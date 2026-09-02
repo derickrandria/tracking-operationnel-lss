@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Données locales
+backend/data/
+sauvegardes/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Divers
+.env
+*.log
+.DS_Store
+backend/.env

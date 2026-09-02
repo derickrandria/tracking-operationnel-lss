@@ -1,0 +1,93 @@
+# ============================================================
+# Stack de PRODUCTION cible (blueprint §4)
+# PostgreSQL + Redis + Celery + worker scraping Playwright
+#
+#   docker compose up --build
+#
+# En mode développement/démo, run.sh suffit (SQLite embarqué).
+# ============================================================
+services:
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: lss
+      POSTGRES_USER: lss
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changer-moi}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lss"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://lss:${POSTGRES_PASSWORD:-changer-moi}@db:5432/lss
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-a-changer-absolument}
+      SIM_ENABLE: "0"                # production : collecte réelle via scraper
+      COLLECTOR_SOURCE: ${COLLECTOR_SOURCE:-MZONEX}
+      MZONEX_URL: ${MZONEX_URL:-}
+      MZONEX_USER: ${MZONEX_USER:-}
+      MZONEX_PASSWORD: ${MZONEX_PASSWORD:-}
+      APP_TZ: Indian/Antananarivo
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://lss:${POSTGRES_PASSWORD:-changer-moi}@db:5432/lss
+      REDIS_URL: redis://redis:6379/0
+      COLLECTOR_SOURCE: ${COLLECTOR_SOURCE:-MZONEX}
+      MZONEX_URL: ${MZONEX_URL:-}
+      MZONEX_USER: ${MZONEX_USER:-}
+      MZONEX_PASSWORD: ${MZONEX_PASSWORD:-}
+      APP_TZ: Indian/Antananarivo
+    depends_on:
+      - api
+    command: celery -A app.celery_app worker --loglevel=info
+
+  beat:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://lss:${POSTGRES_PASSWORD:-changer-moi}@db:5432/lss
+      REDIS_URL: redis://redis:6379/0
+      APP_TZ: Indian/Antananarivo
+    depends_on:
+      - api
+    command: celery -A app.celery_app beat --loglevel=info
+
+  sauvegarde:
+    # Dump PostgreSQL planifié (§11 sauvegarde automatique)
+    image: postgres:16
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-changer-moi}
+    volumes:
+      - ./sauvegardes:/backups
+    entrypoint: |
+      bash -c 'while true; do
+        pg_dump -h db -U lss lss | gzip > /backups/lss_$$(date +%Y%m%d_%H%M%S).sql.gz
+        find /backups -name "*.sql.gz" -mtime +14 -delete
+        sleep 86400
+      done'
+    depends_on:
+      - db
+
+volumes:
+  pgdata:

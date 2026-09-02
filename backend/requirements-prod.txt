@@ -1,0 +1,11 @@
+# Dépendances complémentaires pour la production (stack complète du blueprint §4)
+#   - PostgreSQL au lieu de SQLite       : DATABASE_URL=postgresql+psycopg2://...
+#   - Redis (bus d'événements + cache)   : remplace la diffusion WS mono-processus
+#   - Celery + Beat                       : scraping planifié, archivage minuit (§8/§10)
+#   - Playwright (+ navigateurs)          : scraping MZoneX/CamtrackPro (§10)
+psycopg2-binary>=2.9
+redis>=5.0
+celery>=5.4
+playwright>=1.44
+selenium>=4.20          # fallback scraping (§10)
+webdriver-manager>=4.0

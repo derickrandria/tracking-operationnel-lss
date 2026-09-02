@@ -1,0 +1,175 @@
+/** Types partagés avec l'API. */
+export interface Conducteur {
+  id: string;
+  nom_prenom: string;
+  prenom_usuel: string;
+  matricule: string;
+  telephone: string | null;
+  statut: string;
+  vehicule_plaque?: string | null;
+  date_creation?: string;
+}
+
+export interface Vehicule {
+  id: string;
+  plaque: string;
+  description: string | null;
+  marque: string | null;
+  capacite: number | null;
+  statut: string;
+  gps_associe: string | null;
+  plateforme_gps?: string | null;
+  conducteur_actuel_id: string | null;
+  conducteur: Conducteur | null;
+  date_creation?: string;
+  position?: {
+    lat: number | null;
+    lng: number | null;
+    vitesse: number | null;
+    adresse: string | null;
+    maj: string | null;
+    moteur: boolean | null;
+  };
+}
+
+export interface Trajet {
+  id: string;
+  numero: number;
+  heure_debut: string;
+  heure_fin: string | null;
+  pause_apres_s: number;
+  /** Addendum v1.4 §3.1 — PROVISOIRE (temps réel, onglet Événements) ou
+   *  VALIDÉ (confirmé par l'onglet Trajets MZoneX / rapport CamtrackPro). */
+  statut_source?: "PROVISOIRE" | "VALIDÉ" | null;
+  source_plateforme?: string | null;
+  distance_km?: number | null;
+  /** Addendum v1.5 §7.1 — validité métier (REJETE un trajet < 0,3 km ;
+   * les REJETÉS sont filtrés côté serveur et n'arrivent pas jusqu'ici). */
+  statut_validation?: "EN_ATTENTE" | "VALIDE" | "REJETE" | null;
+}
+
+export interface SuiviLigne {
+  id: string;
+  date_jour: string;
+  vehicule_id: string;
+  plaque: string;
+  description: string | null;
+  conducteur_id: string | null;
+  conducteur: Conducteur | null;
+  situation: string | null;
+  statut_camion: "LIBRE" | "VIDE" | "CHARGÉ" | null;
+  depot_recepteur: string | null;
+  distributeur: string | null;
+  produit: string | null;
+  numero_ot: string | null;
+  emplacement_j_moins_1: string | null;
+  position_08h: string | null;
+  position_10h: string | null;
+  position_12h: string | null;
+  position_14h: string | null;
+  position_16h: string | null;
+  position_18h: string | null;
+  // §0vicies decies N2 (31/08/2026) — relevés automatiques du soir
+  position_20h: string | null;
+  position_22h: string | null;
+  heure_depart: string | null;
+  arret_final: string | null;
+  /** §0nonies decies M4 (29/08/2026) — âge du dernier signal GPS (secondes) ;
+      badge « boîtier muet — données en transit » dès 30 min de silence. */
+  gps_age_s?: number | null;
+  lieu_arret?: string | null;   // Addendum v1.9 §4.2 — colonne « Lieu Arrêt »
+  tcc_s: number;
+  tcj_s: number;
+  ttj_s: number;
+  total_pause_s: number;
+  km_parcourus: number;
+  trajets: Trajet[];
+  nb_trajets: number;
+  mission_id: string | null;
+  flag_tcc: boolean;
+  flag_tcj: boolean;
+  flag_ttj: boolean;
+}
+
+export interface Mission {
+  id: string;
+  date_jour: string;
+  conducteur_id: string | null;
+  conducteur: Conducteur | null;
+  vehicule_id: string;
+  plaque: string;
+  numero_mission_du_jour: number;
+  statut: "EN_COURS" | "TERMINÉE" | "RETARDÉE";
+  heure_debut: string | null;
+  heure_fin: string | null;
+  duree_s: number;
+  numero_ot: string | null;
+  produit: string | null;
+  depot: string | null;
+  distributeur: string | null;
+  kilometrage: number;
+  origine: string | null;
+  etapes: { etat: string; ts: string; lieu: string | null }[];
+}
+
+export interface Infraction {
+  id: string;
+  date_jour: string;
+  heure: string;
+  /** §0octies decies L2 (27/08/2026) — fin verbatim Ym@ne (peut être au J+1) ;
+   *  null → « — » à l'écran, jamais d'invention. */
+  date_fin?: string | null;
+  heure_fin?: string | null;
+  conducteur: Conducteur | null;
+  chauffeur_affiche: string | null;
+  plaque: string;
+  type: string;
+  gravite: "CRITIQUE" | "MOYENNE" | "FAIBLE";
+  duree_s: number | null;
+  valeur_mesuree: number | null;
+  seuil_reference: number | null;
+  mission_id: string | null;
+  source: string;
+  adresse: string | null;
+  // §0quinquies decies I3/I4 (v1.35) — onglet alimenté par Ym@ne
+  nom: string | null;
+  niveau: "ALERTE" | "ALARME" | null;
+  seuil_unite: "kmh" | "s" | "brut" | null;
+  seuil_texte: string | null;
+  seuil_libelle: string | null;
+  coordonnees: string | null;
+  validation: "NON_TRAITEE" | "VALIDE" | "INVALIDE";
+  observation: string | null;
+  validee_par: string | null;
+  validee_le: string | null;
+  ymane_id: string | null;
+}
+
+export interface CompteursInfractions {
+  non_traitees: number;
+  validees: number;
+  invalidees: number;
+  comptabilisees: number;
+}
+
+export interface Alerte {
+  id: string;
+  date_heure: string;
+  type: string;
+  gravite: "CRITIQUE" | "MOYENNE" | "INFORMATION";
+  plaque: string | null;
+  conducteur: Conducteur | null;
+  message: string;
+  statut: "NOUVELLE" | "VUE" | "TRAITEE";
+  lien_module: string | null;
+}
+
+export interface Referentiels {
+  situations: string[];
+  statuts_camion: string[];
+  depots: string[];
+  distributeurs: string[];
+  produits: string[];
+  statuts_vehicule: string[];
+  statuts_conducteur: string[];
+}

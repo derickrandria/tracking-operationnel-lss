@@ -1,0 +1,20 @@
+# Plateforme de Tracking Opérationnel LSS — backend
+fastapi>=0.110
+uvicorn[standard]>=0.29
+SQLAlchemy>=2.0
+PyJWT>=2.8
+python-dotenv>=1.0   # v1.18.2 : chargement de backend/.env (identifiants portails,
+                     # SIM_ENABLE=0, COLLECTOR_SOURCE) — sans lui, le .env est
+                     # silencieusement ignoré et l'application repasse en démo
+openpyxl>=3.1
+reportlab>=4.0
+Pillow>=10        # insertion du logo LSS dans les exports Excel (image openpyxl)
+tzdata>=2024.1
+playwright>=1.44  # collecte réelle MZoneX / CamtrackPro (§10) — v1.18.1 : listé
+                  # ici pour s'auto-réparer via demarrer.bat ; une fois installé,
+                  # lancer une fois : python -m playwright install chromium
+# v1.40 (27/08/2026) : « requests » RETIRÉ définitivement — le collecteur
+# Ym@ne (api_ymane.py) utilise désormais urllib de la bibliothèque standard,
+# comme api_mzonex.py et api_wialon.py (§0septies decies K1, mise au point
+# technique gravée) : plus aucun paquet réseau à installer, plus jamais de
+# ModuleNotFoundError chez l'exploitant.
