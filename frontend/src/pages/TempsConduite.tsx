@@ -12,7 +12,7 @@
  *   - Réutilisation stricte des calculs TCJ/TTJ existants
  *   - Mise à jour temps réel WebSocket sans rechargement
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, download } from "../api";
 import Icon from "../components/icons";
@@ -419,7 +419,7 @@ export default function TempsConduite() {
                 {/* Ligne 2 des entêtes (Sous-colonnes TCJ / TTJ) */}
                 <tr>
                   {dates.map((d_str) => (
-                    <div key={d_str} style={{ display: "contents" }}>
+                    <React.Fragment key={d_str}>
                       <th
                         className="top-[32px] z-20 min-w-[70px] w-[70px] bg-slate-50 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center py-1 text-[11px] font-bold text-slate-500"
                         title={`Temps de conduite journalière du ${d_str}`}
@@ -432,7 +432,7 @@ export default function TempsConduite() {
                       >
                         TTJ
                       </th>
-                    </div>
+                    </React.Fragment>
                   ))}
                 </tr>
               </thead>
@@ -521,7 +521,7 @@ export default function TempsConduite() {
                         const isEnCours = h?.en_cours;
 
                         return (
-                          <div key={d_str} style={{ display: "contents" }}>
+                          <React.Fragment key={d_str}>
                             {/* Cellule TCJ */}
                             <td
                               className={cls(
@@ -562,7 +562,7 @@ export default function TempsConduite() {
                             >
                               {ttj > 0 ? fmtDuree(ttj) : "—"}
                             </td>
-                          </div>
+                          </React.Fragment>
                         );
                       })}
                     </tr>
