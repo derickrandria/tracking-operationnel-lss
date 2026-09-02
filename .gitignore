@@ -9,7 +9,6 @@ sauvegardes/
 
 # Node
 node_modules/
-frontend/dist/
 
 # Divers
 .env
