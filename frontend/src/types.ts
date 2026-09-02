@@ -173,3 +173,45 @@ export interface Referentiels {
   statuts_vehicule: string[];
   statuts_conducteur: string[];
 }
+
+export interface JourneeTCH {
+  tcj_s: number;
+  ttj_s: number;
+  vehicules: string[];
+  inclus_dans_tch: boolean;
+  en_cours: boolean;
+}
+
+export interface ConducteurTCH {
+  conducteur_id: string;
+  nom_prenom: string;
+  prenom_usuel: string;
+  matricule: string;
+  telephone: string | null;
+  statut: string;
+  vehicules_actifs: string[];
+  tch_cumul_s: number;
+  tch_restant_s: number;
+  date_dernier_reset: string | null;
+  alerte_statut: "NORMAL" | "PROCHE_LIMITE" | "LIMITE_ATTEINTE";
+  historique: Record<string, JourneeTCH>;
+}
+
+export interface SyntheseTCH {
+  du: string;
+  au: string;
+  dates: string[];
+  seuils: {
+    seuil_alerte_s: number;
+    seuil_max_s: number;
+    seuil_reset_repos_s: number;
+  };
+  stats: {
+    total_chauffeurs: number;
+    en_conduite_aujourdhui: number;
+    proche_limite: number;
+    limite_atteinte: number;
+    tch_moyen_s: number;
+  };
+  lignes: ConducteurTCH[];
+}

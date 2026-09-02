@@ -463,10 +463,11 @@ app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS,
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ------------------------------------------------------------------ routeurs API
-from .routers import admin, auth, conduite, dashboard, historique, operations, referentiels, surveillance
+from .routers import admin, auth, conduite, dashboard, historique, operations, referentiels, surveillance, temps_conduite
 
 for r in (auth.router, referentiels.router, operations.router, surveillance.router,
-          dashboard.router, historique.router, admin.router, conduite.router):
+          dashboard.router, historique.router, admin.router, conduite.router,
+          temps_conduite.router):
     app.include_router(r)
 
 

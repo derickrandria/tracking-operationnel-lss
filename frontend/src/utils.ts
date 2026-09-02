@@ -8,11 +8,12 @@ export function fmtDuree(s: number | null | undefined): string {
   /** Durée au format H:MM (Addendum v1.8 §CA-6) : 1500 → « 0:25 »,
    *  16200 → « 4:30 » ; les HEURES restent en HH:MM (fmtHeure). */
   if (s === null || s === undefined) return "—";
+  const neg = s < 0;
   const v = Math.abs(Math.round(s));
-  if (v < 60) return `0:${String(v).padStart(2, "0")}`;
+  if (v < 60) return `${neg ? "-" : ""}0:${String(v).padStart(2, "0")}`;
   const h = Math.floor(v / 3600);
   const m = Math.floor((v % 3600) / 60);
-  return `${h}:${String(m).padStart(2, "0")}`;
+  return `${neg ? "-" : ""}${h}:${String(m).padStart(2, "0")}`;
 }
 
 export function fmtHeure(iso: string | null | undefined): string {
@@ -58,6 +59,8 @@ export const LABELS_ALERTE: Record<string, string> = {
   SANS_BADGE: "Roule sans badge",
   REPARATION_DONNEES: "Réparation de données",
   COLLECTE_YMANE: "Collecte Ym@ne en échec",
+  TCH_PROCHE_LIMITE: "TCH proche de la limite",
+  TCH_LIMITE_ATTEINTE: "TCH limite atteinte",
 };
 
 export const COULEURS_GRAVITE: Record<string, string> = {

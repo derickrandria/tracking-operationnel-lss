@@ -21,7 +21,7 @@ from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, jour_attribution,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
 from .event_bus import publish
-from .models import (Alerte, AuditLog, EvenementGPS, GraviteAlerte,
+from .models import (Alerte, AuditLog, Conducteur, EvenementGPS, GraviteAlerte,
                      GraviteInfraction, Infraction, Mission, ParametrageSeuil,
                      SourceEvenement, StatutAlerte, StatutCamion, StatutMission,
                      StatutValidationTrajet, StatutVehicule, SuiviJournalier,
@@ -101,6 +101,11 @@ SEUILS_DEFAUT = {
     "CONDUITE_BADGE_FENETRE_S": (600, "DUREE_S",
         "Alerte « roule sans badge » (MZoneX) : véhicule > 3 km/h sans clé "
         "chauffeur vue depuis plus de cette fenêtre (§0septies B5)"),
+    # --- Module Temps de Conduite (TCH) ---
+    "SEUIL_TCH_ALERTE": (165600, "DUREE_S",
+        "Seuil d'alerte TCH proche de la limite — avertissement (46h)"),
+    "SEUIL_TCH_MAX": (201600, "DUREE_S",
+        "Temps de conduite hebdomadaire maximal (56h)"),
 }
 
 _cache_seuils: dict = {"valeurs": None, "charge_le": None}
@@ -437,6 +442,81 @@ def _alerte_recente(db, type_alerte, vehicule_id, minutes) -> bool:
     return (db.scalar(q) or 0) > 0
 
 
+def _alerte_recente_conducteur(db, type_alerte, conducteur_id, minutes) -> bool:
+    borne = now_local() - timedelta(minutes=minutes)
+    q = select(func.count(Alerte.id)).where(
+        Alerte.type == type_alerte, Alerte.conducteur_id == conducteur_id,
+        Alerte.date_heure >= borne)
+    return (db.scalar(q) or 0) > 0
+
+
+def verifier_alertes_tch(db, conducteur_id: str | None, seuils: dict, ts: datetime):
+    """Contrôle des seuils TCH (Temps de Conduite Hebdomadaire) pour un chauffeur.
+
+    - Seuil d'avertissement : TCH cumulé ≥ 46h00 (165 600 s)
+      Message : « TCH proche de la limite — [Nom chauffeur] — [Cumul TCH] — [TCH restant] »
+    - Seuil limite : TCH cumulé ≥ 56h00 (201 600 s)
+      Message : « TCH limite atteinte — [Nom chauffeur] »
+    """
+    if not conducteur_id:
+        return
+
+    from .routers.temps_conduite import (
+        SEUIL_TCH_ALERTE_S, SEUIL_TCH_MAX_S, calculer_tch_seul_conducteur)
+
+    seuil_alerte = float(seuils.get("SEUIL_TCH_ALERTE", SEUIL_TCH_ALERTE_S))
+    seuil_max = float(seuils.get("SEUIL_TCH_MAX", SEUIL_TCH_MAX_S))
+
+    try:
+        tch_info = calculer_tch_seul_conducteur(db, conducteur_id, maintenant=ts)
+    except Exception:
+        log.exception("Erreur calcul TCH pour alerte chauffeur %s", conducteur_id)
+        return
+
+    tch_cumul = tch_info.get("tch_cumul_s") or 0
+    tch_restant = max(0, int(seuil_max - tch_cumul))
+
+    flag_max = ("tch_max", conducteur_id)
+    flag_warn = ("tch_warn", conducteur_id)
+
+    conducteur = db.get(Conducteur, conducteur_id)
+    nom = (conducteur.nom_prenom or conducteur.prenom_usuel) if conducteur else "Chauffeur"
+
+    if tch_cumul >= seuil_max:
+        with _lock:
+            leve_max = flag_max in _flags
+        if not leve_max and not _alerte_recente_conducteur(db, TypeAlerte.TCH_LIMITE_ATTEINTE, conducteur_id, minutes=120):
+            alerte = creer_alerte(
+                db, TypeAlerte.TCH_LIMITE_ATTEINTE, GraviteAlerte.CRITIQUE,
+                f"TCH limite atteinte — {nom}",
+                ts=ts, conducteur_id=conducteur_id, lien_module="/temps-conduite")
+            if PUBLISH_ENABLED["on"]:
+                publish("alerte.new", s_alerte(alerte))
+            with _lock:
+                _flags[flag_max] = True
+                _flags[flag_warn] = True
+    elif tch_cumul >= seuil_alerte:
+        with _lock:
+            leve_warn = flag_warn in _flags
+            _flags.pop(flag_max, None)
+        if not leve_warn and not _alerte_recente_conducteur(db, TypeAlerte.TCH_PROCHE_LIMITE, conducteur_id, minutes=120):
+            from .serializers import fmt_hms
+            cumul_txt = fmt_hms(tch_cumul) or "46:00"
+            restant_txt = fmt_hms(tch_restant) or "00:00"
+            alerte = creer_alerte(
+                db, TypeAlerte.TCH_PROCHE_LIMITE, GraviteAlerte.MOYENNE,
+                f"TCH proche de la limite — {nom} — {cumul_txt} — {restant_txt}",
+                ts=ts, conducteur_id=conducteur_id, lien_module="/temps-conduite")
+            if PUBLISH_ENABLED["on"]:
+                publish("alerte.new", s_alerte(alerte))
+            with _lock:
+                _flags[flag_warn] = True
+    else:
+        with _lock:
+            _flags.pop(flag_warn, None)
+            _flags.pop(flag_max, None)
+
+
 def creer_infraction(db, suivi, vehicule, type_inf, gravite, ts,
                      duree_s=None, valeur=None, seuil_ref=None,
                      source=SourceEvenement.SIMULATEUR, lat=None, lon=None, adresse=None):
@@ -562,6 +642,10 @@ def _verifier_temps(db, suivi, vehicule, seuils, ts):
     elif not suivi.tcc_s or suivi.tcc_s <= seuil_tcc * 0.5:
         with _lock:
             _flags.pop(flag_p, None)
+
+    # --- Contrôle TCH (Temps de Conduite Hebdomadaire par chauffeur) ---
+    if suivi.conducteur_id:
+        verifier_alertes_tch(db, suivi.conducteur_id, seuils, ts)
 
 
 def _hmm(secondes) -> str:

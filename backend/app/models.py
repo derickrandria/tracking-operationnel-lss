@@ -100,6 +100,9 @@ class TypeAlerte(str, enum.Enum):
     REPARATION_DONNEES = "REPARATION_DONNEES"  # journée contrôlée/réparée (récap)
     # §0septies decies K1 (arbitrage LSS 27/08/2026 — observabilité Ym@ne)
     COLLECTE_YMANE = "COLLECTE_YMANE"        # collecte infractions en échec — auto-refermée à la guérison
+    # Module Temps de conduite (TCH) — seuil 46h (avertissement) et 56h (limite)
+    TCH_PROCHE_LIMITE = "TCH_PROCHE_LIMITE"      # TCH cumulé ≥ 46h00 (avertissement)
+    TCH_LIMITE_ATTEINTE = "TCH_LIMITE_ATTEINTE"  # TCH cumulé ≥ 56h00 (limite réglementaire)
 
 
 class TypeEvenement(str, enum.Enum):

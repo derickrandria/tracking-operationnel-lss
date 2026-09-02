@@ -7,6 +7,7 @@ import Suivi from "./pages/Suivi";
 import Missions from "./pages/Missions";
 import Infractions from "./pages/Infractions";
 import Conduite from "./pages/Conduite";
+import TempsConduite from "./pages/TempsConduite";
 import Alertes from "./pages/Alertes";
 import Historique from "./pages/Historique";
 import Conducteurs from "./pages/Conducteurs";
@@ -28,6 +29,7 @@ export default function App() {
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/suivi" element={<Suivi />} />
+        <Route path="/temps-conduite" element={<TempsConduite />} />
         <Route path="/missions" element={<Missions />} />
         <Route path="/infractions" element={<Infractions />} />
         <Route path="/conduite" element={<Conduite />} />

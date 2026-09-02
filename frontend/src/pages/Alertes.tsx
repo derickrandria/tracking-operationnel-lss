@@ -15,6 +15,7 @@ const ICONES: Record<string, string> = {
   NOUVEAU_VEHICULE: "vehicules", NOUVEAU_CONDUCTEUR: "conducteurs",
   HORS_ITINERAIRE: "missions", CARBURANT_SUSPECT: "carburant",
   REPARATION_DONNEES: "historique",
+  TCH_PROCHE_LIMITE: "horloge", TCH_LIMITE_ATTEINTE: "horloge",
 };
 
 export default function Alertes() {
