@@ -54,15 +54,21 @@ export async function api<T = any>(path: string, options: RequestInit = {}): Pro
     if (!location.pathname.startsWith("/login")) location.href = "/login";
     throw new Error("Session expirée");
   }
+  const contentType = res.headers.get("content-type") || "";
   if (!res.ok) {
     let msg = `Erreur ${res.status}`;
-    try {
-      const j = await res.json();
-      msg = typeof j.detail === "string" ? j.detail : msg;
-    } catch {
-      /* réponse non JSON */
+    if (contentType.includes("application/json")) {
+      try {
+        const j = await res.json();
+        msg = typeof j.detail === "string" ? j.detail : msg;
+      } catch {
+        /* ignore */
+      }
     }
     throw new Error(msg);
+  }
+  if (!contentType.includes("application/json")) {
+    throw new Error("Réponse inattendue du serveur (le backend doit être redémarré pour charger les nouvelles routes API).");
   }
   return res.json();
 }
