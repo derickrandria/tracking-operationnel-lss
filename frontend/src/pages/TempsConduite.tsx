@@ -2,24 +2,27 @@
  * et matrice journalière par chauffeur.
  *
  * Structure de la grille :
- *   - Colonnes fixes à gauche : Chauffeur | Cumul TCH | TCH restant
+ *   - Entêtes figées (2 lignes) : Ligne 1 (Dates) + Ligne 2 (Sous-colonnes TCJ / TTJ)
+ *   - Colonnes fixes à gauche : Chauffeur (Nom et prénom complet) | Cumul TCH | TCH restant
  *   - Colonnes défilantes à droite : paires TCJ / TTJ par date.
+ *   - Barre de défilement horizontale toujours visible à l'écran.
  *
- * Règles :
+ * Règles réglementaires :
  *   - TCH = somme des TCJ du chauffeur depuis le dernier reset (repos continu ≥ 24h)
- *   - TCH max = 56h00 (201 600 s) ; TCH restant = 56h - TCH cumulé
- *   - Alerte avertissement ≥ 46h00 (165 600 s) / Alerte limite ≥ 56h00
- *   - Réutilisation stricte des calculs TCJ/TTJ existants
- *   - Mise à jour temps réel WebSocket sans rechargement
+ *     dans la limite du cycle hebdomadaire (max 56h00).
+ *   - TCH restant = 56h00 - TCH cumulé.
+ *   - Alerte avertissement ≥ 46h00 / Alerte limite ≥ 56h00.
+ *   - Réconciliation canonique des noms (MZoneX / CamtrackPro / Fiches locales).
+ *   - Mise à jour temps réel WebSocket sans rechargement.
  */
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, download } from "../api";
 import Icon from "../components/icons";
 import { addToast } from "../components/toast";
-import { Badge, Btn, Card, PageHeader, Spinner, Vide } from "../components/ui";
+import { Badge, Btn, PageHeader, Spinner, Vide } from "../components/ui";
 import { ConducteurTCH, SyntheseTCH } from "../types";
-import { cls, fmtDateFr, fmtDuree, todayISO } from "../utils";
+import { cls, fmtDuree, todayISO } from "../utils";
 import { on } from "../ws";
 
 const iso = (d: Date) =>
@@ -165,7 +168,6 @@ export default function TempsConduite() {
 
     // 2. Alertes nouvelles
     const off2 = on("alerte.new", () => {
-      // Met à jour les données silencieusement
       charger(true);
     });
 
@@ -210,12 +212,12 @@ export default function TempsConduite() {
   const stats = data?.stats;
 
   return (
-    <div className="flex h-full flex-col gap-3">
+    <div className="flex h-full flex-col min-h-0 gap-2.5">
       <PageHeader
         titre="Temps de conduite (TCH)"
         sousTitre={
           <>
-            Compteur hebdomadaire réglementaire (max <b>56h00</b> · alerte à <b>46h00</b>) · Reset automatique après <b>24h</b> de repos continu
+            Compteur hebdomadaire réglementaire (max <b>56h00</b> · avertissement à <b>46h00</b>) · Reset après <b>24h</b> de repos continu
           </>
         }
         actions={
@@ -224,7 +226,7 @@ export default function TempsConduite() {
               type="date"
               value={du}
               max={todayISO()}
-              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-[13px]"
+              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-[13px]"
               onChange={(e) => changerPlage(e.target.value, au)}
             />
             <span className="text-slate-400 text-[12px]">au</span>
@@ -232,7 +234,7 @@ export default function TempsConduite() {
               type="date"
               value={au}
               max={todayISO()}
-              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-[13px]"
+              className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-[13px]"
               onChange={(e) => changerPlage(du, e.target.value)}
             />
 
@@ -247,7 +249,7 @@ export default function TempsConduite() {
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder="Rechercher chauffeur, matricule…"
-              className="w-48 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px]"
+              className="w-52 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px]"
             />
             <select
               value={filtreAlerte}
@@ -275,31 +277,33 @@ export default function TempsConduite() {
         }
       />
 
-      {/* Raccourcis de dates */}
-      <div className="flex flex-wrap items-center gap-2">
-        <Icon nom="calendrier" className="h-4 w-4 text-slate-400" />
-        <span className="text-[12px] font-semibold text-slate-400">Période :</span>
-        {P.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => changerPlage(p.du, p.au)}
-            className={cls(
-              "rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
-              raccourciActif === p.id
-                ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                : "border-slate-200 dark:border-slate-700 text-slate-400 hover:border-slate-400"
-            )}
-          >
-            {p.label}
-          </button>
-        ))}
-        {raccourciActif === "custom" && (
-          <span className="rounded-full border border-violet-500 bg-violet-500/10 px-3 py-1 text-[12px] font-medium text-violet-500">
-            Personnalisé
-          </span>
-        )}
+      {/* Raccourcis de dates & Légende */}
+      <div className="flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <Icon nom="calendrier" className="h-4 w-4 text-slate-400" />
+          <span className="text-[12px] font-semibold text-slate-400">Période :</span>
+          {P.map((p) => (
+            <button
+              key={p.id}
+              onClick={() => changerPlage(p.du, p.au)}
+              className={cls(
+                "rounded-full border px-3 py-0.5 text-[12px] font-medium transition-colors",
+                raccourciActif === p.id
+                  ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400"
+                  : "border-slate-200 dark:border-slate-700 text-slate-400 hover:border-slate-400"
+              )}
+            >
+              {p.label}
+            </button>
+          ))}
+          {raccourciActif === "custom" && (
+            <span className="rounded-full border border-violet-500 bg-violet-500/10 px-3 py-0.5 text-[12px] font-medium text-violet-500">
+              Personnalisé
+            </span>
+          )}
+        </div>
 
-        <div className="ml-auto flex items-center gap-3 text-[11.5px] text-slate-500 dark:text-slate-400">
+        <div className="flex items-center gap-3 text-[11.5px] text-slate-500 dark:text-slate-400">
           <span className="flex items-center gap-1.5">
             <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" /> &lt; 46h00 (Normal)
           </span>
@@ -314,86 +318,92 @@ export default function TempsConduite() {
 
       {/* Cartes KPI */}
       {stats && (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 xl:grid-cols-5">
-          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 bg-white dark:bg-nuit-900">
+        <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-3 xl:grid-cols-5 shrink-0">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5 bg-white dark:bg-nuit-900">
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Total Chauffeurs</div>
-            <div className="mt-1 text-2xl font-extrabold tabular-nums">{stats.total_chauffeurs}</div>
+            <div className="mt-0.5 text-2xl font-extrabold tabular-nums">{stats.total_chauffeurs}</div>
           </div>
-          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 bg-white dark:bg-nuit-900">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5 bg-white dark:bg-nuit-900">
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">En conduite aujourd'hui</div>
-            <div className="mt-1 text-2xl font-extrabold tabular-nums text-blue-600 dark:text-blue-400">
+            <div className="mt-0.5 text-2xl font-extrabold tabular-nums text-blue-600 dark:text-blue-400">
               {stats.en_conduite_aujourdhui}
             </div>
           </div>
           <div
             className={cls(
-              "rounded-xl border p-3 bg-white dark:bg-nuit-900",
+              "rounded-xl border p-2.5 bg-white dark:bg-nuit-900",
               stats.proche_limite > 0 ? "border-amber-500/50 bg-amber-500/[0.03]" : "border-slate-200 dark:border-slate-800"
             )}
           >
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Proches limite (≥ 46h)</div>
-            <div className={cls("mt-1 text-2xl font-extrabold tabular-nums", stats.proche_limite > 0 ? "text-amber-500" : "")}>
+            <div className={cls("mt-0.5 text-2xl font-extrabold tabular-nums", stats.proche_limite > 0 ? "text-amber-500" : "")}>
               {stats.proche_limite}
             </div>
           </div>
           <div
             className={cls(
-              "rounded-xl border p-3 bg-white dark:bg-nuit-900",
+              "rounded-xl border p-2.5 bg-white dark:bg-nuit-900",
               stats.limite_atteinte > 0 ? "border-red-500/50 bg-red-500/[0.03]" : "border-slate-200 dark:border-slate-800"
             )}
           >
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Limite atteinte (≥ 56h)</div>
-            <div className={cls("mt-1 text-2xl font-extrabold tabular-nums", stats.limite_atteinte > 0 ? "text-red-500" : "")}>
+            <div className={cls("mt-0.5 text-2xl font-extrabold tabular-nums", stats.limite_atteinte > 0 ? "text-red-500" : "")}>
               {stats.limite_atteinte}
             </div>
           </div>
-          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 bg-white dark:bg-nuit-900">
+          <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-2.5 bg-white dark:bg-nuit-900">
             <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">TCH moyen actif</div>
-            <div className="mt-1 text-2xl font-extrabold tabular-nums">{fmtDuree(stats.tch_moyen_s)}</div>
+            <div className="mt-0.5 text-2xl font-extrabold tabular-nums">{fmtDuree(stats.tch_moyen_s)}</div>
           </div>
         </div>
       )}
 
-      {/* Grille principale avec colonnes fixes (Chauffeur, Cumul TCH, TCH restant) et colonnes historiques défilantes */}
-      <Card
-        className="!p-0 overflow-hidden flex min-h-0 flex-1 flex-col"
-        contenuClasse="overflow-auto !p-0"
-        titre={
-          <span>
-            Temps de conduite par chauffeur ({lignes.length})
-            <span className="ml-2 text-[12px] font-normal text-slate-400">
-              Colonnes fixes à gauche · Historique TCJ / TTJ défilant horizontalement
+      {/* Grille principale :
+          - En-têtes figées sur 2 lignes (top-0 et top-[30px])
+          - Colonnes fixes à gauche (Chauffeur, Cumul TCH, TCH restant)
+          - Barre de défilement horizontale toujours visible dans la vue
+      */}
+      <div className="flex-1 min-h-0 flex flex-col rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-nuit-900 shadow-sm overflow-hidden">
+        <header className="flex items-center justify-between px-4 py-2 border-b border-slate-100 dark:border-slate-800 shrink-0 bg-slate-50/50 dark:bg-nuit-800/50">
+          <div className="flex items-center gap-2">
+            <span className="font-semibold text-sm text-slate-700 dark:text-slate-200">
+              Temps de conduite par chauffeur ({lignes.length})
             </span>
-          </span>
-        }
-      >
+            <span className="text-[12px] text-slate-400">
+              · Colonnes fixes à gauche · Défilement horizontal des journées TCJ / TTJ
+            </span>
+          </div>
+        </header>
+
         {chargement && !data ? (
-          <div className="flex h-40 items-center justify-center gap-2 text-slate-400">
+          <div className="flex flex-1 items-center justify-center gap-2 text-slate-400">
             <Spinner /> Chargement des temps de conduite…
           </div>
         ) : lignes.length === 0 ? (
-          <Vide texte="Aucun chauffeur ne correspond aux critères." />
+          <div className="flex-1 flex items-center justify-center">
+            <Vide texte="Aucun chauffeur ne correspond aux critères." />
+          </div>
         ) : (
-          <div className="relative overflow-x-auto overflow-y-auto max-h-[calc(100vh-290px)]">
+          <div className="flex-1 min-h-0 overflow-auto">
             <table className="table-pro w-full border-separate border-spacing-0">
               <thead>
-                {/* Ligne 1 des entêtes */}
+                {/* Ligne 1 des entêtes : Colonnes fixes (rowSpan=2) + Blocs de date (colSpan=2) */}
                 <tr>
                   <th
                     rowSpan={2}
-                    className="sticky left-0 top-0 z-30 min-w-[200px] max-w-[200px] w-[200px] bg-slate-100 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-left px-3 py-2"
+                    className="sticky left-0 top-0 z-40 min-w-[260px] max-w-[260px] w-[260px] bg-slate-100 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-left px-3 py-1.5"
                   >
-                    Chauffeur
+                    Chauffeur (Nom et prénom)
                   </th>
                   <th
                     rowSpan={2}
-                    className="sticky left-[200px] top-0 z-30 min-w-[110px] max-w-[110px] w-[110px] bg-slate-100 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center px-2 py-2"
+                    className="sticky left-[260px] top-0 z-40 min-w-[105px] max-w-[105px] w-[105px] bg-slate-100 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center px-2 py-1.5"
                   >
                     Cumul TCH
                   </th>
                   <th
                     rowSpan={2}
-                    className="sticky left-[310px] top-0 z-30 min-w-[110px] max-w-[110px] w-[110px] bg-slate-100 dark:bg-nuit-800 border-r-2 border-b border-slate-300 dark:border-slate-600 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.15)] text-center px-2 py-2"
+                    className="sticky left-[365px] top-0 z-40 min-w-[105px] max-w-[105px] w-[105px] bg-slate-100 dark:bg-nuit-800 border-r-2 border-b border-slate-300 dark:border-slate-600 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.15)] text-center px-2 py-1.5"
                   >
                     TCH restant
                   </th>
@@ -405,8 +415,10 @@ export default function TempsConduite() {
                         key={d_str}
                         colSpan={2}
                         className={cls(
-                          "top-0 z-20 text-center border-r border-b border-slate-200 dark:border-slate-700 px-2 py-1 text-[12px]",
-                          isToday ? "bg-blue-600/10 text-blue-600 dark:text-blue-400 font-bold" : "bg-slate-50 dark:bg-nuit-800 font-semibold"
+                          "sticky top-0 z-30 text-center border-r border-b border-slate-200 dark:border-slate-700 px-2 py-1 text-[11.5px] h-[30px]",
+                          isToday
+                            ? "bg-blue-600/15 text-blue-600 dark:text-blue-400 font-extrabold"
+                            : "bg-slate-100 dark:bg-nuit-800 font-bold text-slate-700 dark:text-slate-200"
                         )}
                       >
                         {d_str.split("-").reverse().slice(0, 2).join("/")}
@@ -416,18 +428,18 @@ export default function TempsConduite() {
                   })}
                 </tr>
 
-                {/* Ligne 2 des entêtes (Sous-colonnes TCJ / TTJ) */}
+                {/* Ligne 2 des entêtes (Sous-colonnes TCJ / TTJ fixées sous la ligne 1) */}
                 <tr>
                   {dates.map((d_str) => (
                     <React.Fragment key={d_str}>
                       <th
-                        className="top-[32px] z-20 min-w-[70px] w-[70px] bg-slate-50 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center py-1 text-[11px] font-bold text-slate-500"
+                        className="sticky top-[30px] z-30 min-w-[70px] w-[70px] h-[24px] bg-slate-50 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center py-0.5 text-[10.5px] font-bold text-slate-600 dark:text-slate-300"
                         title={`Temps de conduite journalière du ${d_str}`}
                       >
                         TCJ
                       </th>
                       <th
-                        className="top-[32px] z-20 min-w-[70px] w-[70px] bg-slate-50 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center py-1 text-[11px] font-bold text-slate-400"
+                        className="sticky top-[30px] z-30 min-w-[70px] w-[70px] h-[24px] bg-slate-50 dark:bg-nuit-800 border-r border-b border-slate-200 dark:border-slate-700 text-center py-0.5 text-[10.5px] font-bold text-slate-400 dark:text-slate-500"
                         title={`Temps de travail journalier du ${d_str}`}
                       >
                         TTJ
@@ -454,23 +466,30 @@ export default function TempsConduite() {
                           : ""
                       )}
                     >
-                      {/* Colonne 1 : Chauffeur (FIXE) */}
-                      <td className="sticky left-0 z-10 min-w-[200px] max-w-[200px] w-[200px] bg-white dark:bg-nuit-900 border-r border-b border-slate-100 dark:border-slate-800 px-3 py-2">
+                      {/* Colonne 1 : Chauffeur (FIXE) — Nom et Prénom complet */}
+                      <td className="sticky left-0 z-10 min-w-[260px] max-w-[260px] w-[260px] bg-white dark:bg-nuit-900 border-r border-b border-slate-100 dark:border-slate-800 px-3 py-2">
                         <div className="flex flex-col">
+                          {/* Ligne 1 : Nom et Prénom complet */}
                           <div className="flex items-center gap-1.5">
-                            <span className="font-bold text-[13.5px] truncate" title={l.nom_prenom}>
-                              {l.prenom_usuel || l.nom_prenom}
+                            <span className="font-bold text-[13px] text-slate-900 dark:text-slate-100 truncate" title={l.nom_prenom}>
+                              {l.nom_prenom}
                             </span>
                             {l.statut !== "ACTIF" && (
-                              <Badge couleur={COULEURS_STATUT[l.statut]} className="!text-[9.5px] !px-1">
+                              <Badge couleur={COULEURS_STATUT[l.statut]} className="!text-[9.5px] !px-1 shrink-0">
                                 {l.statut}
                               </Badge>
                             )}
                           </div>
-                          <div className="flex items-center gap-2 text-[11px] text-slate-400">
-                            <span className="font-mono">{l.matricule}</span>
+                          {/* Ligne 2 : Matricule + Prénom usuel + Camion(s) */}
+                          <div className="flex items-center gap-1.5 text-[11px] text-slate-400 mt-0.5">
+                            <span className="font-mono text-slate-500 font-semibold">{l.matricule}</span>
+                            {l.prenom_usuel && l.prenom_usuel !== l.nom_prenom && (
+                              <span className="text-slate-400 font-medium truncate">
+                                · {l.prenom_usuel}
+                              </span>
+                            )}
                             {l.vehicules_actifs.length > 0 && (
-                              <span className="truncate text-slate-500 dark:text-slate-300 font-semibold" title={`Camion(s) : ${l.vehicules_actifs.join(", ")}`}>
+                              <span className="truncate text-blue-600 dark:text-blue-400 font-medium" title={`Camion(s) assigné(s) : ${l.vehicules_actifs.join(", ")}`}>
                                 · {l.vehicules_actifs.join(", ")}
                               </span>
                             )}
@@ -479,10 +498,10 @@ export default function TempsConduite() {
                       </td>
 
                       {/* Colonne 2 : Cumul TCH (FIXE) */}
-                      <td className="sticky left-[200px] z-10 min-w-[110px] max-w-[110px] w-[110px] bg-white dark:bg-nuit-900 border-r border-b border-slate-100 dark:border-slate-800 text-center px-2 py-2">
+                      <td className="sticky left-[260px] z-10 min-w-[105px] max-w-[105px] w-[105px] bg-white dark:bg-nuit-900 border-r border-b border-slate-100 dark:border-slate-800 text-center px-2 py-2">
                         <span
                           className={cls(
-                            "inline-flex items-center justify-center rounded-lg px-2 py-1 font-mono text-[13px] font-extrabold tabular-nums",
+                            "inline-flex items-center justify-center rounded-lg px-2 py-0.5 font-mono text-[12.5px] font-extrabold tabular-nums",
                             estCritique
                               ? "bg-red-500/15 text-red-600 dark:text-red-400 border border-red-500/40"
                               : estAvertissement
@@ -497,10 +516,10 @@ export default function TempsConduite() {
                       </td>
 
                       {/* Colonne 3 : TCH restant (FIXE avec ombre séparatrice) */}
-                      <td className="sticky left-[310px] z-10 min-w-[110px] max-w-[110px] w-[110px] bg-white dark:bg-nuit-900 border-r-2 border-b border-slate-300 dark:border-slate-600 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.15)] text-center px-2 py-2">
+                      <td className="sticky left-[365px] z-10 min-w-[105px] max-w-[105px] w-[105px] bg-white dark:bg-nuit-900 border-r-2 border-b border-slate-300 dark:border-slate-600 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.15)] text-center px-2 py-2">
                         <span
                           className={cls(
-                            "font-mono text-[13px] font-bold tabular-nums",
+                            "font-mono text-[12.5px] font-bold tabular-nums",
                             l.tch_restant_s <= 0
                               ? "text-red-600 dark:text-red-400 font-extrabold"
                               : l.tch_restant_s <= 36000 // <= 10h
@@ -525,7 +544,7 @@ export default function TempsConduite() {
                             {/* Cellule TCJ */}
                             <td
                               className={cls(
-                                "border-r border-b border-slate-100 dark:border-slate-800 text-center px-1.5 py-2 font-mono text-[12.5px] tabular-nums",
+                                "border-r border-b border-slate-100 dark:border-slate-800 text-center px-1.5 py-2 font-mono text-[12px] tabular-nums",
                                 tcj > 0
                                   ? h?.inclus_dans_tch
                                     ? isEnCours
@@ -555,7 +574,7 @@ export default function TempsConduite() {
                             {/* Cellule TTJ */}
                             <td
                               className={cls(
-                                "border-r border-b border-slate-100 dark:border-slate-800 text-center px-1.5 py-2 font-mono text-[12px] tabular-nums text-slate-400 dark:text-slate-500",
+                                "border-r border-b border-slate-100 dark:border-slate-800 text-center px-1.5 py-2 font-mono text-[11.5px] tabular-nums text-slate-400 dark:text-slate-500",
                                 isEnCours && "bg-blue-50/30 dark:bg-blue-950/10"
                               )}
                               title={ttj > 0 ? `TTJ : ${fmtDuree(ttj)}` : "—"}
@@ -572,7 +591,7 @@ export default function TempsConduite() {
             </table>
           </div>
         )}
-      </Card>
+      </div>
     </div>
   );
 }

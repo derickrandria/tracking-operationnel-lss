@@ -32,6 +32,7 @@ from ..database import get_db
 from ..engine import get_seuils
 from ..models import (Conducteur, HistoriqueJournalier, StatutConducteur,
                      StatutValidationTrajet, SuiviJournalier, Trajet, Vehicule)
+from ..reparation import normaliser_libelle
 from ..security import TOUS, require_roles
 from ..serializers import fmt_hms, iso
 
@@ -65,19 +66,52 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                                 conducteur_id_filtre: str | None = None) -> dict:
     """Extrait et calcule l'ensemble des données TCH pour les chauffeurs.
 
-    Pour garantir la détection exacte du dernier reset (24h de repos), la
-    recherche remonte jusqu'à 35 jours avant la date de début demandée.
+    Règles :
+      - Déduplication & réconciliation canonique (MZoneX / CamtrackPro / Fiches locales).
+      - Détection des coupures de repos continu >= 24h.
+      - Plafonnement au cycle hebdomadaire (max 6-7 jours glissants, jamais d'accumulation
+        sur des semaines entières).
+      - Affichage complet nom + prénom et réutilisation stricte des valeurs TCJ existantes.
     """
     maintenant = maintenant or now_local()
     jour_courant = jour_attribution(maintenant)
-    borne_recul = min(debut_fenetre, fin_fenetre) - timedelta(days=35)
+    borne_recul = min(debut_fenetre, fin_fenetre) - timedelta(days=21)
 
-    # 1. Récupération des conducteurs
-    q_cond = select(Conducteur).order_by(Conducteur.prenom_usuel, Conducteur.nom_prenom)
+    # 1. Récupération de tous les conducteurs et construction de la table de déduplication canonique
+    q_cond = select(Conducteur).order_by(Conducteur.nom_prenom)
     if conducteur_id_filtre:
         q_cond = q_cond.where(Conducteur.id == conducteur_id_filtre)
     conducteurs = db.scalars(q_cond).all()
-    cond_map = {c.id: c for c in conducteurs}
+
+    # Déduplication par nom normalisé : MZoneX vs CamtrackPro vs saisie manuelle
+    groupes_canon: dict[str, list[Conducteur]] = {}
+    id_vers_gardien: dict[str, Conducteur] = {}
+    nom_norm_vers_gardien: dict[str, Conducteur] = {}
+
+    for c in conducteurs:
+        cle = (c.nom_normalise or normaliser_libelle(c.nom_prenom))[:170]
+        groupes_canon.setdefault(cle, []).append(c)
+
+    for cle, fiches in groupes_canon.items():
+        # Sélection du gardien : matricule officiel CH... d'abord, puis téléphone, puis statut
+        def score(f: Conducteur):
+            s = 0
+            if f.matricule and not f.matricule.startswith("AUTO-"):
+                s += 500
+            if f.telephone:
+                s += 100
+            if f.statut == StatutConducteur.ACTIF:
+                s += 50
+            return (-s, f.date_creation or datetime.min, f.id)
+
+        gardien = sorted(fiches, key=score)[0]
+        nom_norm_vers_gardien[cle] = gardien
+        for f in fiches:
+            id_vers_gardien[f.id] = gardien
+
+    # Liste unique des fiches gardiennes actives pour la vue
+    gardiens_uniques = list({g.id: g for g in id_vers_gardien.values()}.values())
+    gardiens_uniques.sort(key=lambda x: (x.nom_prenom or "").upper())
 
     # 2. Récupération des SuiviJournalier (avec trajets et véhicule)
     q_suivi = (
@@ -99,32 +133,42 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
     )
     historiques = db.scalars(q_hist).all()
 
-    # Structure d'agrégation par chauffeur :
-    # conducteur_id -> {
+    # Structure d'agrégation par chauffeur gardien :
+    # gardien_id -> {
+    #    "gardien": Conducteur,
     #    "jours": { date -> { "tcj_s": int, "ttj_s": int, "vehicules": set(), "en_cours": bool } },
     #    "spans": [ (debut_dt, fin_dt, plaque) ]
     # }
-    data_chauffeurs: dict[str, dict] = {c.id: {"jours": {}, "spans": []} for c in conducteurs}
+    data_chauffeurs: dict[str, dict] = {
+        g.id: {"gardien": g, "jours": {}, "spans": []} for g in gardiens_uniques
+    }
+
+    def resoudre_gardien(c_id: str | None, nom_str: str | None) -> Conducteur | None:
+        if c_id and c_id in id_vers_gardien:
+            return id_vers_gardien[c_id]
+        if nom_str:
+            cle = normaliser_libelle(nom_str)[:170]
+            if cle in nom_norm_vers_gardien:
+                return nom_norm_vers_gardien[cle]
+        return None
 
     # A. Intégration des HistoriqueJournalier (jours archivés passés)
     for h in historiques:
         c_id = h.conducteur_id
-        if not c_id:
+        d = h.donnees or {}
+        gardien = resoudre_gardien(c_id, d.get("chauffeur") or (h.vehicule.plaque if h.vehicule else None))
+        if not gardien:
             continue
-        if c_id not in data_chauffeurs:
-            # Chauffeur peut être inactif ou hors liste filtrée
-            if not conducteur_id_filtre or c_id == conducteur_id_filtre:
-                data_chauffeurs[c_id] = {"jours": {}, "spans": []}
-            else:
-                continue
+        gid = gardien.id
+        if conducteur_id_filtre and gid != conducteur_id_filtre:
+            continue
 
         j = h.date_jour
-        d = h.donnees or {}
         tcj = int(d.get("tcj_s") or 0)
         ttj = int(d.get("ttj_s") or 0)
         plaque = (h.vehicule.plaque if h.vehicule else None) or d.get("plaque")
 
-        c_data = data_chauffeurs[c_id]
+        c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
         if j not in c_data["jours"]:
             c_data["jours"][j] = {
                 "tcj_s": tcj, "ttj_s": ttj,
@@ -142,7 +186,6 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         spans_trouves = False
         for t in trajets_snap:
             if isinstance(t, dict):
-                # Vérifier si le trajet est valide (≥ 0,3 km)
                 dist = t.get("distance_km")
                 if t.get("statut_validation") == "REJETE":
                     continue
@@ -158,11 +201,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         if not spans_trouves and tcj > 0:
             h_dep = _dt_iso(d.get("heure_depart"))
             if h_dep is not None:
-                fin_eff = h_dep + timedelta(seconds=max(3600, ttj or tcj))
+                fin_eff = h_dep + timedelta(seconds=max(1800, ttj or tcj))
                 c_data["spans"].append((h_dep, fin_eff, plaque))
             else:
                 deb_def = datetime.combine(j, datetime.min.time()).replace(hour=6)
-                fin_def = deb_def + timedelta(seconds=max(3600, ttj or tcj))
+                fin_def = deb_def + timedelta(seconds=max(1800, ttj or tcj))
                 c_data["spans"].append((deb_def, fin_def, plaque))
 
     # B. Intégration des SuiviJournalier (prioritaire pour aujourd'hui et jours actifs)
@@ -174,15 +217,13 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         # Trajets individuels du suivi
         for t in (s.trajets or []):
             t_cond_id = t.conducteur_badge_id or s.conducteur_id
-            if not t_cond_id:
+            gardien = resoudre_gardien(t_cond_id, None)
+            if not gardien:
                 continue
-            if t_cond_id not in data_chauffeurs:
-                if not conducteur_id_filtre or t_cond_id == conducteur_id_filtre:
-                    data_chauffeurs[t_cond_id] = {"jours": {}, "spans": []}
-                else:
-                    continue
+            gid = gardien.id
+            if conducteur_id_filtre and gid != conducteur_id_filtre:
+                continue
 
-            # Règle absolue §2 : manœuvre < 0,3 km exclue
             if t.statut_validation == StatutValidationTrajet.REJETE:
                 continue
             if t.distance_km is not None and t.distance_km < 0.3:
@@ -197,37 +238,36 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
             else:
                 fin_eff = fin
 
-            data_chauffeurs[t_cond_id]["spans"].append((deb, fin_eff, plaque))
+            c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
+            c_data["spans"].append((deb, fin_eff, plaque))
 
         # Intégration au niveau journalier
-        c_id = s.conducteur_id
-        if c_id and (not conducteur_id_filtre or c_id == conducteur_id_filtre):
-            if c_id not in data_chauffeurs:
-                data_chauffeurs[c_id] = {"jours": {}, "spans": []}
+        gardien = resoudre_gardien(s.conducteur_id, None)
+        if gardien:
+            gid = gardien.id
+            if not conducteur_id_filtre or gid == conducteur_id_filtre:
+                c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
+                tcj = int(s.tcj_s or 0)
+                ttj = int(s.ttj_s or 0)
 
-            c_data = data_chauffeurs[c_id]
-            tcj = int(s.tcj_s or 0)
-            ttj = int(s.ttj_s or 0)
-
-            if is_today or j not in c_data["jours"]:
-                if j in c_data["jours"] and is_today:
-                    # Chauffeur conduisant plusieurs camions aujourd'hui
-                    c_data["jours"][j]["tcj_s"] += tcj
-                    c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj)
+                if is_today or j not in c_data["jours"]:
+                    if j in c_data["jours"] and is_today:
+                        c_data["jours"][j]["tcj_s"] += tcj
+                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj)
+                        if plaque:
+                            c_data["jours"][j]["vehicules"].add(plaque)
+                        c_data["jours"][j]["en_cours"] = True
+                    else:
+                        c_data["jours"][j] = {
+                            "tcj_s": tcj, "ttj_s": ttj,
+                            "vehicules": {plaque} if plaque else set(),
+                            "en_cours": is_today
+                        }
+                else:
                     if plaque:
                         c_data["jours"][j]["vehicules"].add(plaque)
-                    c_data["jours"][j]["en_cours"] = True
-                else:
-                    c_data["jours"][j] = {
-                        "tcj_s": tcj, "ttj_s": ttj,
-                        "vehicules": {plaque} if plaque else set(),
-                        "en_cours": is_today
-                    }
-            else:
-                if plaque:
-                    c_data["jours"][j]["vehicules"].add(plaque)
 
-    # 4. Calcul de l'algorithme TCH (détection du reset 24h et cumul) pour chaque chauffeur
+    # 4. Calcul de l'algorithme TCH (détection du reset 24h et cumul hebdomadaire)
     resultats_lignes = []
 
     # Génération de la liste des dates de la fenêtre demandée
@@ -235,18 +275,12 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
     dates_fenetre = [debut_fenetre + timedelta(days=i) for i in range(nb_jours)]
     dates_str = [d.isoformat() for d in dates_fenetre]
 
-    for c_id, c_data in data_chauffeurs.items():
-        cond = cond_map.get(c_id)
-        if not cond:
-            # Récupérer au vol si non présent dans le mapping
-            cond = db.get(Conducteur, c_id)
-            if not cond:
-                continue
-
+    for gid, c_data in data_chauffeurs.items():
+        cond = c_data["gardien"]
         spans = c_data["spans"]
         jours_dict = c_data["jours"]
 
-        # Fusion des intervalles qui se chevauchent ou se touchent
+        # Fusion des intervalles qui se chevauchent
         spans.sort(key=lambda x: x[0])
         merged_spans: list[list[datetime]] = []
         for deb, fin, _ in spans:
@@ -261,13 +295,17 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                     merged_spans.append([deb, fin])
 
         # Recherche du dernier reset :
-        # Période continue de repos ≥ 24h (86 400 s) sans aucun trajet valide.
+        # Période continue de repos >= 24h (86 400 s) sans aucun trajet valide.
+        # Règle réglementaire TCH : un cycle hebdomadaire court sur 6 périodes de conduite max
+        # (plafonné à 7 jours glissants).
         dernier_reset_debut: datetime | None = None
         date_dernier_reset_str: str | None = None
         tch_cumul_s = 0
 
+        # Borne réglementaire hebdomadaire (au plus 6 jours avant aujourd'hui)
+        borne_hebdo_date = jour_courant - timedelta(days=6)
+
         if not merged_spans:
-            # Aucun trajet enregistré
             dernier_reset_debut = None
             date_dernier_reset_str = None
             tch_cumul_s = 0
@@ -282,8 +320,7 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 date_dernier_reset_str = dernier_fin.isoformat()
                 tch_cumul_s = 0
             else:
-                # Le chauffeur est dans un cycle actif.
-                # On recherche la dernière coupure de 24h en remontant la chaîne des intervalles.
+                # Recherche de la dernière coupure >= 24h en remontant la chaîne
                 dernier_reset_debut = merged_spans[0][0]
                 date_dernier_reset_str = merged_spans[0][0].isoformat()
 
@@ -294,10 +331,12 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                         date_dernier_reset_str = merged_spans[i][0].isoformat()
                         break
 
-                # Somme des TCJ pour les journées à partir du dernier reset
-                date_borne_reset = dernier_reset_debut.date()
+                # Borne de début de calcul : la plus récente entre le dernier reset 24h et le début du cycle hebdo (J-6)
+                date_effective_debut = max(dernier_reset_debut.date(), borne_hebdo_date)
+
+                # Somme des TCJ pour les journées à partir de la borne effective
                 for j_date, j_info in jours_dict.items():
-                    if j_date >= date_borne_reset:
+                    if j_date >= date_effective_debut and j_date <= jour_courant:
                         tch_cumul_s += int(j_info["tcj_s"] or 0)
 
         tch_restant_s = SEUIL_TCH_MAX_S - tch_cumul_s
@@ -315,7 +354,7 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
             d_str = d.isoformat()
             if d in jours_dict:
                 j_info = jours_dict[d]
-                inclus = (dernier_reset_debut is not None and d >= dernier_reset_debut.date())
+                inclus = (dernier_reset_debut is not None and d >= max(dernier_reset_debut.date(), borne_hebdo_date) and d <= jour_courant)
                 hist_grid[d_str] = {
                     "tcj_s": j_info["tcj_s"],
                     "ttj_s": j_info["ttj_s"],
@@ -340,8 +379,8 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         resultats_lignes.append({
             "conducteur_id": cond.id,
             "nom_prenom": cond.nom_prenom,
-            "prenom_usuel": cond.prenom_usuel,
-            "matricule": cond.matricule,
+            "prenom_usuel": cond.prenom_usuel or "",
+            "matricule": cond.matricule or "—",
             "telephone": cond.telephone,
             "statut": cond.statut.value if cond.statut else "ACTIF",
             "vehicules_actifs": vehicules_actifs,
@@ -352,12 +391,12 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
             "historique": hist_grid,
         })
 
-    # Tri par défaut : statut alerte (critique d'abord), puis TCH décroissant, puis prénom usuel
+    # Tri par défaut : statut alerte (critique d'abord), puis TCH décroissant, puis nom
     ordre_alerte = {"LIMITE_ATTEINTE": 0, "PROCHE_LIMITE": 1, "NORMAL": 2}
     resultats_lignes.sort(key=lambda x: (
         ordre_alerte.get(x["alerte_statut"], 2),
         -x["tch_cumul_s"],
-        x["prenom_usuel"] or ""
+        (x["nom_prenom"] or "").upper()
     ))
 
     # Calcul des statistiques globales
