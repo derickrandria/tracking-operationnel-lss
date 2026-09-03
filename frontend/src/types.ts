@@ -55,6 +55,8 @@ export interface Trajet {
   /** Addendum v1.5 §7.1 — validité métier (REJETE un trajet < 0,3 km ;
    * les REJETÉS sont filtrés côté serveur et n'arrivent pas jusqu'ici). */
   statut_validation?: "EN_ATTENTE" | "VALIDE" | "REJETE" | null;
+  conducteur_badge?: string | null;
+  conducteur_badge_id?: string | null;
 }
 
 export interface SuiviLigne {

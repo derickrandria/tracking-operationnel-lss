@@ -124,6 +124,40 @@ export interface GrilleSuiviProps {
   masquerTCC?: boolean;
 }
 
+function extraireConducteursRelais(l: SuiviLigne): Array<{ nom: string; duree_s: number }> {
+  if (!l.trajets || l.trajets.length === 0) return [];
+  const mapRelais = new Map<string, number>();
+  const nomPrincipal = (l.conducteur?.nom_prenom || "").toLowerCase().trim();
+  const prenomPrincipal = (l.conducteur?.prenom_usuel || "").toLowerCase().trim();
+
+  for (const t of l.trajets) {
+    const badge = (t.conducteur_badge || "").trim();
+    if (!badge) continue;
+    const badgeNorm = badge.toLowerCase();
+    if (nomPrincipal && (badgeNorm === nomPrincipal || nomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    if (prenomPrincipal && (badgeNorm === prenomPrincipal || prenomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    let sec = 0;
+    if (t.heure_debut && t.heure_fin) {
+      const d1 = new Date(t.heure_debut).getTime();
+      const d2 = new Date(t.heure_fin).getTime();
+      if (d2 > d1) sec = Math.round((d2 - d1) / 1000);
+    }
+    mapRelais.set(badge, (mapRelais.get(badge) || 0) + sec);
+  }
+  return Array.from(mapRelais.entries()).map(([nom, duree_s]) => ({ nom, duree_s }));
+}
+
+function fmtDureeRelais(sec: number): string {
+  if (!sec || sec <= 0) return "";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h${String(m).padStart(2, "0")}`;
+}
+
 export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                                       lectureSeule, onEdit, pendingUI,
                                       masquerTCC }: GrilleSuiviProps) {
@@ -190,6 +224,7 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
         <tbody>
           {lignes.map((l) => {
             const estDoublonChauffeur = l.conducteur?.id ? (conducteursComptes.get(l.conducteur.id) || 0) > 1 : false;
+            const relais = extraireConducteursRelais(l);
             return (
             <tr key={l.id} className={cls(l.flag_tcc || l.flag_tcj || l.flag_ttj ? "bg-red-500/[0.04]" : "")}>
               <td className={cls("sticky left-0 z-10 font-bold whitespace-nowrap bg-white dark:bg-nuit-900")}>{l.plaque}</td>
@@ -232,8 +267,49 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                     <span className="text-[10.5px] text-slate-400 truncate max-w-[170px]" title={l.conducteur.nom_prenom}>
                       {l.conducteur.nom_prenom}
                     </span>
+                    {relais.length > 0 && (
+                      <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                        {relais.map((r) => (
+                          <span
+                            key={r.nom}
+                            className="px-1 py-0.2 rounded text-[9.5px] font-medium bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                            title={`Chauffeur relais ayant également conduit sur ce camion aujourd'hui : ${r.nom}${r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}`}
+                          >
+                            Relais : {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
+                          </span>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                ) : <span className="text-slate-400">—</span>}
+                ) : (
+                  relais.length > 0 ? (
+                    <div className="flex flex-col py-0.5">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-semibold text-slate-800 dark:text-slate-100">
+                          {relais[0].nom}
+                        </span>
+                        {relais[0].duree_s > 0 && (
+                          <span className="text-[10px] text-slate-400">
+                            ({fmtDureeRelais(relais[0].duree_s)})
+                          </span>
+                        )}
+                      </div>
+                      {relais.length > 1 && (
+                        <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                          {relais.slice(1).map((r) => (
+                            <span
+                              key={r.nom}
+                              className="px-1 py-0.2 rounded text-[9.5px] font-medium bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                              title={`Autre chauffeur ayant conduit : ${r.nom}`}
+                            >
+                              Relais : {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : <span className="text-slate-400">—</span>
+                )}
               </td>
               <td className="whitespace-nowrap text-slate-400 text-[12px]">{l.conducteur?.telephone || "—"}</td>
 

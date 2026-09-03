@@ -27,7 +27,7 @@ from openpyxl.utils import get_column_letter
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
-from ..config import jour_attribution, now_local
+from ..config import calculer_tokens_set, jour_attribution, now_local
 from ..database import get_db
 from ..engine import get_seuils
 from ..models import (Conducteur, HistoriqueJournalier, StatutConducteur,
@@ -87,6 +87,7 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
     groupes_canon: dict[str, list[Conducteur]] = {}
     id_vers_gardien: dict[str, Conducteur] = {}
     nom_norm_vers_gardien: dict[str, Conducteur] = {}
+    tset_vers_gardien: dict[str, Conducteur] = {}
 
     for c in conducteurs:
         cle = (c.nom_normalise or normaliser_libelle(c.nom_prenom))[:170]
@@ -112,6 +113,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
     # Liste unique des fiches gardiennes actives pour la vue
     gardiens_uniques = list({g.id: g for g in id_vers_gardien.values()}.values())
     gardiens_uniques.sort(key=lambda x: (x.nom_prenom or "").upper())
+
+    for g in gardiens_uniques:
+        tset = getattr(g, "tokens_set", None) or (calculer_tokens_set(g.nom_prenom)[:170] if g.nom_prenom else "")
+        if tset:
+            tset_vers_gardien[tset] = g
 
     # 2. Récupération des SuiviJournalier (avec trajets et véhicule)
     q_suivi = (
@@ -150,6 +156,15 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
             cle = normaliser_libelle(nom_str)[:170]
             if cle in nom_norm_vers_gardien:
                 return nom_norm_vers_gardien[cle]
+            tset = calculer_tokens_set(nom_str)[:170]
+            if tset in tset_vers_gardien:
+                return tset_vers_gardien[tset]
+            mots_c = set(tset.split())
+            if mots_c:
+                for g in gardiens_uniques:
+                    g_tokens = set((getattr(g, "tokens_set", None) or calculer_tokens_set(g.nom_prenom)).split())
+                    if mots_c.issubset(g_tokens) or (g.prenom_usuel and normaliser_libelle(g.prenom_usuel) in mots_c):
+                        return g
         return None
 
     # A. Intégration EXCLUSIVE de HistoriqueJournalier pour tous les jours passés archivés (j < jour_courant)
@@ -162,9 +177,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         d = h.donnees or {}
         plaque = (h.vehicule.plaque if h.vehicule else None) or d.get("plaque")
         trajets_snap = d.get("trajets") or []
+        tcj_archive = int(d.get("tcj_s") or 0)
+        ttj_archive = int(d.get("ttj_s") or 0)
 
+        trips_par_gardien: dict[str, list[dict]] = {}
         if trajets_snap:
-            par_chauffeur_snap: dict[str, tuple[Conducteur, int, int]] = {}
             for t in trajets_snap:
                 if not isinstance(t, dict):
                     continue
@@ -174,8 +191,10 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 if dist is not None and dist < 0.3:
                     continue
                 deb = _dt_iso(t.get("heure_debut"))
+                if deb is None:
+                    continue
                 fin = _dt_iso(t.get("heure_fin"))
-                duree = int((fin - deb).total_seconds()) if (deb and fin and fin >= deb) else 0
+                duree = int((fin - deb).total_seconds()) if (fin and fin >= deb) else 0
 
                 # Chauffeur spécifique du trajet
                 t_gard = resoudre_gardien(t.get("conducteur_badge_id"), t.get("conducteur_badge"))
@@ -183,67 +202,93 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                     t_gard = resoudre_gardien(h.conducteur_id, d.get("chauffeur") or plaque)
                 if not t_gard:
                     continue
-                tgid = t_gard.id
-                if conducteur_id_filtre and tgid != conducteur_id_filtre:
-                    continue
 
-                jours_archives_vus.add((tgid, j))
-                c_data = data_chauffeurs.setdefault(tgid, {"gardien": t_gard, "jours": {}, "spans": []})
-                if deb is not None:
-                    fin_eff = fin or (deb + timedelta(seconds=max(300, duree)))
-                    c_data["spans"].append((deb, fin_eff, plaque))
+                trips_par_gardien.setdefault(t_gard.id, []).append({
+                    "gardien": t_gard,
+                    "debut": deb,
+                    "fin": fin or (deb + timedelta(seconds=max(300, duree))),
+                    "duree": duree,
+                    "plaque": plaque
+                })
 
-                prev_tcj, prev_ttj = par_chauffeur_snap.get(tgid, (t_gard, 0, 0))[1:]
-                par_chauffeur_snap[tgid] = (t_gard, prev_tcj + duree, max(prev_ttj, duree))
-
-            for tgid, (t_gard, tcj_c, ttj_c) in par_chauffeur_snap.items():
-                c_data = data_chauffeurs[tgid]
-                if j not in c_data["jours"]:
-                    c_data["jours"][j] = {
-                        "tcj_s": tcj_c, "ttj_s": ttj_c,
-                        "vehicules": {plaque} if plaque else set(),
-                        "en_cours": False
-                    }
-                else:
-                    c_data["jours"][j]["tcj_s"] += tcj_c
-                    c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj_c)
-                    if plaque:
-                        c_data["jours"][j]["vehicules"].add(plaque)
-        else:
-            c_id = h.conducteur_id
-            gardien = resoudre_gardien(c_id, d.get("chauffeur") or plaque)
-            if not gardien:
-                continue
-            gid = gardien.id
-            if conducteur_id_filtre and gid != conducteur_id_filtre:
-                continue
-
-            jours_archives_vus.add((gid, j))
-            tcj = int(d.get("tcj_s") or 0)
-            ttj = int(d.get("ttj_s") or 0)
-
-            c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
-            if j not in c_data["jours"]:
-                c_data["jours"][j] = {
-                    "tcj_s": tcj, "ttj_s": ttj,
-                    "vehicules": {plaque} if plaque else set(),
-                    "en_cours": False
-                }
+        if trips_par_gardien:
+            nb_conducteurs = len(trips_par_gardien)
+            if nb_conducteurs == 1:
+                tgid, items = list(trips_par_gardien.items())[0]
+                t_gard = items[0]["gardien"]
+                if not conducteur_id_filtre or tgid == conducteur_id_filtre:
+                    jours_archives_vus.add((tgid, j))
+                    c_data = data_chauffeurs.setdefault(tgid, {"gardien": t_gard, "jours": {}, "spans": []})
+                    for it in items:
+                        c_data["spans"].append((it["debut"], it["fin"], plaque))
+                    tcj_val = tcj_archive if tcj_archive > 0 else sum(it["duree"] for it in items)
+                    ttj_val = max(ttj_archive, tcj_val)
+                    if j not in c_data["jours"]:
+                        c_data["jours"][j] = {
+                            "tcj_s": tcj_val, "ttj_s": ttj_val,
+                            "vehicules": {plaque} if plaque else set(),
+                            "en_cours": False
+                        }
+                    else:
+                        c_data["jours"][j]["tcj_s"] += tcj_val
+                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"] + ttj_val, c_data["jours"][j]["tcj_s"])
+                        if plaque:
+                            c_data["jours"][j]["vehicules"].add(plaque)
             else:
-                c_data["jours"][j]["tcj_s"] += tcj
-                c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj)
-                if plaque:
-                    c_data["jours"][j]["vehicules"].add(plaque)
+                for tgid, items in trips_par_gardien.items():
+                    if conducteur_id_filtre and tgid != conducteur_id_filtre:
+                        continue
+                    t_gard = items[0]["gardien"]
+                    jours_archives_vus.add((tgid, j))
+                    c_data = data_chauffeurs.setdefault(tgid, {"gardien": t_gard, "jours": {}, "spans": []})
+                    for it in items:
+                        c_data["spans"].append((it["debut"], it["fin"], plaque))
+                    tcj_c = sum(it["duree"] for it in items)
+                    deb_min = min(it["debut"] for it in items)
+                    fin_max = max(it["fin"] for it in items)
+                    amp = int((fin_max - deb_min).total_seconds())
+                    ttj_c = max(amp, tcj_c)
+                    if j not in c_data["jours"]:
+                        c_data["jours"][j] = {
+                            "tcj_s": tcj_c, "ttj_s": ttj_c,
+                            "vehicules": {plaque} if plaque else set(),
+                            "en_cours": False
+                        }
+                    else:
+                        c_data["jours"][j]["tcj_s"] += tcj_c
+                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"] + ttj_c, c_data["jours"][j]["tcj_s"])
+                        if plaque:
+                            c_data["jours"][j]["vehicules"].add(plaque)
+        else:
+            gardien = resoudre_gardien(h.conducteur_id, d.get("chauffeur") or plaque)
+            if gardien:
+                gid = gardien.id
+                if not conducteur_id_filtre or gid == conducteur_id_filtre:
+                    jours_archives_vus.add((gid, j))
+                    c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
+                    tcj_val = tcj_archive
+                    ttj_val = max(ttj_archive, tcj_val)
+                    if j not in c_data["jours"]:
+                        c_data["jours"][j] = {
+                            "tcj_s": tcj_val, "ttj_s": ttj_val,
+                            "vehicules": {plaque} if plaque else set(),
+                            "en_cours": False
+                        }
+                    else:
+                        c_data["jours"][j]["tcj_s"] += tcj_val
+                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"] + ttj_val, c_data["jours"][j]["tcj_s"])
+                        if plaque:
+                            c_data["jours"][j]["vehicules"].add(plaque)
 
-            if tcj > 0:
-                h_dep = _dt_iso(d.get("heure_depart"))
-                if h_dep is not None:
-                    fin_eff = h_dep + timedelta(seconds=max(1800, ttj or tcj))
-                    c_data["spans"].append((h_dep, fin_eff, plaque))
-                else:
-                    deb_def = datetime.combine(j, datetime.min.time()).replace(hour=6)
-                    fin_def = deb_def + timedelta(seconds=max(1800, ttj or tcj))
-                    c_data["spans"].append((deb_def, fin_def, plaque))
+                    if tcj_val > 0:
+                        h_dep = _dt_iso(d.get("heure_depart"))
+                        if h_dep is not None:
+                            fin_eff = h_dep + timedelta(seconds=max(1800, ttj_val or tcj_val))
+                            c_data["spans"].append((h_dep, fin_eff, plaque))
+                        else:
+                            deb_def = datetime.combine(j, datetime.min.time()).replace(hour=6)
+                            fin_def = deb_def + timedelta(seconds=max(1800, ttj_val or tcj_val))
+                            c_data["spans"].append((deb_def, fin_def, plaque))
 
     # B. Intégration de SuiviJournalier :
     #    - EXCLUSIF pour aujourd'hui (j == jour_courant)
@@ -252,9 +297,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         j = s.date_jour
         is_today = (j == jour_courant)
         plaque = s.vehicule.plaque if s.vehicule else None
+        tcj_suivi = int(s.tcj_s or 0)
+        ttj_suivi = int(s.ttj_s or 0)
 
+        trips_par_gardien_suivi: dict[str, list[dict]] = {}
         if s.trajets:
-            par_chauffeur_suivi: dict[str, tuple[Conducteur, int, int]] = {}
             for t in s.trajets:
                 if t.statut_validation == StatutValidationTrajet.REJETE:
                     continue
@@ -276,59 +323,101 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                     t_gard = resoudre_gardien(s.conducteur_id, None)
                 if not t_gard:
                     continue
-                tgid = t_gard.id
-                if conducteur_id_filtre and tgid != conducteur_id_filtre:
-                    continue
 
-                if not is_today and (tgid, j) in jours_archives_vus:
-                    continue
+                trips_par_gardien_suivi.setdefault(t_gard.id, []).append({
+                    "gardien": t_gard,
+                    "debut": deb,
+                    "fin": fin_eff,
+                    "duree": duree,
+                    "plaque": plaque
+                })
 
-                c_data = data_chauffeurs.setdefault(tgid, {"gardien": t_gard, "jours": {}, "spans": []})
-                c_data["spans"].append((deb, fin_eff, plaque))
-
-                prev_tcj, prev_ttj = par_chauffeur_suivi.get(tgid, (t_gard, 0, 0))[1:]
-                par_chauffeur_suivi[tgid] = (t_gard, prev_tcj + duree, max(prev_ttj, duree))
-
-            for tgid, (t_gard, tcj_c, ttj_c) in par_chauffeur_suivi.items():
-                c_data = data_chauffeurs[tgid]
-                if j not in c_data["jours"]:
-                    c_data["jours"][j] = {
-                        "tcj_s": tcj_c, "ttj_s": ttj_c,
-                        "vehicules": {plaque} if plaque else set(),
-                        "en_cours": is_today
-                    }
-                else:
-                    c_data["jours"][j]["tcj_s"] += tcj_c
-                    c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj_c)
-                    if plaque:
-                        c_data["jours"][j]["vehicules"].add(plaque)
-                    if is_today:
-                        c_data["jours"][j]["en_cours"] = True
+        if trips_par_gardien_suivi:
+            nb_conducteurs = len(trips_par_gardien_suivi)
+            if nb_conducteurs == 1:
+                tgid, items = list(trips_par_gardien_suivi.items())[0]
+                t_gard = items[0]["gardien"]
+                if not conducteur_id_filtre or tgid == conducteur_id_filtre:
+                    if is_today or (tgid, j) not in jours_archives_vus:
+                        c_data = data_chauffeurs.setdefault(tgid, {"gardien": t_gard, "jours": {}, "spans": []})
+                        for it in items:
+                            c_data["spans"].append((it["debut"], it["fin"], plaque))
+                        tcj_val = tcj_suivi if tcj_suivi > 0 else sum(it["duree"] for it in items)
+                        ttj_val = max(ttj_suivi, tcj_val)
+                        if j not in c_data["jours"]:
+                            c_data["jours"][j] = {
+                                "tcj_s": tcj_val, "ttj_s": ttj_val,
+                                "vehicules": {plaque} if plaque else set(),
+                                "en_cours": is_today
+                            }
+                        else:
+                            c_data["jours"][j]["tcj_s"] += tcj_val
+                            c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"] + ttj_val, c_data["jours"][j]["tcj_s"])
+                            if plaque:
+                                c_data["jours"][j]["vehicules"].add(plaque)
+                            if is_today:
+                                c_data["jours"][j]["en_cours"] = True
+            else:
+                for tgid, items in trips_par_gardien_suivi.items():
+                    if conducteur_id_filtre and tgid != conducteur_id_filtre:
+                        continue
+                    if not is_today and (tgid, j) in jours_archives_vus:
+                        continue
+                    t_gard = items[0]["gardien"]
+                    c_data = data_chauffeurs.setdefault(tgid, {"gardien": t_gard, "jours": {}, "spans": []})
+                    for it in items:
+                        c_data["spans"].append((it["debut"], it["fin"], plaque))
+                    tcj_c = sum(it["duree"] for it in items)
+                    deb_min = min(it["debut"] for it in items)
+                    fin_max = max(it["fin"] for it in items)
+                    amp = int((fin_max - deb_min).total_seconds())
+                    ttj_c = max(amp, tcj_c)
+                    if j not in c_data["jours"]:
+                        c_data["jours"][j] = {
+                            "tcj_s": tcj_c, "ttj_s": ttj_c,
+                            "vehicules": {plaque} if plaque else set(),
+                            "en_cours": is_today
+                        }
+                    else:
+                        c_data["jours"][j]["tcj_s"] += tcj_c
+                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"] + ttj_c, c_data["jours"][j]["tcj_s"])
+                        if plaque:
+                            c_data["jours"][j]["vehicules"].add(plaque)
+                        if is_today:
+                            c_data["jours"][j]["en_cours"] = True
         else:
             gardien = resoudre_gardien(s.conducteur_id, None)
             if gardien:
                 gid = gardien.id
                 if not conducteur_id_filtre or gid == conducteur_id_filtre:
-                    if not is_today and (gid, j) in jours_archives_vus:
-                        continue
+                    if is_today or (gid, j) not in jours_archives_vus:
+                        c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
+                        tcj_val = tcj_suivi
+                        ttj_val = max(ttj_suivi, tcj_val)
 
-                    c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
-                    tcj = int(s.tcj_s or 0)
-                    ttj = int(s.ttj_s or 0)
+                        if j not in c_data["jours"]:
+                            c_data["jours"][j] = {
+                                "tcj_s": tcj_val, "ttj_s": ttj_val,
+                                "vehicules": {plaque} if plaque else set(),
+                                "en_cours": is_today
+                            }
+                        else:
+                            c_data["jours"][j]["tcj_s"] += tcj_val
+                            c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"] + ttj_val, c_data["jours"][j]["tcj_s"])
+                            if plaque:
+                                c_data["jours"][j]["vehicules"].add(plaque)
+                            if is_today:
+                                c_data["jours"][j]["en_cours"] = True
 
-                    if j not in c_data["jours"]:
-                        c_data["jours"][j] = {
-                            "tcj_s": tcj, "ttj_s": ttj,
-                            "vehicules": {plaque} if plaque else set(),
-                            "en_cours": is_today
-                        }
-                    else:
-                        c_data["jours"][j]["tcj_s"] += tcj
-                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj)
-                        if plaque:
-                            c_data["jours"][j]["vehicules"].add(plaque)
-                        if is_today:
-                            c_data["jours"][j]["en_cours"] = True
+                        if tcj_val > 0:
+                            h_dep = s.heure_depart
+                            if h_dep is not None:
+                                fin_eff = h_dep + timedelta(seconds=max(1800, ttj_val or tcj_val))
+                                c_data["spans"].append((h_dep, fin_eff, plaque))
+                            else:
+                                deb_def = datetime.combine(j, datetime.min.time()).replace(hour=6)
+                                fin_def = deb_def + timedelta(seconds=max(1800, ttj_val or tcj_val))
+                                c_data["spans"].append((deb_def, fin_def, plaque))
 
     # 4. Calcul de l'algorithme TCH (détection du reset 24h et cumul hebdomadaire)
     resultats_lignes = []

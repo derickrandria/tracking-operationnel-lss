@@ -42,6 +42,16 @@ def setup():
     Base.metadata.create_all(bind=_engine)
     db = SessionLocal()
     try:
+        # Nettoyage préalable des données de test
+        db.query(Trajet).filter(Trajet.id.in_(["t-lundi-1", "t-mardi-1", "t-jeudi-1", "t-vendredi-1",
+                                               "t-paul-1", "t-paul-2", "t-paul-3", "t-paul-4", "t-paul-5", "t-paul-6"])).delete(synchronize_session=False)
+        db.query(SuiviJournalier).filter(SuiviJournalier.id.in_(["s-lundi-1", "s-mardi-1", "s-jeudi-1", "s-vendredi-1",
+                                                               "s-paul-1", "s-paul-2", "s-paul-3", "s-paul-4", "s-paul-5", "s-paul-6"])).delete(synchronize_session=False)
+        db.query(Alerte).filter(Alerte.conducteur_id.in_(["cond-001", "cond-002"])).delete(synchronize_session=False)
+        db.query(Vehicule).filter(Vehicule.id.in_(["veh-001", "veh-002", "veh-003"])).delete(synchronize_session=False)
+        db.query(Conducteur).filter(Conducteur.id.in_(["cond-001", "cond-002"])).delete(synchronize_session=False)
+        db.commit()
+
         # Utilisateur de test
         if not db.scalar(select(User).where(User.username == "admin_test")):
             db.add(User(username="admin_test", password_hash=hash_password("Pass@123"),
