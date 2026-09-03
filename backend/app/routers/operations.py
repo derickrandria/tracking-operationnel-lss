@@ -330,9 +330,14 @@ def liste_missions(date_debut: str | None = None, date_fin: str | None = None,
                    vehicule_id: str | None = None, depot: str | None = None,
                    distributeur: str | None = None, q: str | None = None,
                    date: str | None = None,  # compatibilité rétroactive
-                   db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+                   rattrapage: bool = False,
+                   db: Session = Depends(get_db), user=Depends(require_roles(*TOUS))):
     if date and not date_debut and not date_fin:
         date_debut = date_fin = date
+
+    if rattrapage:
+        from ..engine import rattraper_missions_7j
+        rattraper_missions_7j(db)
 
     debut, fin, missions = _recuperer_missions_filtrees(
         db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
@@ -355,6 +360,21 @@ def liste_missions(date_debut: str | None = None, date_fin: str | None = None,
         "date_fin": fin.isoformat(),
         "stats": stats,
         "missions": [s_mission(m, inf_counts.get(m.id, 0)) for m in missions],
+    }
+
+
+@router.post("/missions/rattrapage")
+@router.get("/missions/rattrapage-7j")
+def declencher_rattrapage_missions_7j(db: Session = Depends(get_db),
+                                      user=Depends(require_roles(*TOUS))):
+    """Exécute la collecte rétrospective et reconstruction des missions sur les 7 derniers jours (§3)."""
+    from ..engine import rattraper_missions_7j
+    stats = rattraper_missions_7j(db)
+    audit(db, user, "mission.rattrapage_7j", "mission", "rattrapage_7j", stats)
+    return {
+        "statut": "OK",
+        "message": "Collecte rétrospective et rattrapage sur 7 jours exécutés avec succès.",
+        "stats": stats
     }
 
 

@@ -135,8 +135,11 @@ export interface Mission {
   statut: "EN_COURS" | "TERMINÉE" | "DÉVIÉE" | "RETARDÉE";
   statut_camion_actuel?: "VIDE" | "CHARGE" | "CHARGÉ" | "LIBRE" | string;
   heure_debut: string | null;
+  date_debut?: string | null;
   heure_chargement?: string | null;
+  date_chargement?: string | null;
   heure_fin: string | null;
+  date_fin?: string | null;
   duree_s: number;
   numero_ot: string | null;
   produit: string | null;

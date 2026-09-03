@@ -32,9 +32,9 @@ from app.engine import (appliquer_champs_suivi, ensure_suivi,
                         ingest_event, initialiser_ou_maj_mission)
 from app.geozones import detecter_zone_logistique, normaliser_code_depot
 from app.main import app
-from app.models import (Conducteur, Mission, StatutCamion,
+from app.models import (Conducteur, EvenementGPS, Mission, StatutCamion,
                         StatutConducteur, StatutMission,
-                        StatutVehicule, SuiviJournalier, Vehicule)
+                        StatutVehicule, SuiviJournalier, TypeEvenement, Vehicule)
 from app.seed import seed_si_vide
 
 # Initialisation base de test
@@ -266,8 +266,97 @@ def test_missions_complet():
     assert "statut_operationnel" in veh_v
     print(f"  ✅ Statut opérationnel véhicule : {veh_v['statut_operationnel']}")
 
+    # -------------------------------------------------------------------------
+    # 9. Test des 3 colonnes d'horodatages distinctes
+    # -------------------------------------------------------------------------
+    print("\n[T9] Test des 3 colonnes d'horodatages distinctes (Début, Chargement, Déchargement)")
+    m_json = client.get("/api/missions", headers=headers).json()["missions"][0]
+    assert "date_debut" in m_json and "heure_debut" in m_json
+    assert "date_chargement" in m_json and "heure_chargement" in m_json
+    assert "date_fin" in m_json and "heure_fin" in m_json
+    assert m_json["date_debut"] is not None
+    assert m_json["date_chargement"] is not None
+    assert m_json["date_fin"] is not None
+    print(f"  ✅ Début Mission : {m_json['date_debut']}")
+    print(f"  ✅ Date Chargement : {m_json['date_chargement']}")
+    print(f"  ✅ Date Déchargement : {m_json['date_fin']}")
+
+    # -------------------------------------------------------------------------
+    # 10. Test Collecte rétrospective & Rattrapage 7 jours
+    # -------------------------------------------------------------------------
+    print("\n[T10] Test Collecte rétrospective & Rattrapage 7 jours (API + Anti-doublon Upsert)")
+    # Appel de l'endpoint de rattrapage
+    res_rat = client.post("/api/missions/rattrapage", headers=headers)
+    assert res_rat.status_code == 200
+    res_rat_data = res_rat.json()
+    assert res_rat_data["statut"] == "OK"
+    assert "stats" in res_rat_data
+    print(f"  ✅ Endpoint /api/missions/rattrapage 200 OK — stats: {res_rat_data['stats']}")
+
+    # Création d'une mission incomplète pour tester l'upsert
+    j_hier = aujourd - timedelta(days=1)
+    m_incompl = Mission(
+        id="test-miss-incompl",
+        code_mission="MIS-TEST-INC",
+        date_jour=j_hier,
+        vehicule_id=v.id,
+        conducteur_id=c.id,
+        numero_mission_du_jour=2,
+        statut=StatutMission.EN_COURS,
+        statut_camion_actuel="VIDE",
+        heure_debut=datetime.combine(j_hier, time(5, 30)),
+        heure_chargement=None,
+        heure_fin=None,
+        numero_ot="OT-INC-1",
+        depot_prevu="DABE"
+    )
+    db.add(m_incompl)
+    db.commit()
+
+    # Création d'événements GPS hier : départ base 05:30, sortie GRT 09:30, déchargement 19:00
+    ev_dep_hier = EvenementGPS(
+        vehicule_id=v.id,
+        horodatage=datetime.combine(j_hier, time(5, 30)),
+        latitude=-18.9100,
+        longitude=47.7500,
+        adresse="RN2 · Sortie Base Tana",
+        vitesse=45.0,
+        type_evenement=TypeEvenement.DEBUT_MOUVEMENT
+    )
+    ev_grt_hier = EvenementGPS(
+        vehicule_id=v.id,
+        horodatage=datetime.combine(j_hier, time(9, 30)),
+        latitude=-18.1820,
+        longitude=49.2680,
+        adresse="RN2 · Ranomainty (Sortie GRT)",
+        vitesse=40.0,
+        type_evenement=TypeEvenement.POSITION
+    )
+    ev_dech_hier = EvenementGPS(
+        vehicule_id=v.id,
+        horodatage=datetime.combine(j_hier, time(19, 0)),
+        latitude=-19.8659,
+        longitude=47.0333,
+        adresse="Dépôt DABE — Antsirabe",
+        vitesse=0.0,
+        type_evenement=TypeEvenement.ARRET
+    )
+    db.add_all([ev_dep_hier, ev_grt_hier, ev_dech_hier])
+    db.commit()
+
+    # Déclenchement du rattrapage
+    from app.engine import rattraper_missions_7j
+    stats_rep = rattraper_missions_7j(db, datetime.combine(aujourd, time(12, 0)))
+    db.refresh(m_incompl)
+
+    assert m_incompl.heure_chargement is not None, "heure_chargement doit être rattrapée par l'upsert"
+    assert m_incompl.heure_fin is not None, "heure_fin doit être rattrapée par l'upsert"
+    assert m_incompl.statut == StatutMission.TERMINEE, "statut doit être clôturé à TERMINÉE"
+    assert m_incompl.statut_camion_actuel == "LIBRE", "camion doit repasser à LIBRE"
+    print("  ✅ Anti-doublon / Upsert confirmé : mission incomplète mise à jour avec les horodatages manquants")
+
     print("\n============================================================")
-    print("TOUS LES TESTS MISSIONS PASSENT AVEC SUCCÈS (8/8)")
+    print("TOUS LES TESTS MISSIONS PASSENT AVEC SUCCÈS (10/10)")
     print("============================================================")
 
 

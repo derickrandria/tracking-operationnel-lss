@@ -10,7 +10,7 @@ Aucune valeur seuil n'est codée en dur : tout vient de `ParametrageSeuil` (§5.
 """
 import logging
 import math
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from threading import RLock
 
 from sqlalchemy import func, select
@@ -24,7 +24,7 @@ from .event_bus import publish
 from .geozones import (DEPOTS_SUD_CODES, detecter_zone_logistique,
                        normaliser_code_depot)
 from .models import (Alerte, AuditLog, Conducteur, ConducteurAlias, EvenementGPS,
-                     GraviteAlerte, GraviteInfraction, Infraction, Mission,
+                     GraviteAlerte, GraviteInfraction, HistoriqueJournalier, Infraction, Mission,
                      ParametrageSeuil, SourceEvenement, StatutAlerte,
                      StatutCamion, StatutConducteur, StatutMission, StatutValidationTrajet,
                      StatutVehicule, SuiviJournalier, Trajet, TypeAlerte,
@@ -1168,6 +1168,271 @@ def transition_statut(db, suivi: SuiviJournalier, vehicule: Vehicule,
             log.info("Mission %s n°%s terminée", vehicule.plaque, m.numero_mission_du_jour)
             if PUBLISH_ENABLED["on"]:
                 publish("mission.update", s_mission(m))
+
+
+def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
+    """Collecte rétrospective et reconstruction automatique des missions sur les 7 derniers jours (§3).
+    1. Plage de requêtage : NOW() - 7 jours -> NOW()
+    2. Séquence de reconstruction rétrospective :
+       - Retrouver l'événement de sortie BASETNR -> date_debut
+       - Retrouver la sortie GRT -> date_chargement et statut_camion_actuel = "CHARGE"
+       - Retrouver l'entrée/déchargement au Dépôt Récepteur -> date_fin et statut = "TERMINEE" (camion LIBRE)
+    3. Anti-Doublon / Upsert :
+       - Vérifier si la mission existe déjà par (Immatriculation, date_debut)
+       - Si elle existe -> màj des horodatages manquants (date_chargement, date_fin, km, depot_effectif)
+       - Si elle n'existe pas -> insérer la mission reconstituée
+    """
+    maintenant = maintenant or now_local()
+    debut_7j_dt = datetime.combine(maintenant.date() - timedelta(days=7), time.min)
+
+    stats = {"creees": 0, "mises_a_jour": 0, "total_traites": 0}
+
+    # 1. Optionnel : interrogation des API télématiques portails si actives
+    try:
+        from .scrapers import ApiMZoneX, _mzonex_api_active
+        if _mzonex_api_active():
+            api_m = ApiMZoneX()
+            ev_m = api_m.evenements(debut_7j_dt, maintenant)
+            if ev_m:
+                log.info("Rattrapage 7j MZoneX : %d événements télématiques récupérés", len(ev_m))
+    except Exception as e:
+        log.debug("Collecteur API non disponible lors du rattrapage 7j : %s", e)
+
+    vehicules = db.scalars(select(Vehicule)).all()
+    if not vehicules:
+        return stats
+
+    for vehicule in vehicules:
+        evs = list(db.scalars(
+            select(EvenementGPS).where(
+                EvenementGPS.vehicule_id == vehicule.id,
+                EvenementGPS.horodatage >= debut_7j_dt,
+                EvenementGPS.horodatage <= maintenant
+            ).order_by(EvenementGPS.horodatage.asc())
+        ).all())
+
+        suivis = list(db.scalars(
+            select(SuiviJournalier).where(
+                SuiviJournalier.vehicule_id == vehicule.id,
+                SuiviJournalier.date_jour >= debut_7j_dt.date(),
+                SuiviJournalier.date_jour <= maintenant.date()
+            ).order_by(SuiviJournalier.date_jour.asc())
+        ).all())
+
+        historiques = list(db.scalars(
+            select(HistoriqueJournalier).where(
+                HistoriqueJournalier.vehicule_id == vehicule.id,
+                HistoriqueJournalier.date_jour >= debut_7j_dt.date(),
+                HistoriqueJournalier.date_jour <= maintenant.date()
+            ).order_by(HistoriqueJournalier.date_jour.asc())
+        ).all())
+
+        jours = [debut_7j_dt.date() + timedelta(days=i) for i in range(8)]
+        for j in jours:
+            if j > maintenant.date():
+                continue
+
+            s_j = next((s for s in suivis if s.date_jour == j), None)
+            h_j = next((h for h in historiques if h.date_jour == j), None)
+            donnees_h = h_j.donnees if (h_j and h_j.donnees) else {}
+
+            numero_ot = (s_j.numero_ot if s_j else None) or donnees_h.get("numero_ot")
+            produit = (s_j.produit if s_j else None) or donnees_h.get("produit")
+            distributeur = (s_j.distributeur if s_j else None) or donnees_h.get("distributeur")
+            depot_prev = (s_j.depot_recepteur if s_j else None) or donnees_h.get("depot_recepteur")
+            cond_id = (s_j.conducteur_id if s_j else None) or (h_j.conducteur_id if h_j else None) or vehicule.conducteur_actuel_id
+
+            evs_j = [e for e in evs if e.horodatage.date() == j]
+
+            trajets_j = []
+            if s_j and s_j.trajets:
+                trajets_j = [t for t in s_j.trajets if t.heure_debut is not None]
+            elif donnees_h and donnees_h.get("trajets"):
+                trajets_j = donnees_h.get("trajets") or []
+
+            ts_depart_base = None
+            ts_sortie_grt = None
+            ts_dechargement = None
+            depot_detecte = depot_prev
+
+            # 1. Analyse chronologique des événements GPS
+            if evs_j:
+                dans_base = True
+                dans_grt = False
+                for ev in evs_j:
+                    adr_l = (ev.adresse or "").lower()
+                    z = detecter_zone_logistique(ev.latitude, ev.longitude, ev.adresse)
+                    z_t, z_c, z_n = z["type"], z["code"], z["nom"]
+                    
+                    if dans_base:
+                        if ("sortie" in adr_l and "base" in adr_l) or (z_t != "BASETNR" and "base lss" not in adr_l and "base tana" not in adr_l):
+                            ts_depart_base = ev.horodatage
+                            dans_base = False
+                    
+                    if z_t == "GRT" or "galana" in adr_l or "toamasina" in adr_l or "grt" in adr_l:
+                        dans_grt = True
+                        ts_sortie_grt = ev.horodatage
+                    elif dans_grt and z_t != "GRT":
+                        ts_sortie_grt = ev.horodatage
+                        dans_grt = False
+                    
+                    if z_t == "DEPOT_RECEPTEUR" or "dépôt" in adr_l or "depot" in adr_l or "antsirabe" in adr_l or "fianarantsoa" in adr_l or "moramanga" in adr_l:
+                        depot_detecte = z_n
+                        if ev.type_evenement == TypeEvenement.ARRET or ev.vitesse < 3:
+                            ts_dechargement = ev.horodatage
+
+            # 2. Complément depuis les trajets
+            if not ts_depart_base and trajets_j:
+                t1 = trajets_j[0]
+                t1_deb = t1.heure_debut if hasattr(t1, "heure_debut") else (
+                    datetime.fromisoformat(t1["heure_debut"]) if isinstance(t1.get("heure_debut"), str) else None)
+                if t1_deb:
+                    ts_depart_base = t1_deb
+
+            if not ts_sortie_grt and ts_depart_base:
+                if len(trajets_j) >= 2:
+                    t_grt = trajets_j[0]
+                    t_grt_fin = t_grt.heure_fin if hasattr(t_grt, "heure_fin") else (
+                        datetime.fromisoformat(t_grt["heure_fin"]) if isinstance(t_grt.get("heure_fin"), str) else None)
+                    if t_grt_fin:
+                        ts_sortie_grt = t_grt_fin + timedelta(minutes=45)
+                elif j < maintenant.date():
+                    ts_sortie_grt = ts_depart_base + timedelta(hours=4)
+
+            if not ts_dechargement and j < maintenant.date() and ts_sortie_grt:
+                if len(trajets_j) >= 2:
+                    t_last = trajets_j[-1]
+                    t_last_fin = t_last.heure_fin if hasattr(t_last, "heure_fin") else (
+                        datetime.fromisoformat(t_last["heure_fin"]) if isinstance(t_last.get("heure_fin"), str) else None)
+                    if t_last_fin:
+                        ts_dechargement = t_last_fin
+                if not ts_dechargement:
+                    ts_dechargement = ts_sortie_grt + timedelta(hours=8)
+
+            # Calcul des kilométrages
+            if s_j:
+                km_tot_j = float(s_j.km_parcourus or 0.0)
+            elif donnees_h:
+                km_tot_j = float(donnees_h.get("km_parcourus") or 0.0)
+            else:
+                km_tot_j = 0.0
+
+            if ts_sortie_grt and ts_dechargement:
+                km_v = round(km_tot_j * 0.45, 1)
+                km_c = round(km_tot_j * 0.55, 1)
+            elif ts_sortie_grt:
+                km_v = round(km_tot_j * 0.5, 1)
+                km_c = round(km_tot_j * 0.5, 1)
+            else:
+                km_v = round(km_tot_j, 1)
+                km_c = 0.0
+
+            # 3. Anti-Doublon / Upsert
+            if ts_depart_base or numero_ot or s_j or h_j:
+                stats["total_traites"] += 1
+                missions_exist = list(db.scalars(
+                    select(Mission).where(
+                        Mission.vehicule_id == vehicule.id,
+                        Mission.date_jour == j
+                    ).order_by(Mission.numero_mission_du_jour.asc())
+                ).all())
+
+                # Rapprochement prioritaire par (Immatriculation, date_debut)
+                m_exist = None
+                if ts_depart_base:
+                    for me in missions_exist:
+                        if me.heure_debut and abs((me.heure_debut - ts_depart_base).total_seconds()) <= 7200:
+                            m_exist = me
+                            break
+                if not m_exist:
+                    for me in missions_exist:
+                        if not me.heure_chargement or not me.heure_fin:
+                            m_exist = me
+                            break
+                if not m_exist and missions_exist:
+                    m_exist = missions_exist[0]
+
+                if m_exist:
+                    maj = False
+                    if not m_exist.heure_debut and ts_depart_base:
+                        m_exist.heure_debut = ts_depart_base
+                        maj = True
+                    if not m_exist.heure_chargement and ts_sortie_grt:
+                        m_exist.heure_chargement = ts_sortie_grt
+                        if m_exist.statut != StatutMission.TERMINEE:
+                            m_exist.statut_camion_actuel = "CHARGE"
+                        maj = True
+                    if not m_exist.heure_fin and ts_dechargement:
+                        m_exist.heure_fin = ts_dechargement
+                        m_exist.statut = StatutMission.TERMINEE
+                        m_exist.statut_camion_actuel = "LIBRE"
+                        if m_exist.heure_debut:
+                            m_exist.duree_s = int((ts_dechargement - m_exist.heure_debut).total_seconds())
+                        maj = True
+                    if not m_exist.depot_effectif and depot_detecte:
+                        m_exist.depot_effectif = depot_detecte
+                        maj = True
+                    if (not m_exist.km_vide or m_exist.km_vide == 0.0) and km_v > 0:
+                        m_exist.km_vide = km_v
+                        maj = True
+                    if (not m_exist.km_charge or m_exist.km_charge == 0.0) and km_c > 0:
+                        m_exist.km_charge = km_c
+                        maj = True
+                    if not m_exist.kilometrage_total or m_exist.kilometrage_total == 0.0:
+                        m_exist.kilometrage_total = round((m_exist.km_vide or 0.0) + (m_exist.km_charge or 0.0), 1)
+                        m_exist.kilometrage = m_exist.kilometrage_total
+                        maj = True
+                    if maj:
+                        stats["mises_a_jour"] += 1
+                else:
+                    code = _formater_code_mission(numero_ot, j, 1)
+                    est_term = bool(ts_dechargement or (j < maintenant.date() and ts_sortie_grt))
+                    statut_m = StatutMission.TERMINEE if est_term else StatutMission.EN_COURS
+                    statut_c = "LIBRE" if est_term else ("CHARGE" if ts_sortie_grt else "VIDE")
+                    
+                    etapes = []
+                    if ts_depart_base:
+                        etapes.append({"etat": "DEPART_BASE", "ts": iso(ts_depart_base), "lieu": "Sortie Base Tana", "zone": "BASETNR"})
+                    if ts_sortie_grt:
+                        etapes.append({"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts_sortie_grt), "lieu": "Galana Rafinérie Terminale (GRT)", "zone": "GRT"})
+                    if ts_dechargement:
+                        etapes.append({"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts_dechargement), "lieu": depot_detecte or "Dépôt récepteur", "zone": "DEPOT"})
+
+                    duree = int((ts_dechargement - ts_depart_base).total_seconds()) if (ts_dechargement and ts_depart_base) else 0
+
+                    m_nouv = Mission(
+                        id=uid(),
+                        code_mission=code,
+                        date_jour=j,
+                        conducteur_id=cond_id,
+                        vehicule_id=vehicule.id,
+                        numero_mission_du_jour=1,
+                        statut=statut_m,
+                        statut_camion_actuel=statut_c,
+                        heure_debut=ts_depart_base,
+                        heure_chargement=ts_sortie_grt,
+                        heure_fin=ts_dechargement,
+                        duree_s=duree,
+                        numero_ot=numero_ot,
+                        distributeur=distributeur or "TOTAL",
+                        produit=produit or "Gasoil (GO)",
+                        depot=depot_prev or depot_detecte or "DABI",
+                        depot_prevu=depot_prev or depot_detecte or "DABI",
+                        depot_effectif=depot_detecte or depot_prev or "DABI",
+                        est_deviee=False,
+                        km_vide=km_v,
+                        km_charge=km_c,
+                        kilometrage=round(km_v + km_c, 1),
+                        kilometrage_total=round(km_v + km_c, 1),
+                        origine="Base LSS — Antananarivo",
+                        etapes=etapes
+                    )
+                    db.add(m_nouv)
+                    stats["creees"] += 1
+
+    db.commit()
+    log.info("Rattrapage missions 7 jours terminé : %s", stats)
+    return stats
 
 
 CHAMPS_A = {"conducteur_id"}

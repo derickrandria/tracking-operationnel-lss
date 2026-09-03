@@ -23,8 +23,22 @@ export function fmtHeure(iso: string | null | undefined): string {
 
 export function fmtDateHeure(iso: string | null | undefined): string {
   if (!iso) return "—";
-  const d = new Date(iso);
-  return `${d.toLocaleDateString("fr-FR")} ${d.toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })}`;
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) {
+      // Fallback si chaîne non standard
+      const clean = iso.replace("T", " ").slice(0, 16);
+      return clean || "—";
+    }
+    const day = String(d.getDate()).padStart(2, "0");
+    const month = String(d.getMonth() + 1).padStart(2, "0");
+    const year = d.getFullYear();
+    const hours = String(d.getHours()).padStart(2, "0");
+    const minutes = String(d.getMinutes()).padStart(2, "0");
+    return `${day}/${month}/${year} ${hours}:${minutes}`;
+  } catch {
+    return String(iso).slice(0, 16).replace("T", " ");
+  }
 }
 
 export function fmtDateFr(iso: string | null | undefined): string {

@@ -655,9 +655,19 @@ def export_historique_pdf(du, au, jours: list, synthese: list[dict],
 # =============================================================================
 # EXPORTS MISSIONS (Module 3 — Reconstitution & Suivi Logistique)
 # =============================================================================
+def _fmt_dt_complet(iso_val: str | None) -> str:
+    if not iso_val:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_val))
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(iso_val)[:16].replace("T", " ")
+
+
 def export_missions_excel(titre_periode: str, missions: list[dict],
                           utilisateur: str = "") -> bytes:
-    """Export Excel de l'onglet Missions avec les 4 blocs de colonnes."""
+    """Export Excel de l'onglet Missions avec les 3 colonnes d'horodatages distinctes."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Missions"
@@ -666,7 +676,7 @@ def export_missions_excel(titre_periode: str, missions: list[dict],
         "N° Mission", "Date", "Chauffeur", "Immatriculation",
         "N° OT", "Distributeur", "Produit", "Dépôt Prévu", "Destination Réelle",
         "Statut Camion", "Statut Mission",
-        "Départ OT", "Chargement GRT", "Livraison / Fin",
+        "Début Mission", "Date Chargement", "Date Déchargement",
         "Durée", "Km Vide", "Km Chargé", "Km Total", "Nb Infractions"
     ]
 
@@ -697,6 +707,10 @@ def export_missions_excel(titre_periode: str, missions: list[dict],
         if m.get("est_deviee"):
             depot_eff = f"{depot_eff} (DÉVIÉE)"
 
+        deb_str = _fmt_dt_complet(m.get("heure_debut") or m.get("date_debut")) or "En attente"
+        chg_str = _fmt_dt_complet(m.get("heure_chargement") or m.get("date_chargement")) or "—"
+        fin_str = _fmt_dt_complet(m.get("heure_fin") or m.get("date_fin")) if m.get("statut") == "TERMINÉE" else "En cours"
+
         vals = [
             m.get("code_mission") or f"MIS-{m.get('id', '')[:8]}",
             m.get("date_jour") or "—",
@@ -709,9 +723,9 @@ def export_missions_excel(titre_periode: str, missions: list[dict],
             depot_eff,
             m.get("statut_camion_actuel") or "—",
             m.get("statut") or "—",
-            _hhmm(m.get("heure_debut")),
-            _hhmm(m.get("heure_chargement")),
-            _hhmm(m.get("heure_fin")),
+            deb_str,
+            chg_str,
+            fin_str,
             _fmt_duree_txt(m.get("duree_s")),
             round(m.get("km_vide") or 0.0, 1),
             round(m.get("km_charge") or 0.0, 1),
@@ -754,7 +768,7 @@ def export_missions_pdf(titre_periode: str, missions: list[dict],
     ]
 
     headers = ["N° Mission", "Chauffeur", "Camion", "N° OT", "Produit",
-               "Dépôt Prévu", "Destination", "Statut", "Départ", "Livraison",
+               "Dépôt Prévu", "Destination", "Statut", "Début", "Chargement", "Déchargement",
                "Km Tot.", "Infr."]
 
     data = [headers]
@@ -765,6 +779,10 @@ def export_missions_pdf(titre_periode: str, missions: list[dict],
         if m.get("est_deviee"):
             depot_eff = f"{depot_eff}*"
 
+        deb_str = _hhmm(m.get("heure_debut") or m.get("date_debut")) or "Attente"
+        chg_str = _hhmm(m.get("heure_chargement") or m.get("date_chargement")) or "—"
+        fin_str = _hhmm(m.get("heure_fin") or m.get("date_fin")) if m.get("statut") == "TERMINÉE" else "En cours"
+
         row = [
             m.get("code_mission") or f"MIS-{m.get('id', '')[:6]}",
             chauffeur_nom,
@@ -774,8 +792,9 @@ def export_missions_pdf(titre_periode: str, missions: list[dict],
             m.get("depot_prevu") or m.get("depot") or "—",
             depot_eff,
             m.get("statut") or "—",
-            _hhmm(m.get("heure_debut")),
-            _hhmm(m.get("heure_fin")),
+            deb_str,
+            chg_str,
+            fin_str,
             f"{round(m.get('kilometrage_total') or m.get('kilometrage') or 0.0, 0):.0f} km",
             str(m.get("nb_infractions") or 0),
         ]

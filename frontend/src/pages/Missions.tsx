@@ -73,6 +73,7 @@ export default function Missions() {
   const [missions, setMissions] = useState<Mission[]>([]);
   const [stats, setStats] = useState<StatsMissions | null>(null);
   const [chargement, setChargement] = useState(true);
+  const [rattrapageEnCours, setRattrapageEnCours] = useState(false);
 
   const [missionSelectionnee, setMissionSelectionnee] = useState<Mission | null>(null);
   const [modalNouvelleMissionOuverte, setModalNouvelleMissionOuverte] = useState(false);
@@ -80,6 +81,21 @@ export default function Missions() {
   const [conducteurs, setConducteurs] = useState<Conducteur[]>([]);
 
   const timer = useRef<number>();
+
+  async function lancerRattrapage7j(silencieux = false) {
+    if (rattrapageEnCours) return;
+    setRattrapageEnCours(true);
+    try {
+      await api("/api/missions/rattrapage", { method: "POST" });
+      await chargerDonnees();
+    } catch (e) {
+      if (!silencieux) {
+        console.error("Erreur lors du rattrapage des missions sur 7 jours:", e);
+      }
+    } finally {
+      setRattrapageEnCours(false);
+    }
+  }
 
   async function chargerDonnees() {
     try {
@@ -115,13 +131,15 @@ export default function Missions() {
     }
   }
 
+  // Chargement initial + Rattrapage automatique 7 jours
+  useEffect(() => {
+    chargerReferentiels();
+    lancerRattrapage7j(true);
+  }, []);
+
   useEffect(() => {
     chargerDonnees();
   }, [dateDebut, dateFin, statutFiltre, depotFiltre, distributeurFiltre, recherche]);
-
-  useEffect(() => {
-    chargerReferentiels();
-  }, []);
 
   useEffect(() => {
     const rafraichir = () => {
@@ -166,6 +184,7 @@ export default function Missions() {
       j7.setDate(now.getDate() - 6);
       setDateDebut(j7.toISOString().slice(0, 10));
       setDateFin(todayISO());
+      lancerRattrapage7j(false);
     } else if (mode === "aujourdhui") {
       setDateDebut(todayISO());
       setDateFin(todayISO());
@@ -207,6 +226,15 @@ export default function Missions() {
             >
               <Icon nom="plus" className="w-4 h-4" />
               <span>+ Assigner OT / Nouvelle Mission</span>
+            </Btn>
+            <Btn
+              variante="secondaire"
+              onClick={() => lancerRattrapage7j(false)}
+              disabled={rattrapageEnCours}
+              title="Lancer la collecte rétrospective et le rattrapage automatique sur les 7 derniers jours"
+            >
+              {rattrapageEnCours ? <Spinner /> : <Icon nom="rafraichir" className="w-4 h-4 text-blue-500" />}
+              <span>{rattrapageEnCours ? "Rattrapage en cours…" : "Rattrapage 7 jours"}</span>
             </Btn>
             <Btn variante="secondaire" onClick={exporterExcel} title="Exporter les missions sous Excel">
               <Icon nom="telecharger" className="w-4 h-4" />
@@ -428,7 +456,9 @@ export default function Missions() {
                   <th className="px-3 py-2.5 whitespace-nowrap">Destination Réelle</th>
                   <th className="px-3 py-2.5 text-center whitespace-nowrap">Statut Camion</th>
                   <th className="px-3 py-2.5 text-center whitespace-nowrap">Statut Mission</th>
-                  <th className="px-3 py-2.5 text-center whitespace-nowrap">Horodatages (Départ ➔ Fin)</th>
+                  <th className="px-3 py-2.5 text-center whitespace-nowrap">Début Mission</th>
+                  <th className="px-3 py-2.5 text-center whitespace-nowrap">Date Chargement</th>
+                  <th className="px-3 py-2.5 text-center whitespace-nowrap">Date Déchargement</th>
                   <th className="px-3 py-2.5 text-right whitespace-nowrap">Km Parcouru</th>
                   <th className="px-3 py-2.5 text-center whitespace-nowrap">Infractions</th>
                   <th className="px-3.5 py-2.5 text-center whitespace-nowrap">Action</th>
@@ -528,10 +558,41 @@ export default function Missions() {
                         <Badge couleur={couleurMission}>{m.statut}</Badge>
                       </td>
 
-                      {/* Horodatages */}
-                      <td className="px-3 py-2.5 text-center font-mono text-[11.5px] whitespace-nowrap text-slate-600 dark:text-slate-400">
-                        {fmtHeure(m.heure_debut)} ➔ {m.heure_chargement ? fmtHeure(m.heure_chargement) : "…"} ➔{" "}
-                        {m.heure_fin ? fmtHeure(m.heure_fin) : "…"}
+                      {/* 1. Début Mission (date_debut) */}
+                      <td className="px-3 py-2.5 text-center font-mono text-[12px] whitespace-nowrap">
+                        {m.heure_debut || m.date_debut ? (
+                          <span className="text-slate-700 dark:text-slate-200">
+                            {fmtDateHeure(m.heure_debut || m.date_debut)}
+                          </span>
+                        ) : (
+                          <span className="text-amber-600 dark:text-amber-400 font-medium italic text-[11.5px] bg-amber-50 dark:bg-amber-950/40 px-2 py-0.5 rounded border border-amber-200 dark:border-amber-900">
+                            En attente
+                          </span>
+                        )}
+                      </td>
+
+                      {/* 2. Date Chargement (date_chargement) */}
+                      <td className="px-3 py-2.5 text-center font-mono text-[12px] whitespace-nowrap">
+                        {m.heure_chargement || m.date_chargement ? (
+                          <span className="text-slate-700 dark:text-slate-200">
+                            {fmtDateHeure(m.heure_chargement || m.date_chargement)}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 font-mono">—</span>
+                        )}
+                      </td>
+
+                      {/* 3. Date Déchargement (date_fin) */}
+                      <td className="px-3 py-2.5 text-center font-mono text-[12px] whitespace-nowrap">
+                        {m.statut === "TERMINÉE" && (m.heure_fin || m.date_fin) ? (
+                          <span className="text-slate-700 dark:text-slate-200">
+                            {fmtDateHeure(m.heure_fin || m.date_fin)}
+                          </span>
+                        ) : (
+                          <span className="text-blue-600 dark:text-blue-400 font-medium italic text-[11.5px] bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 rounded border border-blue-200 dark:border-blue-900">
+                            En cours
+                          </span>
+                        )}
                       </td>
 
                       {/* Km Parcourus */}
@@ -723,6 +784,51 @@ function ModalDetailMission({
             <div className="text-[11px] text-slate-400 uppercase">Durée de Mission</div>
             <div className="font-bold mt-1 text-slate-700 dark:text-slate-200 tabular-nums">
               {mission.statut === "EN_COURS" ? "En cours…" : fmtDuree(mission.duree_s)}
+            </div>
+          </div>
+        </div>
+
+        {/* 3 Horodatages Clés de la Mission */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-[13px]">
+          <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/60">
+            <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-blue-500" />
+              1. Début Mission (Sortie Base)
+            </div>
+            <div className="font-mono font-bold mt-1.5 text-slate-800 dark:text-slate-100">
+              {mission.heure_debut || mission.date_debut ? (
+                fmtDateHeure(mission.heure_debut || mission.date_debut)
+              ) : (
+                <span className="text-amber-500 font-medium italic text-xs">En attente sortie base</span>
+              )}
+            </div>
+          </div>
+
+          <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/60">
+            <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              2. Date Chargement (Sortie GRT)
+            </div>
+            <div className="font-mono font-bold mt-1.5 text-slate-800 dark:text-slate-100">
+              {mission.heure_chargement || mission.date_chargement ? (
+                fmtDateHeure(mission.heure_chargement || mission.date_chargement)
+              ) : (
+                <span className="text-slate-400 font-mono">—</span>
+              )}
+            </div>
+          </div>
+
+          <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/60">
+            <div className="text-[11px] font-bold text-slate-500 dark:text-slate-400 uppercase flex items-center gap-1.5">
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              3. Date Déchargement (Dépôt)
+            </div>
+            <div className="font-mono font-bold mt-1.5 text-slate-800 dark:text-slate-100">
+              {mission.statut === "TERMINÉE" && (mission.heure_fin || mission.date_fin) ? (
+                fmtDateHeure(mission.heure_fin || mission.date_fin)
+              ) : (
+                <span className="text-blue-500 font-medium italic text-xs">En cours de mission</span>
+              )}
             </div>
           </div>
         </div>
