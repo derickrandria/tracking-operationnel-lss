@@ -196,8 +196,13 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 fin = _dt_iso(t.get("heure_fin"))
                 duree = int((fin - deb).total_seconds()) if (fin and fin >= deb) else 0
 
-                # Chauffeur spécifique du trajet
+                # Chauffeur spécifique du trajet :
+                # 1. Badge explicite sur le trajet
                 t_gard = resoudre_gardien(t.get("conducteur_badge_id"), t.get("conducteur_badge"))
+                # 2. Si pas de badge sur le trajet et que le camion a un titulaire officiel
+                if not t_gard and h.vehicule and h.vehicule.conducteur_actuel_id:
+                    t_gard = resoudre_gardien(h.vehicule.conducteur_actuel_id, None)
+                # 3. Fallback sur le chauffeur de l'archive
                 if not t_gard:
                     t_gard = resoudre_gardien(h.conducteur_id, d.get("chauffeur") or plaque)
                 if not t_gard:
@@ -260,7 +265,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                         if plaque:
                             c_data["jours"][j]["vehicules"].add(plaque)
         else:
-            gardien = resoudre_gardien(h.conducteur_id, d.get("chauffeur") or plaque)
+            gardien = None
+            if h.vehicule and h.vehicule.conducteur_actuel_id:
+                gardien = resoudre_gardien(h.vehicule.conducteur_actuel_id, None)
+            if not gardien:
+                gardien = resoudre_gardien(h.conducteur_id, d.get("chauffeur") or plaque)
             if gardien:
                 gid = gardien.id
                 if not conducteur_id_filtre or gid == conducteur_id_filtre:
@@ -318,7 +327,13 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                     fin_eff = fin
                 duree = int((fin_eff - deb).total_seconds()) if fin_eff >= deb else 0
 
+                # Chauffeur spécifique du trajet :
+                # 1. Badge sur le trajet
                 t_gard = resoudre_gardien(t.conducteur_badge_id, t.conducteur_badge)
+                # 2. Si pas de badge et que le camion a un titulaire officiel
+                if not t_gard and s.vehicule and s.vehicule.conducteur_actuel_id:
+                    t_gard = resoudre_gardien(s.vehicule.conducteur_actuel_id, None)
+                # 3. Fallback sur le chauffeur du suivi
                 if not t_gard:
                     t_gard = resoudre_gardien(s.conducteur_id, None)
                 if not t_gard:
@@ -386,7 +401,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                         if is_today:
                             c_data["jours"][j]["en_cours"] = True
         else:
-            gardien = resoudre_gardien(s.conducteur_id, None)
+            gardien = None
+            if s.vehicule and s.vehicule.conducteur_actuel_id:
+                gardien = resoudre_gardien(s.vehicule.conducteur_actuel_id, None)
+            if not gardien:
+                gardien = resoudre_gardien(s.conducteur_id, None)
             if gardien:
                 gid = gardien.id
                 if not conducteur_id_filtre or gid == conducteur_id_filtre:

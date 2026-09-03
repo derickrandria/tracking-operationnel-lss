@@ -282,6 +282,8 @@ c_ando = Conducteur(nom_prenom="ANDRIAMAMONJY Ando Lovasoa", prenom_usuel="Ando"
                     nom_normalise=normaliser_libelle("ANDRIAMAMONJY Ando Lovasoa"),
                     tokens_set=calculer_tokens_set("ANDRIAMAMONJY Ando Lovasoa"), statut=StatutConducteur.ACTIF)
 db.add_all([v_partage, c_dom, c_ando])
+db.flush()
+v_partage.conducteur_actuel_id = c_dom.id
 db.commit()
 
 jour_hier = date.today() - timedelta(days=1)
@@ -336,6 +338,46 @@ check(f"Dominique crédité de ses trajets (10h00 = 36000s, obtenu: {dom_tcj_hie
       dom_tcj_hier == 36000)
 check(f"Ando crédité uniquement de ses trajets (2h00 = 7200s, obtenu: {ando_tcj_hier}s)",
       ando_tcj_hier == 7200)
+
+# ------------------------------------------------------------------
+# Test 11 : Réparation des archives passées erronées (Ando assigné par erreur sans badges détaillés)
+# ------------------------------------------------------------------
+print("\n[T11] Test Réparation des archives passées sans badges détaillés")
+from app.reparation import reparer_historique_conducteurs_passes
+
+jour_avant_hier = date.today() - timedelta(days=2)
+# Simuler une archive erronée passée : conducteur_id = Ando, mais camion titulaire = Dominique
+# et 12h01 (43260s) de conduite sans badges dans le snapshot
+db.add(HistoriqueJournalier(
+    date_jour=jour_avant_hier, annee=jour_avant_hier.year, mois=jour_avant_hier.month,
+    vehicule_id=v_partage.id, conducteur_id=c_ando.id,
+    donnees={
+        "id": "s-err-1", "date_jour": jour_avant_hier.isoformat(),
+        "vehicule_id": v_partage.id, "plaque": "TEST-PARTAGE",
+        "conducteur_id": c_ando.id, "chauffeur": "Ando Lovasoa",
+        "tcj_s": 43260, "ttj_s": 50400, "trajets": []
+    },
+    nb_infractions=0, nb_alertes=0))
+db.commit()
+
+# Exécuter la réparation des archives passées
+stats_rep = reparer_historique_conducteurs_passes(db)
+check("Réparation archives passées exécutée sans erreur", not stats_rep.get("erreur"))
+
+# Extraire à nouveau le TCH
+res_tch2 = extraire_donnees_chauffeurs(db, debut_fenetre=jour_avant_hier, fin_fenetre=date.today())
+lignes_tch2 = {l["conducteur_id"]: l for l in res_tch2["lignes"]}
+
+dom_tch2 = lignes_tch2.get(c_dom.id)
+ando_tch2 = lignes_tch2.get(c_ando.id)
+
+dom_tcj_j2 = dom_tch2["historique"].get(jour_avant_hier.isoformat(), {}).get("tcj_s", 0) if dom_tch2 else 0
+ando_tcj_j2 = ando_tch2["historique"].get(jour_avant_hier.isoformat(), {}).get("tcj_s", 0) if ando_tch2 else 0
+
+check(f"Archive passée erronée réattribuée au titulaire Dominique (43260s, obtenu: {dom_tcj_j2}s)",
+      dom_tcj_j2 == 43260)
+check(f"Ando purgé des 12h01 de Dominique sur l'archive passée (0s, obtenu: {ando_tcj_j2}s)",
+      ando_tcj_j2 == 0)
 
 print(f"\n{'=' * 60}\nRESULTAT : {R['ok']} OK / {R['ko']} KO\n{'=' * 60}")
 db.close()

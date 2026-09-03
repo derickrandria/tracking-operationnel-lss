@@ -474,6 +474,10 @@ async def _am4_puis_reparation_v130():
         log.exception("§0sexies decies J1-J4 : réparation dédoublonnage "
                       "chauffeurs v1.38 en échec — reprise au prochain "
                       "démarrage")
+    try:
+        await asyncio.to_thread(reparation.reparer_historique_conducteurs_passes)
+    except Exception:
+        log.exception("Réparation historique conducteurs passés en échec")
 
 
 def _rattrapage_j1():
@@ -501,6 +505,11 @@ async def lifespan(app: FastAPI):
                       "démarrage")
     reparer_identifiants()
     reparer_conducteurs_non_personnes()    # §0quinquies D5 (14/08/2026)
+    try:
+        from . import reparation
+        reparation.reparer_historique_conducteurs_passes()
+    except Exception:
+        log.exception("Réparation initiale historique conducteurs en échec")
     daily.rattraper_au_demarrage()
     event_bus.attacher_boucle(asyncio.get_running_loop())
 

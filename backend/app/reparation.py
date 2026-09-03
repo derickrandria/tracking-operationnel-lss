@@ -41,6 +41,7 @@ import logging
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import joinedload, selectinload
 
 from .config import calculer_tokens_set, jour_attribution, normaliser_libelle, now_local
 from .daily import (_trajets_reels_du_jour as _relecture_portails,
@@ -54,7 +55,7 @@ from .models import (Alerte, AuditLog, Conducteur, GraviteAlerte,
 from .reconciliation import (_badge_eco, _propager, _recalculer_pauses,
                              _renumeroter, _spliter_minuit,
                              _synchroniser_archive)
-from .serializers import iso
+from .serializers import iso, s_conducteur
 
 log = logging.getLogger("lss.reparation")
 
@@ -864,6 +865,124 @@ def reparer_conducteurs_v138(db=None) -> dict:
         log.exception("§0sexies decies : réparation v1.38 en échec — "
                       "reprise au prochain démarrage")
         stats["erreur"] = True
+    finally:
+        if propre:
+            db.close()
+    return stats
+
+
+def _dt_iso_rep(texte) -> datetime | None:
+    if not texte:
+        return None
+    try:
+        return datetime.fromisoformat(str(texte))
+    except (ValueError, TypeError):
+        return None
+
+
+def reparer_historique_conducteurs_passes(db=None) -> dict:
+    """Correction des attributions de conducteurs sur les données passées et archives :
+    1. Réalignement sur le chauffeur majoritaire / titulaire du véhicule.
+    2. Propagation des badges de trajets dans les snapshots JSON d'archives.
+    3. Élimination des attributions erronées dues aux badges de relais momentanés.
+    """
+    propre = db is None
+    db = db or SessionLocal()
+    stats = {"suivis_corriges": 0, "archives_corrigees": 0, "trajets_badges_enrichis": 0}
+    try:
+        # 1. Parcourir tous les SuiviJournalier existants
+        suivis = db.scalars(select(SuiviJournalier).options(
+            selectinload(SuiviJournalier.trajets),
+            joinedload(SuiviJournalier.vehicule)
+        )).all()
+
+        for s in suivis:
+            if getattr(s, "conducteur_origine", None) == "MANUEL":
+                continue
+            veh = s.vehicule
+            titulaire_id = veh.conducteur_actuel_id if veh else None
+
+            # Calcul des durées par conducteur sur les trajets réels
+            duree_par_cond: dict[str, int] = {}
+            for t in (s.trajets or []):
+                if t.statut_validation == StatutValidationTrajet.REJETE:
+                    continue
+                cid = t.conducteur_badge_id or titulaire_id
+                if cid:
+                    duree = int((t.heure_fin - t.heure_debut).total_seconds()) if (t.heure_fin and t.heure_debut and t.heure_fin >= t.heure_debut) else 0
+                    duree_par_cond[cid] = duree_par_cond.get(cid, 0) + duree
+
+            if duree_par_cond:
+                majoritaire_id = max(duree_par_cond.items(), key=lambda x: x[1])[0]
+                if s.conducteur_id != majoritaire_id:
+                    log.info("Réparation Suivi %s (%s) : conducteur %s -> majoritaire %s",
+                             s.id, veh.plaque if veh else "?", s.conducteur_id, majoritaire_id)
+                    s.conducteur_id = majoritaire_id
+                    s.conducteur_origine = "BADGE"
+                    stats["suivis_corriges"] += 1
+            elif titulaire_id and s.conducteur_id != titulaire_id and not s.conducteur_id:
+                s.conducteur_id = titulaire_id
+                stats["suivis_corriges"] += 1
+
+        db.commit()
+
+        # 2. Parcourir tous les HistoriqueJournalier existants
+        hists = db.scalars(select(HistoriqueJournalier).options(
+            joinedload(HistoriqueJournalier.vehicule)
+        )).all()
+
+        for h in hists:
+            veh = h.vehicule
+            titulaire_id = veh.conducteur_actuel_id if veh else None
+            d = dict(h.donnees or {})
+            trajets_snap = list(d.get("trajets") or [])
+            modifie = False
+
+            duree_par_cond_hist: dict[str, int] = {}
+            for t in trajets_snap:
+                if not isinstance(t, dict):
+                    continue
+                if t.get("statut_validation") == "REJETE":
+                    continue
+                cid = t.get("conducteur_badge_id") or titulaire_id
+                if cid:
+                    deb = _dt_iso_rep(t.get("heure_debut"))
+                    fin = _dt_iso_rep(t.get("heure_fin"))
+                    duree = int((fin - deb).total_seconds()) if (deb and fin and fin >= deb) else 0
+                    duree_par_cond_hist[cid] = duree_par_cond_hist.get(cid, 0) + duree
+
+            if duree_par_cond_hist:
+                majoritaire_id = max(duree_par_cond_hist.items(), key=lambda x: x[1])[0]
+                if h.conducteur_id != majoritaire_id:
+                    log.info("Réparation Historique %s (%s - %s) : conducteur %s -> majoritaire %s",
+                             h.id, h.date_jour, veh.plaque if veh else "?", h.conducteur_id, majoritaire_id)
+                    h.conducteur_id = majoritaire_id
+                    maj_cond = db.get(Conducteur, majoritaire_id)
+                    if maj_cond:
+                        d["conducteur_id"] = maj_cond.id
+                        d["chauffeur"] = maj_cond.nom_prenom
+                        d["conducteur"] = s_conducteur(maj_cond, court=True)
+                    modifie = True
+                    stats["archives_corrigees"] += 1
+            elif titulaire_id and h.conducteur_id != titulaire_id:
+                # Si l'archive a été enregistrée avec un chauffeur différent du titulaire sans trajets spécifiques pour le justifier
+                h.conducteur_id = titulaire_id
+                maj_cond = db.get(Conducteur, titulaire_id)
+                if maj_cond:
+                    d["conducteur_id"] = maj_cond.id
+                    d["chauffeur"] = maj_cond.nom_prenom
+                    d["conducteur"] = s_conducteur(maj_cond, court=True)
+                modifie = True
+                stats["archives_corrigees"] += 1
+
+            if modifie:
+                h.donnees = d
+
+        db.commit()
+        log.info("Réparation historique conducteurs terminée : %s", stats)
+    except Exception:
+        db.rollback()
+        log.exception("Erreur lors de la réparation de l'historique des conducteurs")
     finally:
         if propre:
             db.close()
