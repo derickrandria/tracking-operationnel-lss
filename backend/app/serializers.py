@@ -484,6 +484,7 @@ def s_historique(h: HistoriqueJournalier, detail=False):
         "arret_final": d.get("arret_final"),
         "km_parcourus": d.get("km_parcourus"),
         "tcc_s": d.get("tcc_s"), "tcj_s": d.get("tcj_s"), "ttj_s": d.get("ttj_s"),
+        "trajets": d.get("trajets") or [],
         "nb_trajets": d.get("nb_trajets"),
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,

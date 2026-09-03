@@ -245,7 +245,7 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                 {l.conducteur ? (
                   <div className="flex flex-col py-0.5">
                     <div className="flex items-center gap-1.5 flex-wrap">
-                      <span title={l.conducteur.nom_prenom} className="font-semibold text-slate-800 dark:text-slate-100">
+                      <span title={l.conducteur.nom_prenom} className="font-bold text-slate-900 dark:text-slate-100">
                         {l.conducteur.prenom_usuel || l.conducteur.nom_prenom}
                       </span>
                       {l.conducteur.code_badge_mzonex ? (
@@ -268,14 +268,14 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                       {l.conducteur.nom_prenom}
                     </span>
                     {relais.length > 0 && (
-                      <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                      <div className="flex flex-col gap-0.5 mt-0.5">
                         {relais.map((r) => (
                           <span
                             key={r.nom}
-                            className="px-1 py-0.2 rounded text-[9.5px] font-medium bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
-                            title={`Chauffeur relais ayant également conduit sur ce camion aujourd'hui : ${r.nom}${r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}`}
+                            className="text-[11px] font-normal text-slate-600 dark:text-slate-300"
+                            title={`Autre conducteur ayant conduit sur ce camion : ${r.nom}${r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}`}
                           >
-                            Relais : {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
+                            {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
                           </span>
                         ))}
                       </div>
@@ -285,7 +285,7 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                   relais.length > 0 ? (
                     <div className="flex flex-col py-0.5">
                       <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="font-semibold text-slate-800 dark:text-slate-100">
+                        <span className="font-bold text-slate-900 dark:text-slate-100">
                           {relais[0].nom}
                         </span>
                         {relais[0].duree_s > 0 && (
@@ -295,14 +295,14 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                         )}
                       </div>
                       {relais.length > 1 && (
-                        <div className="flex items-center gap-1 mt-0.5 flex-wrap">
+                        <div className="flex flex-col gap-0.5 mt-0.5">
                           {relais.slice(1).map((r) => (
                             <span
                               key={r.nom}
-                              className="px-1 py-0.2 rounded text-[9.5px] font-medium bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
+                              className="text-[11px] font-normal text-slate-600 dark:text-slate-300"
                               title={`Autre chauffeur ayant conduit : ${r.nom}`}
                             >
-                              Relais : {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
+                              {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
                             </span>
                           ))}
                         </div>

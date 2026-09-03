@@ -340,22 +340,38 @@ check(f"Ando crédité uniquement de ses trajets (2h00 = 7200s, obtenu: {ando_tc
       ando_tcj_hier == 7200)
 
 # ------------------------------------------------------------------
-# Test 11 : Réparation des archives passées erronées (Ando assigné par erreur sans badges détaillés)
+# Test 11 : Répartition exacte et affichage multi-chauffeurs sur archive passée
 # ------------------------------------------------------------------
-print("\n[T11] Test Réparation des archives passées sans badges détaillés")
+print("\n[T11] Test Répartition exacte Dominique / Ando sur archive passée")
 from app.reparation import reparer_historique_conducteurs_passes
 
 jour_avant_hier = date.today() - timedelta(days=2)
-# Simuler une archive erronée passée : conducteur_id = Ando, mais camion titulaire = Dominique
-# et 12h01 (43260s) de conduite sans badges dans le snapshot
+# Simuler une archive passée où Dominique a conduit 10h00 (36000s) et Ando 2h01 (7260s) = total 12h01
+trajets_archive_partage = [
+    {
+        "id": "t-snap-1", "numero": 1,
+        "heure_debut": datetime.combine(jour_avant_hier, datetime.min.time()).replace(hour=4, minute=0).isoformat(),
+        "heure_fin": datetime.combine(jour_avant_hier, datetime.min.time()).replace(hour=14, minute=0).isoformat(),
+        "distance_km": 300.0, "statut_validation": "VALIDE",
+        "conducteur_badge": "RAKOTONINDRINA Solofohery Alain", "conducteur_badge_id": c_dom.id
+    },
+    {
+        "id": "t-snap-2", "numero": 2,
+        "heure_debut": datetime.combine(jour_avant_hier, datetime.min.time()).replace(hour=14, minute=30).isoformat(),
+        "heure_fin": datetime.combine(jour_avant_hier, datetime.min.time()).replace(hour=16, minute=31).isoformat(),
+        "distance_km": 60.0, "statut_validation": "VALIDE",
+        "conducteur_badge": "ANDRIAMAMONJY Ando Lovasoa", "conducteur_badge_id": c_ando.id
+    }
+]
+
 db.add(HistoriqueJournalier(
     date_jour=jour_avant_hier, annee=jour_avant_hier.year, mois=jour_avant_hier.month,
-    vehicule_id=v_partage.id, conducteur_id=c_ando.id,
+    vehicule_id=v_partage.id, conducteur_id=c_ando.id, # Était attribué par erreur à Ando seul
     donnees={
         "id": "s-err-1", "date_jour": jour_avant_hier.isoformat(),
-        "vehicule_id": v_partage.id, "plaque": "TEST-PARTAGE",
+        "vehicule_id": v_partage.id, "plaque": "TEST-4926TBU",
         "conducteur_id": c_ando.id, "chauffeur": "Ando Lovasoa",
-        "tcj_s": 43260, "ttj_s": 50400, "trajets": []
+        "tcj_s": 43260, "ttj_s": 50400, "trajets": trajets_archive_partage
     },
     nb_infractions=0, nb_alertes=0))
 db.commit()
@@ -364,7 +380,14 @@ db.commit()
 stats_rep = reparer_historique_conducteurs_passes(db)
 check("Réparation archives passées exécutée sans erreur", not stats_rep.get("erreur"))
 
-# Extraire à nouveau le TCH
+# Vérifier que l'archive a bien été réattribuée au chauffeur majoritaire Dominique (10h > 2h01)
+hist_repare = db.scalar(select(HistoriqueJournalier).where(
+    HistoriqueJournalier.date_jour == jour_avant_hier,
+    HistoriqueJournalier.vehicule_id == v_partage.id
+))
+check("Archive réassignée au chauffeur majoritaire Dominique", hist_repare.conducteur_id == c_dom.id)
+
+# Extraire les données TCH
 res_tch2 = extraire_donnees_chauffeurs(db, debut_fenetre=jour_avant_hier, fin_fenetre=date.today())
 lignes_tch2 = {l["conducteur_id"]: l for l in res_tch2["lignes"]}
 
@@ -374,10 +397,12 @@ ando_tch2 = lignes_tch2.get(c_ando.id)
 dom_tcj_j2 = dom_tch2["historique"].get(jour_avant_hier.isoformat(), {}).get("tcj_s", 0) if dom_tch2 else 0
 ando_tcj_j2 = ando_tch2["historique"].get(jour_avant_hier.isoformat(), {}).get("tcj_s", 0) if ando_tch2 else 0
 
-check(f"Archive passée erronée réattribuée au titulaire Dominique (43260s, obtenu: {dom_tcj_j2}s)",
-      dom_tcj_j2 == 43260)
-check(f"Ando purgé des 12h01 de Dominique sur l'archive passée (0s, obtenu: {ando_tcj_j2}s)",
-      ando_tcj_j2 == 0)
+check(f"Dominique crédité exactement de ses trajets (10h00 = 36000s, obtenu: {dom_tcj_j2}s)",
+      dom_tcj_j2 == 36000)
+check(f"Ando crédité exactement de ses trajets (2h01 = 7260s, obtenu: {ando_tcj_j2}s)",
+      ando_tcj_j2 == 7260)
+check(f"Somme des temps Dominique + Ando = 12h01 (43260s, somme obtenue: {dom_tcj_j2 + ando_tcj_j2}s)",
+      dom_tcj_j2 + ando_tcj_j2 == 43260)
 
 print(f"\n{'=' * 60}\nRESULTAT : {R['ok']} OK / {R['ko']} KO\n{'=' * 60}")
 db.close()

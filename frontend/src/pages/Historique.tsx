@@ -42,6 +42,34 @@ function presets() {
 
 type Onglet = "suivi" | "infractions" | "alertes";
 
+function extraireConducteursRelaisHist(h: any): Array<{ nom: string; duree_s: number }> {
+  const trajets = h.trajets || h.donnees?.trajets || [];
+  if (!trajets || trajets.length === 0) return [];
+  const mapRelais = new Map<string, number>();
+  const nomPrincipal = (h.conducteur?.nom_prenom || "").toLowerCase().trim();
+  const prenomPrincipal = (h.conducteur?.prenom_usuel || "").toLowerCase().trim();
+
+  for (const t of trajets) {
+    const badge = (t.conducteur_badge || "").trim();
+    if (!badge) continue;
+    const badgeNorm = badge.toLowerCase();
+    if (nomPrincipal && (badgeNorm === nomPrincipal || nomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    if (prenomPrincipal && (badgeNorm === prenomPrincipal || prenomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    let sec = 0;
+    if (t.heure_debut && t.heure_fin) {
+      const d1 = new Date(t.heure_debut).getTime();
+      const d2 = new Date(t.heure_fin).getTime();
+      if (d2 > d1) sec = Math.round((d2 - d1) / 1000);
+    }
+    mapRelais.set(badge, (mapRelais.get(badge) || 0) + sec);
+  }
+  return Array.from(mapRelais.entries()).map(([nom, duree_s]) => ({ nom, duree_s }));
+}
+
 export default function Historique() {
   const [onglet, setOnglet] = useState<Onglet>("suivi");
   const [params, setParams] = useSearchParams();
@@ -289,13 +317,31 @@ export default function Historique() {
                     <th>Trajets</th><th>Km</th><th>Infractions</th><th>Alertes</th>
                   </tr></thead>
                   <tbody>
-                    {data.items.map((h: any) => (
+                    {data.items.map((h: any) => {
+                      const relais = extraireConducteursRelaisHist(h);
+                      const nomPrincipal = h.conducteur?.prenom_usuel || h.conducteur?.nom_prenom;
+                      return (
                       <tr key={h.id} className="cursor-pointer"
                         title="Voir la grille complète de cette journée (identique au Suivi Journalier)"
                         onClick={() => setJourGrille(h.date_jour)}>
                         <td className="whitespace-nowrap font-medium">{h.date_jour.split("-").reverse().join("/")}</td>
                         <td className="font-bold whitespace-nowrap">{h.plaque}</td>
-                        <td className="whitespace-nowrap">{h.conducteur?.prenom_usuel || "—"}</td>
+                        <td className="whitespace-nowrap">
+                          <div className="flex flex-col py-0.5">
+                            {nomPrincipal ? (
+                              <span className="font-bold text-slate-900 dark:text-slate-100">
+                                {nomPrincipal}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                            {relais.map((r) => (
+                              <span key={r.nom} className="text-[11px] font-normal text-slate-600 dark:text-slate-400">
+                                {r.nom}{r.duree_s > 0 ? ` (${fmtDuree(r.duree_s)})` : ""}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
                         <td className="max-w-[220px] truncate text-[12px]">{h.situation || "—"}</td>
                         <td><Badge>{h.statut_camion || "—"}</Badge></td>
                         <td>{h.depot_recepteur || "—"}</td>
@@ -318,7 +364,7 @@ export default function Historique() {
                         </td>
                         <td><Badge>{h.nb_alertes}</Badge></td>
                       </tr>
-                    ))}
+                    );})}
                   </tbody>
                 </table>
               </div>
