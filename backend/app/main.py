@@ -171,7 +171,8 @@ def migrer_schema():
         # §0sexies decies J1 (27/08/2026) : forme canonique anti-doublon
         # chauffeur. L'index UNIQUE est volontairement posé PLUS TARD, par la
         # réparation v1.38 (§J3), une fois les doublons hérités résorbés.
-        cols_c = {c["name"] for c in insp.get_columns("conducteurs")}
+        cols_c_raw = {c["name"]: c for c in insp.get_columns("conducteurs")}
+        cols_c = set(cols_c_raw.keys())
         if "nom_normalise" not in cols_c:
             cx.execute(text(
                 "ALTER TABLE conducteurs ADD COLUMN nom_normalise VARCHAR(170)"))
@@ -191,6 +192,53 @@ def migrer_schema():
             log.info("Migration : conducteurs.code_badge_mzonex ajouté")
         cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_code_badge_mzonex "
                         "ON conducteurs (code_badge_mzonex)"))
+
+        # Rendre conducteurs.matricule nullable sous SQLite si créé avec contrainte NOT NULL héritée
+        if cols_c_raw.get("matricule", {}).get("nullable") is False:
+            try:
+                cx.execute(text("PRAGMA foreign_keys=OFF"))
+                cx.execute(text("""
+                    CREATE TABLE IF NOT EXISTS conducteurs_migr_tmp (
+                        id VARCHAR(36) PRIMARY KEY,
+                        nom_prenom VARCHAR(160) NOT NULL,
+                        code_badge_mzonex INTEGER,
+                        prenom_usuel VARCHAR(60) NOT NULL,
+                        matricule VARCHAR(40),
+                        telephone VARCHAR(40),
+                        statut VARCHAR(30) DEFAULT 'ACTIF',
+                        date_creation DATETIME,
+                        nom_normalise VARCHAR(170),
+                        tokens_set VARCHAR(170)
+                    )
+                """))
+                champs_sel = [
+                    "id", "nom_prenom",
+                    "code_badge_mzonex" if "code_badge_mzonex" in cols_c else "NULL AS code_badge_mzonex",
+                    "prenom_usuel",
+                    "CASE WHEN matricule LIKE 'CH%' OR matricule LIKE 'AUTO-%' THEN NULL ELSE matricule END AS matricule",
+                    "telephone" if "telephone" in cols_c else "NULL AS telephone",
+                    "statut" if "statut" in cols_c else "'ACTIF' AS statut",
+                    "date_creation" if "date_creation" in cols_c else "CURRENT_TIMESTAMP AS date_creation",
+                    "nom_normalise" if "nom_normalise" in cols_c else "NULL AS nom_normalise",
+                    "tokens_set" if "tokens_set" in cols_c else "NULL AS tokens_set"
+                ]
+                cx.execute(text(f"""
+                    INSERT INTO conducteurs_migr_tmp (id, nom_prenom, code_badge_mzonex, prenom_usuel, matricule, telephone, statut, date_creation, nom_normalise, tokens_set)
+                    SELECT {', '.join(champs_sel)} FROM conducteurs
+                """))
+                cx.execute(text("DROP TABLE conducteurs"))
+                cx.execute(text("ALTER TABLE conducteurs_migr_tmp RENAME TO conducteurs"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_nom_prenom ON conducteurs (nom_prenom)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_prenom_usuel ON conducteurs (prenom_usuel)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_matricule ON conducteurs (matricule)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_nom_normalise ON conducteurs (nom_normalise)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_tokens_set ON conducteurs (tokens_set)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_code_badge_mzonex ON conducteurs (code_badge_mzonex)"))
+                cx.execute(text("PRAGMA foreign_keys=ON"))
+                log.info("Migration SQLite : conducteurs.matricule converti en NULLABLE avec succès")
+            except Exception as e:
+                log.warning("Impossible de convertir conducteurs.matricule en nullable : %s", e)
+
         # Table conducteur_aliases
         cx.execute(text("""
             CREATE TABLE IF NOT EXISTS conducteur_aliases (
@@ -207,8 +255,11 @@ def migrer_schema():
         cx.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_conducteur_aliases_normalise "
                         "ON conducteur_aliases (alias_normalise)"))
         # Purge des préfixes hérités 'CH...' ou 'AUTO-...' : seuls les driverKeyCode MZoneX sont conservés
-        cx.execute(text("UPDATE conducteurs SET matricule = NULL WHERE matricule LIKE 'CH%' OR matricule LIKE 'AUTO-%'"))
-        cx.execute(text("UPDATE conducteurs SET matricule = CAST(code_badge_mzonex AS TEXT) WHERE code_badge_mzonex IS NOT NULL AND (matricule IS NULL OR matricule = '')"))
+        try:
+            cx.execute(text("UPDATE conducteurs SET matricule = NULL WHERE matricule LIKE 'CH%' OR matricule LIKE 'AUTO-%'"))
+            cx.execute(text("UPDATE conducteurs SET matricule = CAST(code_badge_mzonex AS TEXT) WHERE code_badge_mzonex IS NOT NULL AND (matricule IS NULL OR matricule = '')"))
+        except Exception as e:
+            log.warning("Avertissement purge matricules: %s", e)
         # §0decies (24/08/2026) : marqueur segment B d'un trajet franchissant
         # minuit (revérification portail sans faux « sans source »)
         if "suite_minuit" not in cols_t:
