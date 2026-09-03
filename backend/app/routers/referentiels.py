@@ -7,7 +7,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..config import (DEPOTS, DISTRIBUTEURS, PRODUITS, calculer_tokens_set,
@@ -275,16 +275,24 @@ def supprimer_alias(cid: str, aid: str, db: Session = Depends(get_db),
 
 @router.delete("/conducteurs/{cid}")
 def supprimer_conducteur(cid: str, db: Session = Depends(get_db),
-                         user=Depends(require_roles(*ADMIN))):
+                         user=Depends(require_roles(*ECRITURE))):
+    """Supprime définitivement un chauffeur et détache proprement ses références vives."""
     c = db.get(Conducteur, cid)
     if c is None:
         raise HTTPException(404, "Conducteur introuvable")
-    refs = db.scalar(select(func.count(Vehicule.id)).where(Vehicule.conducteur_actuel_id == cid)) or 0
-    refs += db.scalar(select(func.count(SuiviJournalier.id)).where(SuiviJournalier.conducteur_id == cid)) or 0
-    refs += db.scalar(select(func.count(Infraction.id)).where(Infraction.conducteur_id == cid)) or 0
-    if refs:
-        raise HTTPException(409, "Conducteur référencé dans l'historique : utilisez « Fusionner » ou « Désactiver »")
-    audit(db, user, "conducteur.suppression", "conducteur", cid, {"avant": s_conducteur(c)})
+
+    avant = s_conducteur(c)
+
+    # 1. Détachement propre de toutes les clés étrangères vives
+    db.execute(update(Vehicule).where(Vehicule.conducteur_actuel_id == cid).values(conducteur_actuel_id=None))
+    db.execute(update(SuiviJournalier).where(SuiviJournalier.conducteur_id == cid).values(conducteur_id=None))
+    db.execute(update(Trajet).where(Trajet.conducteur_badge_id == cid).values(conducteur_badge_id=None))
+    db.execute(update(Mission).where(Mission.conducteur_id == cid).values(conducteur_id=None))
+    db.execute(update(Infraction).where(Infraction.conducteur_id == cid).values(conducteur_id=None))
+    db.execute(update(Alerte).where(Alerte.conducteur_id == cid).values(conducteur_id=None))
+
+    # 2. Suppression de la fiche (les alias sont supprimés en cascade) et audit
+    audit(db, user, "conducteur.suppression", "conducteur", cid, {"avant": avant})
     db.delete(c)
     db.commit()
     publish("referentiels.changed", {"entite": "conducteur", "action": "suppression", "id": cid})

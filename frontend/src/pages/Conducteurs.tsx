@@ -242,11 +242,9 @@ export default function Conducteurs() {
                             <Btn variante="secondaire" className="!px-2 !py-0.5 text-[11.5px] text-indigo-600 dark:text-indigo-400" onClick={() => { setFusionSource(c); setFusionCibleId(""); }}>
                               Fusionner
                             </Btn>
-                            {admin && (
-                              <Btn variante="fantome" className="!px-1.5 !py-0.5 text-[11.5px] text-red-500 hover:text-red-700" onClick={() => supprimer(c)}>
-                                Suppr.
-                              </Btn>
-                            )}
+                            <Btn variante="fantome" className="!px-1.5 !py-0.5 text-[11.5px] text-red-500 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950/30" onClick={() => supprimer(c)}>
+                              Supprimer
+                            </Btn>
                           </div>
                         </td>
                       )}

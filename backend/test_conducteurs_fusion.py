@@ -150,6 +150,26 @@ alias_id = resp_add_alias.json().get("id")
 resp_del_alias = client.delete(f"/api/conducteurs/{c_camtrack_id}/aliases/{alias_id}", headers=headers)
 check("Suppression d'alias 200 OK", resp_del_alias.status_code == 200)
 
+print("\n[T6] Test Suppression directe d'un chauffeur")
+c_del = Conducteur(nom_prenom="A_SUPPRIMER Test", prenom_usuel="Test",
+                   matricule="TEST-DEL", statut=StatutConducteur.ACTIF)
+db.add(c_del)
+db.commit()
+c_del_id = c_del.id
+
+# Attacher un véhicule et un alias à ce chauffeur
+v_del = db.scalar(select(Vehicule).limit(1))
+v_del.conducteur_actuel_id = c_del_id
+db.add(ConducteurAlias(conducteur_id=c_del_id, alias_brut="Test Alias", alias_normalise="test alias"))
+db.commit()
+
+resp_suppr = client.delete(f"/api/conducteurs/{c_del_id}", headers=headers)
+check("Suppression directe chauffeur 200 OK", resp_suppr.status_code == 200)
+db.expire_all()
+check("Chauffeur supprimé en base", db.get(Conducteur, c_del_id) is None)
+check("Véhicule détaché proprement (conducteur_actuel_id = None)", v_del.conducteur_actuel_id is None)
+check("Alias associé supprimé", db.scalar(select(ConducteurAlias).where(ConducteurAlias.conducteur_id == c_del_id)) is None)
+
 print(f"\n{'=' * 60}\nRESULTAT : {R['ok']} OK / {R['ko']} KO\n{'=' * 60}")
 db.close()
 sys.exit(1 if R["ko"] else 0)
