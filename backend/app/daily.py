@@ -345,22 +345,34 @@ def rattraper_consolidation(cible_hier: date | None = None) -> dict:
                 SuiviJournalier.date_jour == jour)) or 0
             items, echecs = _trajets_reels_du_jour(jour)
             if echecs:
-                if SIM_ENABLE and nb_suivis > 0:
-                    # En mode démonstration / simulateur (ou avec suivis locaux présents) :
-                    # consolidation 23:59:59 et archivage des données locales existantes (minuit n'attend pas)
-                    n_pre = consolider_jour(db, jour)
-                    nb_arch = archiver_jour(db, jour)
+                if nb_suivis > 0:
+                    # En production comme en démo : si la veille/journée possède déjà des suivis enregistrés (55 camions),
+                    # on consolide à 23:59:59 et archive les données locales existantes (minuit n'attend pas — règle §0decies D4).
+                    if items:
+                        stats = _consolider_et_archiver_jour(db, jour, items, username="catchup_partiel")
+                        n_pre = stats.get("consolides", 0)
+                        nb_arch = stats.get("archives", 0)
+                    else:
+                        n_pre = consolider_jour(db, jour)
+                        nb_arch = archiver_jour(db, jour)
+
+                    db.add(AuditLog(username="systeme",
+                                    action="jour.catchup_consolide_local",
+                                    entite="suivi", entite_id=None,
+                                    details={"jour": jour.isoformat(),
+                                             "portails_absents": echecs,
+                                             "suivis_archives": nb_arch,
+                                             "regle": "§0decies D4 : consolidation sur la base (minuit n'attend pas)"}))
+                    db.commit()
                     rapport["jours_traités"] += 1
                     rapport["jours_archivés"] += nb_arch
-                    rapport["détails"][jour.isoformat()] = {"consolides": n_pre, "archives": nb_arch}
-                    log.info("AM-4 (Mode Démo) : journée du %s consolidée (%d) et archivée (%d)",
-                             jour, n_pre, nb_arch)
+                    rapport["détails"][jour.isoformat()] = {"consolides": n_pre, "archives": nb_arch, "portails_absents": echecs}
+                    log.info("AM-4 : journée du %s consolidée (%d) et archivée (%d) sur la base (portails absents : %s)",
+                             jour, n_pre, nb_arch, ", ".join(echecs))
                     jour += timedelta(days=1)
                     continue
 
-                # garde-fou R5 (production réelle) : un portail au moins n'a PAS répondu → le jour
-                # resterait PARTIEL → on n'écrit rien, on journalise et on
-                # signale ; nouvelle tentative au prochain démarrage
+                # Si aucun suivi local et portail en échec :
                 deja = db.scalar(select(func.count(AuditLog.id)).where(
                     AuditLog.action == "jour.catchup_sans_source",
                     AuditLog.details.like(f'%"{jour.isoformat()}"%'))) or 0
