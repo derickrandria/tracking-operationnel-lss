@@ -199,10 +199,15 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 # Chauffeur spécifique du trajet :
                 # 1. Badge explicite sur le trajet
                 t_gard = resoudre_gardien(t.get("conducteur_badge_id"), t.get("conducteur_badge"))
-                # 2. Si pas de badge sur le trajet et que le camion a un titulaire officiel
+                # 2. Si pas de badge dans le snapshot, chercher dans la table trajets DB
+                if not t_gard and t.get("id"):
+                    t_db = db.get(Trajet, str(t.get("id")))
+                    if t_db:
+                        t_gard = resoudre_gardien(t_db.conducteur_badge_id, t_db.conducteur_badge)
+                # 3. Si pas de badge sur le trajet et que le camion a un titulaire officiel
                 if not t_gard and h.vehicule and h.vehicule.conducteur_actuel_id:
                     t_gard = resoudre_gardien(h.vehicule.conducteur_actuel_id, None)
-                # 3. Fallback sur le chauffeur de l'archive
+                # 4. Fallback sur le chauffeur de l'archive
                 if not t_gard:
                     t_gard = resoudre_gardien(h.conducteur_id, d.get("chauffeur") or plaque)
                 if not t_gard:

@@ -883,7 +883,7 @@ def _dt_iso_rep(texte) -> datetime | None:
 def reparer_historique_conducteurs_passes(db=None) -> dict:
     """Correction des attributions de conducteurs sur les données passées et archives :
     1. Réalignement sur le chauffeur majoritaire / titulaire du véhicule.
-    2. Propagation des badges de trajets dans les snapshots JSON d'archives.
+    2. Propagation et enrichissement des badges de trajets dans les snapshots JSON d'archives.
     3. Élimination des attributions erronées dues aux badges de relais momentanés.
     """
     propre = db is None
@@ -938,6 +938,28 @@ def reparer_historique_conducteurs_passes(db=None) -> dict:
             trajets_snap = list(d.get("trajets") or [])
             modifie = False
 
+            # Enrichir les snapshots de trajets depuis la table `trajets` de la base
+            db_trajets = db.scalars(select(Trajet).join(
+                SuiviJournalier, Trajet.suivi_id == SuiviJournalier.id
+            ).where(
+                SuiviJournalier.vehicule_id == h.vehicule_id,
+                SuiviJournalier.date_jour == h.date_jour
+            )).all()
+
+            if db_trajets and trajets_snap:
+                map_db_t = {t_db.id: t_db for t_db in db_trajets if t_db.id}
+                for t in trajets_snap:
+                    if not isinstance(t, dict):
+                        continue
+                    tid = t.get("id")
+                    if tid and tid in map_db_t:
+                        db_t = map_db_t[tid]
+                        if db_t.conducteur_badge and not t.get("conducteur_badge"):
+                            t["conducteur_badge"] = db_t.conducteur_badge
+                            t["conducteur_badge_id"] = db_t.conducteur_badge_id
+                            modifie = True
+                            stats["trajets_badges_enrichis"] += 1
+
             duree_par_cond_hist: dict[str, int] = {}
             for t in trajets_snap:
                 if not isinstance(t, dict):
@@ -964,8 +986,7 @@ def reparer_historique_conducteurs_passes(db=None) -> dict:
                         d["conducteur"] = s_conducteur(maj_cond, court=True)
                     modifie = True
                     stats["archives_corrigees"] += 1
-            elif titulaire_id and h.conducteur_id != titulaire_id:
-                # Si l'archive a été enregistrée avec un chauffeur différent du titulaire sans trajets spécifiques pour le justifier
+            elif titulaire_id and not h.conducteur_id:
                 h.conducteur_id = titulaire_id
                 maj_cond = db.get(Conducteur, titulaire_id)
                 if maj_cond:
@@ -976,6 +997,7 @@ def reparer_historique_conducteurs_passes(db=None) -> dict:
                 stats["archives_corrigees"] += 1
 
             if modifie:
+                d["trajets"] = trajets_snap
                 h.donnees = d
 
         db.commit()
