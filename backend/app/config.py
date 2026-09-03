@@ -139,6 +139,21 @@ def normaliser_libelle(texte: str | None) -> str:
     return " ".join(brut.lower().split())
 
 
+def calculer_tokens_set(texte: str | None) -> str:
+    """Calcule le sac de mots normalisé (ordonné alphabétiquement et dédupliqué).
+    Permet une comparaison insensible à l'ordre Nom / Prénom :
+    « RAKOTO Jean » -> « jean rakoto »
+    « Jean RAKOTO » -> « jean rakoto »
+    Retire la ponctuation (- / ' . ,) pour une robustesse maximale."""
+    import re
+    if not texte:
+        return ""
+    norm = normaliser_libelle(texte)
+    sans_ponct = re.sub(r"[^\w\s]", " ", norm)
+    mots = sorted(set(m for m in sans_ponct.split() if len(m) > 1 or m.isalnum()))
+    return " ".join(mots)
+
+
 def mots_ignores_badge() -> frozenset:
     """§0septies B2 (arbitrage LSS 20/08/2026) — EXCEPTION à « le badge fait
     foi » : les clés de SERVICE ne désignent pas un chauffeur (« Nouveau

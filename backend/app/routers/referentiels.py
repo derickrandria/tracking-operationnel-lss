@@ -7,16 +7,17 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
-from ..config import (DEPOTS, DISTRIBUTEURS, PRODUITS, normaliser_libelle,
-                      normaliser_saisie, now_local)
+from ..config import (DEPOTS, DISTRIBUTEURS, PRODUITS, calculer_tokens_set,
+                      normaliser_libelle, normaliser_saisie, now_local)
 from ..database import get_db
 from ..engine import ensure_suivi, get_seuils
 from ..event_bus import publish
-from ..models import (Conducteur, Infraction, SituationCamion, StatutCamion,
-                      StatutConducteur, StatutVehicule, SuiviJournalier, Vehicule)
+from ..models import (Alerte, Conducteur, ConducteurAlias, Infraction, Mission,
+                      SituationCamion, StatutCamion, StatutConducteur,
+                      StatutVehicule, SuiviJournalier, Trajet, Vehicule)
 from ..security import ADMIN, ECRITURE, TOUS, audit, require_roles
 from ..serializers import s_conducteur, s_suivi, s_vehicule
 
@@ -47,6 +48,7 @@ class ConducteurIn(BaseModel):
     telephone: str | None = None
     statut: str = "ACTIF"
     matricule: str | None = None
+    code_badge_mzonex: int | None = None
 
 
 class ConducteurPatch(BaseModel):
@@ -54,6 +56,18 @@ class ConducteurPatch(BaseModel):
     prenom_usuel: str | None = None
     telephone: str | None = None
     statut: str | None = None
+    matricule: str | None = None
+    code_badge_mzonex: int | None = None
+
+
+class ConducteurFusionIn(BaseModel):
+    source_id: str
+    cible_id: str
+    creer_alias: bool = True
+
+
+class AliasIn(BaseModel):
+    alias: str
 
 
 def _vehicule_assigne(db: Session) -> dict:
@@ -89,21 +103,31 @@ def _prochain_matricule(db: Session) -> str:
 @router.post("/conducteurs", status_code=status.HTTP_201_CREATED)
 def creer_conducteur(data: ConducteurIn, db: Session = Depends(get_db),
                      user=Depends(require_roles(*ECRITURE))):
-    # §0sexies decies J1 (27/08/2026) : même borne que le collecteur — un nom
-    # canoniquement équivalent (casse/accents ignorés) = MÊME chauffeur → 409
     norm = normaliser_libelle(data.nom_prenom.strip())[:170]
+    tset = calculer_tokens_set(data.nom_prenom.strip())[:170]
     if db.scalar(select(Conducteur).where(
-            Conducteur.nom_normalise == norm)):
+            (Conducteur.nom_normalise == norm) | (Conducteur.tokens_set == tset))):
         raise HTTPException(409, "Un chauffeur au nom équivalent existe déjà "
-                                 "(casse et accents ignorés)")
+                                 "(casse, accents et ordre des mots ignorés)")
+    if db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == norm)):
+        raise HTTPException(409, "Ce libellé est déjà enregistré comme alias pour un autre chauffeur")
+
+    # Code badge MZoneX / matricule
+    badge_code = data.code_badge_mzonex
+    mat = (data.matricule or "").strip() or (str(badge_code) if badge_code else None)
+    if mat and db.scalar(select(Conducteur).where(Conducteur.matricule == mat)):
+        raise HTTPException(409, "Matricule déjà utilisé")
+    if badge_code and db.scalar(select(Conducteur).where(Conducteur.code_badge_mzonex == badge_code)):
+        raise HTTPException(409, "Code badge MZoneX déjà utilisé")
+
     c = Conducteur(
         nom_prenom=data.nom_prenom.strip(), prenom_usuel=data.prenom_usuel.strip().upper(),
         telephone=(data.telephone or "").strip() or None,
         statut=StatutConducteur(data.statut),
-        matricule=(data.matricule or "").strip() or _prochain_matricule(db),
-        nom_normalise=norm)
-    if db.scalar(select(Conducteur).where(Conducteur.matricule == c.matricule)):
-        raise HTTPException(409, "Matricule déjà utilisé")
+        matricule=mat,
+        code_badge_mzonex=badge_code,
+        nom_normalise=norm,
+        tokens_set=tset)
     db.add(c)
     db.flush()
     audit(db, user, "conducteur.creation", "conducteur", c.id, {"apres": s_conducteur(c)})
@@ -120,25 +144,133 @@ def modifier_conducteur(cid: str, data: ConducteurPatch, db: Session = Depends(g
         raise HTTPException(404, "Conducteur introuvable")
     avant = s_conducteur(c)
     donnees = data.model_dump(exclude_unset=True)
-    # §0sexies decies J1 : un renommage vers un nom canoniquement déjà pris
-    # est refusé (sinon on recréerait un doublon à la main) ; la forme
-    # canonique suit TOUJOURS le nom affiché.
+
     if donnees.get("nom_prenom"):
         cible = normaliser_libelle(str(donnees["nom_prenom"]).strip())[:170]
+        tset = calculer_tokens_set(str(donnees["nom_prenom"]).strip())[:170]
         if db.scalar(select(Conducteur).where(
-                Conducteur.nom_normalise == cible, Conducteur.id != cid)):
+                (Conducteur.nom_normalise == cible) | (Conducteur.tokens_set == tset),
+                Conducteur.id != cid)):
             raise HTTPException(409, "Un chauffeur au nom équivalent existe "
-                                     "déjà (casse et accents ignorés)")
+                                     "déjà (casse, accents et ordre des mots ignorés)")
         c.nom_normalise = cible
+        c.tokens_set = tset
+
+    if "matricule" in donnees:
+        mat = (donnees["matricule"] or "").strip() or None
+        if mat and db.scalar(select(Conducteur).where(Conducteur.matricule == mat, Conducteur.id != cid)):
+            raise HTTPException(409, "Matricule déjà utilisé")
+        c.matricule = mat
+
+    if "code_badge_mzonex" in donnees:
+        badge = donnees["code_badge_mzonex"]
+        if badge and db.scalar(select(Conducteur).where(Conducteur.code_badge_mzonex == badge, Conducteur.id != cid)):
+            raise HTTPException(409, "Code badge MZoneX déjà utilisé")
+        c.code_badge_mzonex = badge
+
     for champ, val in donnees.items():
+        if champ in ("matricule", "code_badge_mzonex"):
+            continue
         if champ == "statut" and val is not None:
             val = StatutConducteur(val)
         setattr(c, champ, val)
+
     audit(db, user, "conducteur.modification", "conducteur", cid,
           {"avant": avant, "apres": s_conducteur(c)})
     db.commit()
     publish("referentiels.changed", {"entite": "conducteur", "action": "modification", "id": cid})
     return s_conducteur(c)
+
+
+@router.post("/conducteurs/fusionner")
+def fusionner_conducteurs(data: ConducteurFusionIn, db: Session = Depends(get_db),
+                          user=Depends(require_roles(*ECRITURE))):
+    """Fusionne un chauffeur source (ex. AUTO-xxxx) vers un chauffeur cible officiel."""
+    if data.source_id == data.cible_id:
+        raise HTTPException(400, "Impossible de fusionner un chauffeur avec lui-même")
+
+    source = db.get(Conducteur, data.source_id)
+    cible = db.get(Conducteur, data.cible_id)
+    if source is None:
+        raise HTTPException(404, "Chauffeur source introuvable")
+    if cible is None:
+        raise HTTPException(404, "Chauffeur cible introuvable")
+
+    # 1. Création de l'alias si demandé
+    if data.creer_alias and source.nom_prenom:
+        alias_norm = normaliser_libelle(source.nom_prenom)[:170]
+        if alias_norm and alias_norm != cible.nom_normalise:
+            if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == alias_norm)):
+                db.add(ConducteurAlias(conducteur_id=cible.id, alias_brut=source.nom_prenom,
+                                       alias_normalise=alias_norm, source="FUSION"))
+
+    # 2. Réassignation des alias existants de source vers cible
+    db.execute(update(ConducteurAlias).where(ConducteurAlias.conducteur_id == source.id).values(conducteur_id=cible.id))
+
+    # 3. Réassignation de toutes les clés étrangères vives
+    db.execute(update(Vehicule).where(Vehicule.conducteur_actuel_id == source.id).values(conducteur_actuel_id=cible.id))
+    db.execute(update(SuiviJournalier).where(SuiviJournalier.conducteur_id == source.id).values(conducteur_id=cible.id))
+    db.execute(update(Trajet).where(Trajet.conducteur_badge_id == source.id).values(
+        conducteur_badge_id=cible.id, conducteur_badge=cible.nom_prenom))
+    db.execute(update(Mission).where(Mission.conducteur_id == source.id).values(conducteur_id=cible.id))
+    db.execute(update(Infraction).where(Infraction.conducteur_id == source.id).values(conducteur_id=cible.id))
+    db.execute(update(Alerte).where(Alerte.conducteur_id == source.id).values(conducteur_id=cible.id))
+
+    # 4. Héritage du code_badge_mzonex si présent sur la source et absent sur la cible
+    if source.code_badge_mzonex and not cible.code_badge_mzonex:
+        cible.code_badge_mzonex = source.code_badge_mzonex
+        if not cible.matricule:
+            cible.matricule = str(source.code_badge_mzonex)
+
+    # 5. Audit log complet de la fusion
+    audit(db, user, "conducteur.fusion", "conducteur", cible.id, {
+        "source": s_conducteur(source),
+        "cible": s_conducteur(cible),
+        "alias_cree": data.creer_alias
+    })
+
+    # 6. Suppression propre de la fiche source
+    db.delete(source)
+    db.commit()
+    publish("referentiels.changed", {"entite": "conducteur", "action": "fusion", "id": cible.id})
+    return s_conducteur(cible)
+
+
+@router.post("/conducteurs/{cid}/aliases")
+def ajouter_alias(cid: str, data: AliasIn, db: Session = Depends(get_db),
+                  user=Depends(require_roles(*ECRITURE))):
+    c = db.get(Conducteur, cid)
+    if c is None:
+        raise HTTPException(404, "Conducteur introuvable")
+    alias_txt = data.alias.strip()
+    if not alias_txt or len(alias_txt) < 3:
+        raise HTTPException(400, "Libellé d'alias invalide (minimum 3 caractères)")
+    alias_norm = normaliser_libelle(alias_txt)[:170]
+    if alias_norm == c.nom_normalise:
+        raise HTTPException(400, "Cet alias correspond déjà au nom officiel du chauffeur")
+    if db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == alias_norm)):
+        raise HTTPException(409, "Cet alias est déjà associé à un chauffeur")
+
+    alias_obj = ConducteurAlias(conducteur_id=c.id, alias_brut=alias_txt,
+                                alias_normalise=alias_norm, source="MANUEL")
+    db.add(alias_obj)
+    audit(db, user, "conducteur.alias_ajoute", "conducteur", c.id, {"alias": alias_txt})
+    db.commit()
+    publish("referentiels.changed", {"entite": "conducteur", "action": "modification", "id": c.id})
+    return {"ok": True, "id": alias_obj.id, "alias_brut": alias_obj.alias_brut}
+
+
+@router.delete("/conducteurs/{cid}/aliases/{aid}")
+def supprimer_alias(cid: str, aid: str, db: Session = Depends(get_db),
+                    user=Depends(require_roles(*ECRITURE))):
+    alias_obj = db.get(ConducteurAlias, aid)
+    if alias_obj is None or alias_obj.conducteur_id != cid:
+        raise HTTPException(404, "Alias introuvable pour ce chauffeur")
+    db.delete(alias_obj)
+    audit(db, user, "conducteur.alias_supprime", "conducteur", cid, {"alias_id": aid})
+    db.commit()
+    publish("referentiels.changed", {"entite": "conducteur", "action": "modification", "id": cid})
+    return {"ok": True}
 
 
 @router.delete("/conducteurs/{cid}")
@@ -151,7 +283,7 @@ def supprimer_conducteur(cid: str, db: Session = Depends(get_db),
     refs += db.scalar(select(func.count(SuiviJournalier.id)).where(SuiviJournalier.conducteur_id == cid)) or 0
     refs += db.scalar(select(func.count(Infraction.id)).where(Infraction.conducteur_id == cid)) or 0
     if refs:
-        raise HTTPException(409, "Conducteur référencé dans l'historique : utilisez « Désactiver »")
+        raise HTTPException(409, "Conducteur référencé dans l'historique : utilisez « Fusionner » ou « Désactiver »")
     audit(db, user, "conducteur.suppression", "conducteur", cid, {"avant": s_conducteur(c)})
     db.delete(c)
     db.commit()

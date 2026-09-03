@@ -942,11 +942,12 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 mapping[str(v.id).strip().upper()] = v
                 if v.gps_associe:
                     mapping[str(v.gps_associe).strip().upper()] = v
-        if it.get("conducteur"):
+        if it.get("conducteur") or it.get("badge_code"):
             # §0septies B2 (20/08/2026) : les clés de SERVICE (« Nouveau
             # conducteur », « garage LSS ») ne créent JAMAIS de fiche — la
             # saisie manuelle fait le travail sur ces lignes-là
-            resoudre_badge(db, it["conducteur"])
+            resoudre_badge(db, it.get("conducteur"), badge_code=it.get("badge_code"),
+                           plateforme=it.get("source"))
 
     suivi_touches: set[str] = set()
 

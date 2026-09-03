@@ -42,7 +42,7 @@ from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, select
 
-from .config import jour_attribution, normaliser_libelle, now_local
+from .config import calculer_tokens_set, jour_attribution, normaliser_libelle, now_local
 from .daily import (_trajets_reels_du_jour as _relecture_portails,
                     archiver_jour, consolider_jour)
 from .database import SessionLocal
@@ -851,6 +851,9 @@ def reparer_conducteurs_v138(db=None) -> dict:
             if c.nom_normalise != canon:
                 c.nom_normalise = canon
                 stats["rekey"] = stats.get("rekey", 0) + 1
+            tset = calculer_tokens_set(c.nom_prenom)[:170]
+            if c.tokens_set != tset:
+                c.tokens_set = tset
         db.commit()
         stats["index_unique"] = _assurer_index_unique(db)
         db.commit()

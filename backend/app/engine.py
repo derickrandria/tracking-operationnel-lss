@@ -15,17 +15,18 @@ from threading import RLock
 
 from sqlalchemy import func, select
 
-from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, jour_attribution,
-                     mots_ignores_badge, mots_ignores_conducteur,
+from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, calculer_tokens_set,
+                     jour_attribution, mots_ignores_badge, mots_ignores_conducteur,
                      normaliser_ident, normaliser_libelle, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
 from .event_bus import publish
-from .models import (Alerte, AuditLog, Conducteur, EvenementGPS, GraviteAlerte,
-                     GraviteInfraction, Infraction, Mission, ParametrageSeuil,
-                     SourceEvenement, StatutAlerte, StatutCamion, StatutMission,
-                     StatutValidationTrajet, StatutVehicule, SuiviJournalier,
-                     Trajet, TypeAlerte, TypeEvenement, TypeInfraction, Vehicule)
+from .models import (Alerte, AuditLog, Conducteur, ConducteurAlias, EvenementGPS,
+                     GraviteAlerte, GraviteInfraction, Infraction, Mission,
+                     ParametrageSeuil, SourceEvenement, StatutAlerte,
+                     StatutCamion, StatutConducteur, StatutMission, StatutValidationTrajet,
+                     StatutVehicule, SuiviJournalier, Trajet, TypeAlerte,
+                     TypeEvenement, TypeInfraction, Vehicule)
 from .serializers import iso, s_alerte, s_infraction, s_mission, s_suivi
 
 log = logging.getLogger("lss.engine")
@@ -1463,49 +1464,120 @@ def creer_vehicule_auto(db, ident: str, plateforme: str) -> Vehicule | None:
     return v
 
 
-def creer_conducteur_auto(db, nom_brut: str) -> "object | None":
-    """Arbitrage §0quater D2 (14/08/2026) — conducteur vu sur un portail mais
-    inconnu → fiche Conducteur créée (matricule AUTO-xxxxxxxx) + alerte ⓘ +
-    audit. L'affectation au véhicule reste MANUELLE (remplacements = métier).
-    Idempotent (§0sexies decies J1, 27/08) : rapprochement par forme
-    CANONIQUE du nom — insensible casse ET accents (« MICHAËL Justin » =
-    « MICHAEL JUSTIN »), une seule fiche par chauffeur."""
-    from .models import Conducteur
+def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = None,
+                          plateforme: str | None = None) -> "object | None":
+    """Arbitrage §0quater D2 (14/08/2026) & Spécification Déduplication Avancée :
+    1. Rapprochement direct par driverKeyCode MZoneX (si badge_code présent).
+    2. Rapprochement par forme CANONIQUE (nom_normalise).
+    3. Rapprochement par ALIAS connu (conducteur_aliases).
+    4. Rapprochement par SAC DE MOTS exact (tokens_set).
+    5. Rapprochement par INCLUSION forte de patronyme (nom_court in nom_long).
+    6. Découverte chauffeur : création de fiche Conducteur.
+       - MZoneX : matricule = str(driverKeyCode), code_badge_mzonex = badge_code
+       - CamtrackPro : matricule = None, code_badge_mzonex = None
+    """
+    from .models import Conducteur, ConducteurAlias
     nom = " ".join((nom_brut or "").split()).strip()
-    if len(nom) < 5 or not any(c.isalpha() for c in nom):
+
+    # 1. Filtres non-personnes (D5) et clés de service (B2)
+    if nom:
+        if set(nom.lower().split()) & set(mots_ignores_conducteur()):
+            if nom.lower() not in _D5_DEJA_LOGUES:
+                _D5_DEJA_LOGUES.add(nom.lower())
+                log.info("§0quinquies D5 : libellé chauffeur non-personne ignoré "
+                         ": %r (tracé une seule fois)", nom)
+            return None
+        if normaliser_libelle(nom) in mots_ignores_badge():
+            return None
+
+    # Règle MZoneX : si badge_code valide, chercher en priorité absolue par code_badge_mzonex ou matricule
+    if badge_code and badge_code > 0:
+        ex_badge = db.scalar(select(Conducteur).where(
+            (Conducteur.code_badge_mzonex == badge_code) | (Conducteur.matricule == str(badge_code))))
+        if ex_badge is not None:
+            if nom and len(nom) >= 3:
+                cible = normaliser_libelle(nom)[:170]
+                if cible and cible != ex_badge.nom_normalise:
+                    if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible)):
+                        db.add(ConducteurAlias(conducteur_id=ex_badge.id, alias_brut=nom,
+                                               alias_normalise=cible, source=plateforme or "MZONEX"))
+            return ex_badge
+
+    if not nom or len(nom) < 3 or not any(c.isalpha() for c in nom):
         return None
-    # §0quinquies D5 (arbitrage 14/08/2026) — le portail met parfois un LIEU
-    # dans la colonne chauffeur (« Garage LSS 2 », « Dépôt »…) : ces libellés
-    # ne créent jamais de fiche (liste surchargeable CONDUCTEUR_MOTS_IGNORES).
-    if set(nom.lower().split()) & set(mots_ignores_conducteur()):
-        if nom.lower() not in _D5_DEJA_LOGUES:
-            _D5_DEJA_LOGUES.add(nom.lower())
-            log.info("§0quinquies D5 : libellé chauffeur non-personne ignoré "
-                     ": %r (tracé une seule fois)", nom)
-        return None
-    # §0sexies decies J1 (27/08/2026) — l'anti-doublon compare la FORME
-    # CANONIQUE (NFKD, accents écartés, minuscules) et non lower() SQL :
-    # sous SQLite, lower() ne plie que A-Z → « MICHAËL Justin » n'était
-    # jamais reconnu déjà présent (bug : fiches créées en rafale).
+
     cible = normaliser_libelle(nom)[:170]
     if not cible:
         return None
-    existant = db.scalar(select(Conducteur).where(
-        Conducteur.nom_normalise == cible))
-    if existant is None:               # repli : fiches sans forme canonique
-        for c0 in db.scalars(select(Conducteur).where(
-                Conducteur.nom_normalise.is_(None))):
+    tset = calculer_tokens_set(nom)[:170]
+
+    # Échelon 2 : Correspondance canonique directe
+    existant = db.scalar(select(Conducteur).where(Conducteur.nom_normalise == cible))
+    if existant is None:
+        for c0 in db.scalars(select(Conducteur).where(Conducteur.nom_normalise.is_(None))):
             if normaliser_libelle(c0.nom_prenom)[:170] == cible:
                 existant = c0
                 break
+
+    # Échelon 3 : Table des Alias
+    if existant is None:
+        alias_row = db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible))
+        if alias_row is not None and alias_row.conducteur is not None:
+            existant = alias_row.conducteur
+
+    # Échelon 4 : Sac de mots exact (tokens_set)
+    if existant is None and tset:
+        existant = db.scalar(select(Conducteur).where(Conducteur.tokens_set == tset))
+        if existant is None:
+            for c0 in db.scalars(select(Conducteur).where(Conducteur.tokens_set.is_(None))):
+                if calculer_tokens_set(c0.nom_prenom)[:170] == tset:
+                    existant = c0
+                    break
+        if existant is not None:
+            # Enregistrer comme alias permanent
+            if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible)):
+                db.add(ConducteurAlias(conducteur_id=existant.id, alias_brut=nom,
+                                       alias_normalise=cible, source=plateforme or "AUTO"))
+                db.flush()
+
+    # Échelon 5 : Inclusion forte / patronyme partiel (>= 2 mots)
+    if existant is None and tset:
+        mots_cible = set(tset.split())
+        if len(mots_cible) >= 2:
+            candidats = []
+            for c0 in db.scalars(select(Conducteur).where(Conducteur.statut == StatutConducteur.ACTIF)).all():
+                c0_tokens = set((c0.tokens_set or calculer_tokens_set(c0.nom_prenom)).split())
+                if mots_cible.issubset(c0_tokens) and len(c0_tokens) > len(mots_cible):
+                    candidats.append(c0)
+            if len(candidats) == 1:
+                existant = candidats[0]
+                if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible)):
+                    db.add(ConducteurAlias(conducteur_id=existant.id, alias_brut=nom,
+                                           alias_normalise=cible, source=plateforme or "INCLUSION"))
+                    db.flush()
+                log.info("Rapprochement par inclusion : « %s » rattaché à « %s »", nom, existant.nom_prenom)
+
     if existant is not None:
+        if badge_code and not existant.code_badge_mzonex:
+            existant.code_badge_mzonex = badge_code
+            if not existant.matricule:
+                existant.matricule = str(badge_code)
         return existant
+
+    # Échelon 6 : Création nouvelle fiche
     import uuid as _uuid
     tokens = nom.split()
     prenom_usuel = tokens[1] if tokens[0].isupper() and len(tokens) > 1 else tokens[-1]
+    if badge_code and badge_code > 0:
+        matricule = str(badge_code)
+    elif plateforme == "CAMTRACKPRO":
+        matricule = None
+    else:
+        matricule = f"AUTO-{_uuid.uuid4().hex[:8].upper()}"
+
     c = Conducteur(nom_prenom=nom, prenom_usuel=prenom_usuel.capitalize(),
-                   matricule=f"AUTO-{_uuid.uuid4().hex[:8].upper()}",
-                   nom_normalise=cible)
+                   matricule=matricule, code_badge_mzonex=badge_code if (badge_code and badge_code > 0) else None,
+                   nom_normalise=cible, tokens_set=tset)
     db.add(c)
     db.flush()
     creer_alerte(
@@ -1514,10 +1586,11 @@ def creer_conducteur_auto(db, nom_brut: str) -> "object | None":
         f"automatiquement ; affectation au véhicule à faire dans Conducteurs.")
     _auditer(db, "conducteur.auto_cree", c.id, {
         "nom_prenom": nom,
-        "regle": "§0quater D2 (14/08/2026) : découverte chauffeur — "
-                 "affectation manuelle"})
-    log.info("§0quater D2 : nouveau chauffeur « %s » détecté — fiche créée",
-             nom)
+        "matricule": matricule,
+        "code_badge_mzonex": badge_code,
+        "regle": "§0quater D2 (14/08/2026) : découverte chauffeur — affectation manuelle"})
+    log.info("§0quater D2 : nouveau chauffeur « %s » détecté (matricule=%s) — fiche créée",
+             nom, matricule)
     return c
 
 
@@ -1543,7 +1616,8 @@ _CHAMPS_ECO = ("v_max", "ralenti_s", "exc_vitesse", "exc_freinage",
                "exc_accel", "exc_ralenti", "exc_surregime", "exc_autres")
 
 
-def resoudre_badge(db, nom_brut: str | None):
+def resoudre_badge(db, nom_brut: str | None, badge_code: int | None = None,
+                   plateforme: str | None = None):
     """B2 — nom publié par le portail → (fiche Conducteur, libellé_écarté).
 
     (fiche, None)  : badge valide — fiche existante ou créée (D2), fait foi ;
@@ -1551,11 +1625,11 @@ def resoudre_badge(db, nom_brut: str | None):
     (None, None)   : pas de conducteur publié sur cette ligne."""
     from .models import Conducteur  # import local (comme creer_conducteur_auto)
     nom = " ".join((nom_brut or "").split()).strip()
-    if not nom:
+    if not nom and not badge_code:
         return None, None
-    if normaliser_libelle(nom) in mots_ignores_badge():
+    if nom and normaliser_libelle(nom) in mots_ignores_badge():
         return None, nom
-    fiche = creer_conducteur_auto(db, nom)      # D2 + D5 (retourne None si lieu)
+    fiche = creer_conducteur_auto(db, nom, badge_code=badge_code, plateforme=plateforme)
     if fiche is None:
         return None, nom
     return fiche, None
@@ -1590,8 +1664,11 @@ def appliquer_badge_et_eco(db, trajet: Trajet, suivi: SuiviJournalier,
     compteurs d'écoconduite officiels. Idempotent et SILENCIEUX tant que les
     valeurs ne changent pas (les mêmes lignes reviennent à chaque cycle)."""
     nom = it.get("conducteur")
-    if nom:
-        fiche, ecarte = resoudre_badge(db, nom)
+    badge_code = it.get("badge_code")
+    plateforme = it.get("source") or getattr(vehicule, "plateforme_gps", None)
+    fiche = None
+    if nom or badge_code:
+        fiche, ecarte = resoudre_badge(db, nom, badge_code=badge_code, plateforme=plateforme)
         if ecarte is not None:
             if trajet.badge_ecarte != ecarte:
                 trajet.badge_ecarte = ecarte

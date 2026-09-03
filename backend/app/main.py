@@ -179,6 +179,33 @@ def migrer_schema():
                      "(§0sexies decies J1)")
         cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_nom_normalise "
                         "ON conducteurs (nom_normalise)"))
+        if "tokens_set" not in cols_c:
+            cx.execute(text(
+                "ALTER TABLE conducteurs ADD COLUMN tokens_set VARCHAR(170)"))
+            log.info("Migration : conducteurs.tokens_set ajouté")
+        cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_tokens_set "
+                        "ON conducteurs (tokens_set)"))
+        if "code_badge_mzonex" not in cols_c:
+            cx.execute(text(
+                "ALTER TABLE conducteurs ADD COLUMN code_badge_mzonex INTEGER"))
+            log.info("Migration : conducteurs.code_badge_mzonex ajouté")
+        cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_code_badge_mzonex "
+                        "ON conducteurs (code_badge_mzonex)"))
+        # Table conducteur_aliases
+        cx.execute(text("""
+            CREATE TABLE IF NOT EXISTS conducteur_aliases (
+                id VARCHAR(36) PRIMARY KEY,
+                conducteur_id VARCHAR(36) NOT NULL REFERENCES conducteurs(id) ON DELETE CASCADE,
+                alias_brut VARCHAR(160) NOT NULL,
+                alias_normalise VARCHAR(170) NOT NULL UNIQUE,
+                source VARCHAR(30) DEFAULT 'MANUEL',
+                date_creation DATETIME
+            )
+        """))
+        cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteur_aliases_conducteur_id "
+                        "ON conducteur_aliases (conducteur_id)"))
+        cx.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_conducteur_aliases_normalise "
+                        "ON conducteur_aliases (alias_normalise)"))
         # §0decies (24/08/2026) : marqueur segment B d'un trajet franchissant
         # minuit (revérification portail sans faux « sans source »)
         if "suite_minuit" not in cols_t:

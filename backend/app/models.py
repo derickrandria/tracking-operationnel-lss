@@ -173,12 +173,36 @@ class Conducteur(Base):
     # réparation v1.38 une fois les doublons historiques résorbés.
     nom_normalise: Mapped[str | None] = mapped_column(String(170), index=True,
                                                       nullable=True)
+    tokens_set: Mapped[str | None] = mapped_column(String(170), index=True,
+                                                   nullable=True)
+    # Code badge MZoneX (driverKeyCode) — renseigné pour les camions MZoneX, vide pour CamtrackPro
+    code_badge_mzonex: Mapped[int | None] = mapped_column(Integer, index=True,
+                                                          nullable=True)
     prenom_usuel: Mapped[str] = mapped_column(String(60), index=True)
-    matricule: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    # Matricule : renseigné ou driverKeyCode pour MZoneX, vide/null pour CamtrackPro
+    matricule: Mapped[str | None] = mapped_column(String(40), index=True,
+                                                  nullable=True)
     telephone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     statut: Mapped[StatutConducteur] = mapped_column(
         SAEnum(StatutConducteur, **SA_ENUM_KW), default=StatutConducteur.ACTIF)
     date_creation: Mapped[datetime] = mapped_column(DateTime, default=now_local)
+
+    aliases = relationship("ConducteurAlias", back_populates="conducteur",
+                           cascade="all, delete-orphan", lazy="selectin")
+
+
+class ConducteurAlias(Base):
+    """Alias textuels et variantes orthographiques pour le rapprochement des chauffeurs."""
+    __tablename__ = "conducteur_aliases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    conducteur_id: Mapped[str] = mapped_column(
+        ForeignKey("conducteurs.id", ondelete="CASCADE"), index=True)
+    alias_brut: Mapped[str] = mapped_column(String(160))
+    alias_normalise: Mapped[str] = mapped_column(String(170), unique=True, index=True)
+    source: Mapped[str | None] = mapped_column(String(30), default="MANUEL")
+    date_creation: Mapped[datetime] = mapped_column(DateTime, default=now_local)
+
+    conducteur = relationship("Conducteur", back_populates="aliases")
 
 
 class Vehicule(Base):

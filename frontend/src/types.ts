@@ -1,13 +1,22 @@
 /** Types partagés avec l'API. */
+export interface ConducteurAlias {
+  id: string;
+  alias_brut: string;
+}
+
 export interface Conducteur {
   id: string;
   nom_prenom: string;
   prenom_usuel: string;
-  matricule: string;
+  matricule?: string | null;
+  code_badge_mzonex?: number | null;
+  nom_normalise?: string | null;
+  tokens_set?: string | null;
   telephone: string | null;
   statut: string;
   vehicule_plaque?: string | null;
   date_creation?: string;
+  aliases?: ConducteurAlias[];
 }
 
 export interface Vehicule {

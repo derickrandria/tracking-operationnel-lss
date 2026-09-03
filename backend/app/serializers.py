@@ -31,9 +31,16 @@ def s_conducteur(c: Conducteur | None, court=False):
         "nom_prenom": c.nom_prenom,
         "prenom_usuel": c.prenom_usuel,
         "matricule": c.matricule,
+        "nom_normalise": getattr(c, "nom_normalise", None),
+        "tokens_set": getattr(c, "tokens_set", None),
+        "code_badge_mzonex": getattr(c, "code_badge_mzonex", None),
         "telephone": c.telephone,
         "statut": c.statut.value if c.statut else None,
     }
+    if hasattr(c, "aliases") and c.aliases:
+        d["aliases"] = [{"id": a.id, "alias_brut": a.alias_brut} for a in c.aliases]
+    else:
+        d["aliases"] = []
     if not court:
         d["date_creation"] = iso(c.date_creation)
     return d
