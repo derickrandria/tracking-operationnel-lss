@@ -291,6 +291,7 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         "description": s.vehicule.description if s.vehicule else None,
         "conducteur_id": s.conducteur_id,
         "conducteur": s_conducteur(s.conducteur, court=True),
+        "conducteur_origine": getattr(s, "conducteur_origine", None),
         # Partie B
         "situation": s.situation,
         "statut_camion": s.statut_camion.value if s.statut_camion else None,

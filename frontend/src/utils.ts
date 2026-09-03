@@ -61,6 +61,8 @@ export const LABELS_ALERTE: Record<string, string> = {
   COLLECTE_YMANE: "Collecte Ym@ne en échec",
   TCH_PROCHE_LIMITE: "TCH proche de la limite",
   TCH_LIMITE_ATTEINTE: "TCH limite atteinte",
+  CONFLIT_AFFECTATION: "Conflit d'affectation chauffeur",
+  DOUBLON_CONDUCTEUR: "Doublon chauffeur",
 };
 
 export const COULEURS_GRAVITE: Record<string, string> = {

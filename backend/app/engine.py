@@ -16,8 +16,8 @@ from threading import RLock
 from sqlalchemy import func, select
 
 from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, calculer_tokens_set,
-                     jour_attribution, mots_ignores_badge, mots_ignores_conducteur,
-                     normaliser_ident, normaliser_libelle, now_local,
+                     est_libelle_service_ou_garage, jour_attribution, mots_ignores_badge,
+                     mots_ignores_conducteur, normaliser_ident, normaliser_libelle, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
 from .event_bus import publish
@@ -978,6 +978,7 @@ def transition_statut(db, suivi: SuiviJournalier, vehicule: Vehicule,
                 publish("mission.update", s_mission(m))
 
 
+CHAMPS_A = {"conducteur_id"}
 CHAMPS_B = {"situation", "statut_camion", "depot_recepteur", "distributeur",
             "produit", "numero_ot"}
 CHAMPS_C = {"emplacement_j_moins_1", "position_08h", "position_10h", "position_12h",
@@ -988,16 +989,37 @@ CHAMPS_C = {"emplacement_j_moins_1", "position_08h", "position_10h", "position_1
 
 def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
                            ts: datetime | None = None) -> dict:
-    """Application centralisée des saisies Parties B/C (utilisée par l'API et
-    le simulateur) ; déclenche la chaîne de synchronisation §9."""
+    """Application centralisée des saisies Parties A/B/C (utilisée par l'API et
+    le simulateur) ; déclenche la chaîne de synchronisation §9 et garantit l'anti-doublon."""
     ts = ts or now_local()
     vehicule = db.get(Vehicule, suivi.vehicule_id)
     diffs = {}
     ancien_statut = suivi.statut_camion.value if suivi.statut_camion else None
 
     for cle, val in champs.items():
-        if cle not in CHAMPS_B | CHAMPS_C:
+        if cle not in CHAMPS_A | CHAMPS_B | CHAMPS_C:
             continue
+        if cle == "conducteur_id":
+            nouv_cid = val or None
+            if suivi.conducteur_id != nouv_cid:
+                diffs["conducteur_id"] = {"avant": suivi.conducteur_id, "apres": nouv_cid}
+                if nouv_cid:
+                    # Règle stricte anti-doublon : détacher ce chauffeur de tout autre camion le même jour
+                    for s_autre in db.scalars(select(SuiviJournalier).where(
+                            SuiviJournalier.date_jour == suivi.date_jour,
+                            SuiviJournalier.conducteur_id == nouv_cid,
+                            SuiviJournalier.id != suivi.id)).all():
+                        s_autre.conducteur_id = None
+                        s_autre.conducteur_origine = None
+                        if PUBLISH_ENABLED["on"]:
+                            publish("suivi.update", {"suivi": s_suivi(s_autre, get_seuils(db))})
+                    suivi.conducteur_id = nouv_cid
+                    suivi.conducteur_origine = "MANUEL"
+                else:
+                    suivi.conducteur_id = None
+                    suivi.conducteur_origine = None
+            continue
+
         if cle == "statut_camion" and val:
             val = StatutCamion(val)
         ancienne = getattr(suivi, cle)
@@ -1479,15 +1501,13 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
     from .models import Conducteur, ConducteurAlias
     nom = " ".join((nom_brut or "").split()).strip()
 
-    # 1. Filtres non-personnes (D5) et clés de service (B2)
+    # 1. Filtres non-personnes (D5), garages et clés de service (B2)
     if nom:
-        if set(nom.lower().split()) & set(mots_ignores_conducteur()):
+        if est_libelle_service_ou_garage(nom):
             if nom.lower() not in _D5_DEJA_LOGUES:
                 _D5_DEJA_LOGUES.add(nom.lower())
-                log.info("§0quinquies D5 : libellé chauffeur non-personne ignoré "
+                log.info("§0quinquies D5 / B2 : libellé clé de service / garage / non-personne ignoré "
                          ": %r (tracé une seule fois)", nom)
-            return None
-        if normaliser_libelle(nom) in mots_ignores_badge():
             return None
 
     # Règle MZoneX : si badge_code valide, chercher en priorité absolue par code_badge_mzonex ou matricule
@@ -1645,7 +1665,7 @@ def resoudre_badge(db, nom_brut: str | None, badge_code: int | None = None,
     nom = " ".join((nom_brut or "").split()).strip()
     if not nom and not badge_code:
         return None, None
-    if nom and normaliser_libelle(nom) in mots_ignores_badge():
+    if nom and est_libelle_service_ou_garage(nom):
         return None, nom
     fiche = creer_conducteur_auto(db, nom, badge_code=badge_code, plateforme=plateforme)
     if fiche is None:
@@ -1657,9 +1677,59 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
                             username: str = "collecteur") -> None:
     """B2 — le badge fait foi sur le chauffeur du JOUR (grille Parties A) :
     l'attribution « MANUEL » n'est jamais écrasée ; une attribution « BADGE »
-    (ou absente) suit le dernier badge valide publié. Idempotent, audité au
-    changement seulement (les lignes reviennent à chaque sync Niveau 2).
-    Auto-assignation du véhicule + propagation du driverKeyCode via tokens_set."""
+    (ou absente) suit le dernier badge valide publié.
+    Gestion stricte anti-doublon et détection de conflit (saisie manuelle vs portail)."""
+    if suivi is None or fiche is None:
+        return
+
+    # 1. Si la ligne de suivi actuelle est déjà attribuée MANUELLEMENT :
+    # La saisie manuelle prime TOUJOURS sur les relevés des portails.
+    if getattr(suivi, "conducteur_origine", None) == "MANUEL":
+        if suivi.conducteur_id != fiche.id:
+            log.info("§0septies B2 : attribution MANUELLE maintenue sur %s (%s) malgré badge « %s »",
+                     suivi.vehicule.plaque if suivi.vehicule else "?",
+                     suivi.conducteur.nom_prenom if suivi.conducteur else "?",
+                     fiche.nom_prenom)
+        return
+
+    # 2. Vérification anti-doublon : ce chauffeur (fiche.id) est-il déjà affecté à un AUTRE véhicule ce jour ?
+    autre_suivi = db.scalar(select(SuiviJournalier).where(
+        SuiviJournalier.date_jour == suivi.date_jour,
+        SuiviJournalier.conducteur_id == fiche.id,
+        SuiviJournalier.id != suivi.id))
+
+    if autre_suivi is not None:
+        plaque_autre = autre_suivi.vehicule.plaque if autre_suivi.vehicule else "inconnu"
+        plaque_ceci = suivi.vehicule.plaque if suivi.vehicule else "inconnu"
+        nom_ch = fiche.nom_prenom
+
+        # Si l'autre véhicule a été attribué MANUELLEMENT à ce chauffeur :
+        if getattr(autre_suivi, "conducteur_origine", None) == "MANUEL":
+            # Conflit d'affectation : la saisie manuelle sur l'autre véhicule fait foi
+            msg = (f"Conflit d'affectation : {nom_ch} est attribué manuellement "
+                   f"au camion {plaque_autre}, mais a été détecté sur les relevés "
+                   f"({suivi.vehicule.plateforme_gps if suivi.vehicule else 'GPS'}) pour le camion {plaque_ceci}.")
+            if not _alerte_recente_ouverte(db, TypeAlerte.CONFLIT_AFFECTATION, suivi.vehicule_id, fenetre_s=3600):
+                creer_alerte(db, TypeAlerte.CONFLIT_AFFECTATION, GraviteAlerte.MOYENNE,
+                             msg, vehicule_id=suivi.vehicule_id, conducteur_id=fiche.id,
+                             lien_module=f"/suivi?date={suivi.date_jour.isoformat()}&vehicule={suivi.vehicule_id}")
+            _auditer(db, "suivi.conflit_affectation", suivi.id, {
+                "chauffeur": nom_ch, "conducteur_id": fiche.id,
+                "vehicule_manuel": plaque_autre, "vehicule_portail": plaque_ceci,
+                "regle": "Conflit d'affectation : priorité à la saisie manuelle, pas de doublon dans Suivi Journalier"
+            })
+            log.warning("Conflit d'affectation : chauffeur %s (manuel sur %s) détecté portail sur %s",
+                        nom_ch, plaque_autre, plaque_ceci)
+            return
+
+        # Si l'autre affectation n'était PAS manuelle (ex. ancien badge de la journée) :
+        # Pour éviter tout doublon dans le suivi journalier, détacher l'ancien véhicule
+        autre_suivi.conducteur_id = None
+        autre_suivi.conducteur_origine = None
+        log.info("Changement de camion pour %s : détaché de %s et réaffecté à %s",
+                 nom_ch, plaque_autre, plaque_ceci)
+
+    # 3. Auto-assignation du véhicule & propagation driverKeyCode
     if suivi.vehicule_id:
         vehicule = db.get(Vehicule, suivi.vehicule_id)
         if vehicule and vehicule.conducteur_actuel_id != fiche.id:
@@ -1673,10 +1743,9 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
             c_hom.code_badge_mzonex = fiche.code_badge_mzonex
             c_hom.matricule = str(fiche.code_badge_mzonex)
 
-    if getattr(suivi, "conducteur_origine", None) == "MANUEL":
-        return
     if suivi.conducteur_id == fiche.id and suivi.conducteur_origine == "BADGE":
         return
+
     avant = suivi.conducteur_id
     suivi.conducteur_id = fiche.id
     suivi.conducteur_origine = "BADGE"

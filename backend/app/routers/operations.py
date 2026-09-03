@@ -55,6 +55,7 @@ def liste_suivi(date: str | None = None, db: Session = Depends(get_db),
 
 
 class SuiviPatch(BaseModel):
+    conducteur_id: str | None = None
     situation: str | None = None
     statut_camion: str | None = None
     depot_recepteur: str | None = None

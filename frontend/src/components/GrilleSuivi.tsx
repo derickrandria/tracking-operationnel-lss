@@ -9,7 +9,7 @@
  *
  * `onEdit` absent / `lectureSeule` → cellules désactivées, structure inchangée.
  */
-import { Fragment, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import Icon from "./icons";
 import { Modal } from "./ui";
 import { Referentiels, SuiviLigne } from "../types";
@@ -133,6 +133,16 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
   const pauseMin = seuils?.DUREE_MIN_PAUSE_VALIDE || 900;
   const tccMax = seuils?.SEUIL_TCC_MAX ?? 16200;   // 4h30 (Addendum v1.9 §1.1)
 
+  const conducteursComptes = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const l of lignes) {
+      if (l.conducteur?.id) {
+        map.set(l.conducteur.id, (map.get(l.conducteur.id) || 0) + 1);
+      }
+    }
+    return map;
+  }, [lignes]);
+
   return (
     <>
       <table className="table-pro">
@@ -151,7 +161,7 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
           <tr>
             <TH classe="sticky left-0 z-20 min-w-[104px] bg-slate-200 dark:bg-nuit-800 text-slate-500">{modeDetail ? "Plaque" : "A · CC"}</TH>
             <TH classe={modeDetail ? "sticky left-[104px] z-20 min-w-[168px] bg-slate-200 dark:bg-nuit-800" : undefined}>Description</TH>
-            <TH classe={modeDetail ? "sticky left-[272px] z-20 min-w-[140px] bg-slate-200 dark:bg-nuit-800 shadow-[6px_0_10px_-6px_rgba(15,23,42,0.25)]" : undefined}>Chauffeur</TH>
+            <TH classe={modeDetail ? "sticky left-[272px] z-20 min-w-[170px] bg-slate-200 dark:bg-nuit-800 shadow-[6px_0_10px_-6px_rgba(15,23,42,0.25)]" : undefined}>Chauffeur</TH>
             <TH>Téléphone</TH>
             <TH classe="text-blue-500">B · Situation</TH><TH classe="text-blue-500">Statut</TH>
             <TH classe="text-blue-500">Dépôt</TH><TH classe="text-blue-500">Distrib.</TH>
@@ -178,7 +188,9 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
           </tr>
         </thead>
         <tbody>
-          {lignes.map((l) => (
+          {lignes.map((l) => {
+            const estDoublonChauffeur = l.conducteur?.id ? (conducteursComptes.get(l.conducteur.id) || 0) > 1 : false;
+            return (
             <tr key={l.id} className={cls(l.flag_tcc || l.flag_tcj || l.flag_ttj ? "bg-red-500/[0.04]" : "")}>
               <td className={cls("sticky left-0 z-10 font-bold whitespace-nowrap bg-white dark:bg-nuit-900")}>{l.plaque}</td>
               <td className={cls("whitespace-nowrap text-slate-400 text-[12px]",
@@ -196,7 +208,31 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
               <td className={cls("whitespace-nowrap",
                 modeDetail && "sticky left-[272px] z-10 bg-white dark:bg-nuit-900 shadow-[6px_0_10px_-6px_rgba(15,23,42,0.25)]")}>
                 {l.conducteur ? (
-                  <span title={l.conducteur.nom_prenom} className="font-medium">{l.conducteur.prenom_usuel}</span>
+                  <div className="flex flex-col py-0.5">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span title={l.conducteur.nom_prenom} className="font-semibold text-slate-800 dark:text-slate-100">
+                        {l.conducteur.prenom_usuel || l.conducteur.nom_prenom}
+                      </span>
+                      {l.conducteur.code_badge_mzonex ? (
+                        <span className="px-1 py-0.2 rounded text-[10px] font-mono font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20" title="driverKeyCode MZoneX">
+                          {l.conducteur.code_badge_mzonex}
+                        </span>
+                      ) : null}
+                      {l.conducteur_origine === "MANUEL" && (
+                        <span className="px-1 py-0.2 rounded text-[9.5px] font-medium bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20" title="Attribution manuelle (prioritaire)">
+                          Manuel
+                        </span>
+                      )}
+                      {estDoublonChauffeur && (
+                        <span className="px-1 py-0.2 rounded text-[9.5px] font-bold bg-red-500/15 text-red-600 border border-red-500/30 animate-pulse" title="Doublon : ce chauffeur est affecté à plus d'un camion sur cette journée !">
+                          ⚠️ Doublon
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10.5px] text-slate-400 truncate max-w-[170px]" title={l.conducteur.nom_prenom}>
+                      {l.conducteur.nom_prenom}
+                    </span>
+                  </div>
                 ) : <span className="text-slate-400">—</span>}
               </td>
               <td className="whitespace-nowrap text-slate-400 text-[12px]">{l.conducteur?.telephone || "—"}</td>
@@ -299,7 +335,8 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                 {pendingUI?.[l.id] && <span title="Modification en attente d'enregistrement" className="inline-block h-2 w-2 rounded-full bg-amber-500" />}
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
 

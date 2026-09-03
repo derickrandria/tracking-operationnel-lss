@@ -42,6 +42,8 @@ TYPES_ALERTE = {
     "COLLECTE_YMANE": "Collecte Ym@ne en échec (§0septies decies K1)",
     "TCH_PROCHE_LIMITE": "TCH proche de la limite (≥ 46h)",
     "TCH_LIMITE_ATTEINTE": "TCH limite atteinte (≥ 56h)",
+    "CONFLIT_AFFECTATION": "Conflit d'affectation chauffeur (manuel vs portail)",
+    "DOUBLON_CONDUCTEUR": "Doublon chauffeur sur la journée",
 }
 
 

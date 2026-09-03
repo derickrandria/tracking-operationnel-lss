@@ -103,6 +103,9 @@ class TypeAlerte(str, enum.Enum):
     # Module Temps de conduite (TCH) — seuil 46h (avertissement) et 56h (limite)
     TCH_PROCHE_LIMITE = "TCH_PROCHE_LIMITE"      # TCH cumulé ≥ 46h00 (avertissement)
     TCH_LIMITE_ATTEINTE = "TCH_LIMITE_ATTEINTE"  # TCH cumulé ≥ 56h00 (limite réglementaire)
+    # Détection de conflits et doublons d'affectation chauffeur
+    CONFLIT_AFFECTATION = "CONFLIT_AFFECTATION"  # Chauffeur attribué manuellement vs détecté sur un autre camion
+    DOUBLON_CONDUCTEUR = "DOUBLON_CONDUCTEUR"    # Doublon chauffeur sur la même journée
 
 
 class TypeEvenement(str, enum.Enum):

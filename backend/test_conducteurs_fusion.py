@@ -193,6 +193,82 @@ check("Chauffeur supprimé en base", db.get(Conducteur, c_del_id) is None)
 check("Véhicule détaché proprement (conducteur_actuel_id = None)", v_del.conducteur_actuel_id is None)
 check("Alias associé supprimé", db.scalar(select(ConducteurAlias).where(ConducteurAlias.conducteur_id == c_del_id)) is None)
 
+print("\n[T7] Test clés de service et garage (Garage LSS, Nouveau conducteur)")
+from app.engine import resoudre_badge, attribuer_badge_au_jour, TypeAlerte
+fiche_gar, ecarte_gar = resoudre_badge(db, "Garage LSS 2")
+check("Libellé 'Garage LSS 2' écarté (fiche=None, ecarte='Garage LSS 2')",
+      fiche_gar is None and ecarte_gar == "Garage LSS 2")
+
+fiche_nouv, ecarte_nouv = resoudre_badge(db, "Nouveau conducteur")
+check("Libellé 'Nouveau conducteur' écarté",
+      fiche_nouv is None and ecarte_nouv == "Nouveau conducteur")
+
+print("\n[T8] Test Détection de Conflit d'affectation (Chauffeur manuel vs détection portail)")
+# Créer 2 véhicules et un chauffeur
+v_conf_1 = Vehicule(plaque="TEST-CF1", statut="ACTIF")
+v_conf_2 = Vehicule(plaque="TEST-CF2", statut="ACTIF")
+c_manuel = Conducteur(nom_prenom="RABETAFIKA Michel", prenom_usuel="Michel",
+                      matricule=None, nom_normalise=normaliser_libelle("RABETAFIKA Michel"),
+                      tokens_set=calculer_tokens_set("RABETAFIKA Michel"), statut=StatutConducteur.ACTIF)
+db.add_all([v_conf_1, v_conf_2, c_manuel])
+db.commit()
+
+# Affecter manuellement c_manuel au véhicule 1 pour aujourd'hui
+suivi_cf1 = SuiviJournalier(date_jour=date.today(), vehicule_id=v_conf_1.id,
+                            conducteur_id=c_manuel.id, conducteur_origine="MANUEL")
+suivi_cf2 = SuiviJournalier(date_jour=date.today(), vehicule_id=v_conf_2.id,
+                            conducteur_id=None, conducteur_origine=None)
+db.add_all([suivi_cf1, suivi_cf2])
+db.commit()
+
+# Simuler une détection portail du même chauffeur c_manuel sur le véhicule 2
+attribuer_badge_au_jour(db, suivi_cf2, c_manuel)
+db.commit()
+
+# Vérifier que le suivi_cf1 a conservé son chauffeur manuel
+db.refresh(suivi_cf1)
+db.refresh(suivi_cf2)
+check("Suivi 1 conserve son chauffeur MANUEL (priorité absolue)",
+      suivi_cf1.conducteur_id == c_manuel.id and suivi_cf1.conducteur_origine == "MANUEL")
+check("Suivi 2 n'a pas dupliqué le chauffeur manuel",
+      suivi_cf2.conducteur_id != c_manuel.id)
+
+# Vérifier qu'une alerte CONFLIT_AFFECTATION a été créée
+alerte_conflit = db.scalar(select(Alerte).where(
+    Alerte.type == TypeAlerte.CONFLIT_AFFECTATION,
+    Alerte.vehicule_id == v_conf_2.id,
+    Alerte.conducteur_id == c_manuel.id))
+check("Alerte CONFLIT_AFFECTATION créée pour le véhicule 2", alerte_conflit is not None)
+
+print("\n[T9] Test Anti-doublon pour chauffeur BADGE mobile")
+# Créer 2 nouveaux véhicules et un chauffeur BADGE
+v_b1 = Vehicule(plaque="TEST-B1", statut="ACTIF")
+v_b2 = Vehicule(plaque="TEST-B2", statut="ACTIF")
+c_badge = Conducteur(nom_prenom="RAZAFY Hery", prenom_usuel="Hery",
+                     matricule="77889", code_badge_mzonex=77889,
+                     nom_normalise=normaliser_libelle("RAZAFY Hery"),
+                     tokens_set=calculer_tokens_set("RAZAFY Hery"), statut=StatutConducteur.ACTIF)
+db.add_all([v_b1, v_b2, c_badge])
+db.commit()
+
+suivi_b1 = SuiviJournalier(date_jour=date.today(), vehicule_id=v_b1.id,
+                           conducteur_id=c_badge.id, conducteur_origine="BADGE")
+suivi_b2 = SuiviJournalier(date_jour=date.today(), vehicule_id=v_b2.id,
+                           conducteur_id=None, conducteur_origine=None)
+db.add_all([suivi_b1, suivi_b2])
+db.commit()
+
+# Détection du chauffeur c_badge sur le véhicule 2
+attribuer_badge_au_jour(db, suivi_b2, c_badge)
+db.commit()
+
+db.refresh(suivi_b1)
+db.refresh(suivi_b2)
+check("Chauffeur BADGE réaffecté au véhicule 2",
+      suivi_b2.conducteur_id == c_badge.id and suivi_b2.conducteur_origine == "BADGE")
+check("Chauffeur BADGE détaché du véhicule 1 pour éviter tout doublon",
+      suivi_b1.conducteur_id is None)
+
 print(f"\n{'=' * 60}\nRESULTAT : {R['ok']} OK / {R['ko']} KO\n{'=' * 60}")
 db.close()
 sys.exit(1 if R["ko"] else 0)

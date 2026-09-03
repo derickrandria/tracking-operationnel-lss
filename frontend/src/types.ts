@@ -65,6 +65,7 @@ export interface SuiviLigne {
   description: string | null;
   conducteur_id: string | null;
   conducteur: Conducteur | null;
+  conducteur_origine?: "MANUEL" | "BADGE" | null;
   situation: string | null;
   statut_camion: "LIBRE" | "VIDE" | "CHARGÉ" | null;
   depot_recepteur: string | null;

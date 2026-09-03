@@ -120,7 +120,7 @@ def mots_ignores_conducteur() -> frozenset:
     mots ne créent JAMAIS de fiche chauffeur. Surcharge possible :
     CONDUCTEUR_MOTS_IGNORES="mot1,mot2" (dans backend/.env)."""
     brut = os.getenv("CONDUCTEUR_MOTS_IGNORES",
-                     "garage,dépôt,depot,station,parking,atelier")
+                     "garage,dépôt,depot,station,parking,atelier,service,maintenance,inconnu,aucun")
     return frozenset(m.strip().lower() for m in brut.split(",") if m.strip())
 
 
@@ -162,8 +162,27 @@ def mots_ignores_badge() -> frozenset:
     travail. Comparaison sur le libellé normalisé (casse/accents ignorés).
     Surcharge : CONDUCTEUR_BADGE_IGNORES="a,b" (dans backend/.env)."""
     brut = os.getenv("CONDUCTEUR_BADGE_IGNORES",
-                     "nouveau conducteur,garage lss")
+                     "nouveau conducteur,nouveau chauffeur,nouveau conducteurs,garage lss,garage,depot,dépôt,atelier,service,maintenance,sans chauffeur,sans badge,non assigne,non assigné,non affecte,non affecté,cle de service,clé de service,inconnu,aucun,aucun chauffeur,aucun conducteur")
     return frozenset(normaliser_libelle(m) for m in brut.split(",") if m.strip())
+
+
+def est_libelle_service_ou_garage(nom: str | None) -> bool:
+    """Vérifie si un libellé désigne une clé de service, un garage ou un état non-chauffeur."""
+    if not nom:
+        return False
+    norm = normaliser_libelle(nom)
+    if not norm:
+        return False
+    mots = set(norm.split())
+    if mots & mots_ignores_conducteur():
+        return True
+    ignores = mots_ignores_badge()
+    if norm in ignores:
+        return True
+    for ign in ignores:
+        if ign in norm or norm.startswith(ign):
+            return True
+    return False
 
 
 # §0quinquies (14/08/2026) — un « Début du trajet » connu mais resté sans
