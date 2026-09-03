@@ -29,7 +29,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import func, select
 
-from .config import bascule_du, jour_attribution, now_local
+from .config import SIM_ENABLE, bascule_du, jour_attribution, now_local
 from .database import SessionLocal
 from .engine import ensure_suivi, ensure_suivis_du_jour
 from .event_bus import publish
@@ -345,7 +345,20 @@ def rattraper_consolidation(cible_hier: date | None = None) -> dict:
                 SuiviJournalier.date_jour == jour)) or 0
             items, echecs = _trajets_reels_du_jour(jour)
             if echecs:
-                # garde-fou R5 : un portail au moins n'a PAS répondu → le jour
+                if SIM_ENABLE and nb_suivis > 0:
+                    # En mode démonstration / simulateur (ou avec suivis locaux présents) :
+                    # consolidation 23:59:59 et archivage des données locales existantes (minuit n'attend pas)
+                    n_pre = consolider_jour(db, jour)
+                    nb_arch = archiver_jour(db, jour)
+                    rapport["jours_traités"] += 1
+                    rapport["jours_archivés"] += nb_arch
+                    rapport["détails"][jour.isoformat()] = {"consolides": n_pre, "archives": nb_arch}
+                    log.info("AM-4 (Mode Démo) : journée du %s consolidée (%d) et archivée (%d)",
+                             jour, n_pre, nb_arch)
+                    jour += timedelta(days=1)
+                    continue
+
+                # garde-fou R5 (production réelle) : un portail au moins n'a PAS répondu → le jour
                 # resterait PARTIEL → on n'écrit rien, on journalise et on
                 # signale ; nouvelle tentative au prochain démarrage
                 deja = db.scalar(select(func.count(AuditLog.id)).where(
