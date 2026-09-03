@@ -152,8 +152,13 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 return nom_norm_vers_gardien[cle]
         return None
 
-    # A. Intégration des HistoriqueJournalier (jours archivés passés)
+    # A. Intégration EXCLUSIVE de HistoriqueJournalier pour tous les jours passés archivés (j < jour_courant)
+    jours_archives_vus = set()
     for h in historiques:
+        j = h.date_jour
+        if j >= jour_courant:
+            continue  # Les jours courants ou futurs sont traités exclusivement via SuiviJournalier
+
         c_id = h.conducteur_id
         d = h.donnees or {}
         gardien = resoudre_gardien(c_id, d.get("chauffeur") or (h.vehicule.plaque if h.vehicule else None))
@@ -163,7 +168,7 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         if conducteur_id_filtre and gid != conducteur_id_filtre:
             continue
 
-        j = h.date_jour
+        jours_archives_vus.add((gid, j))
         tcj = int(d.get("tcj_s") or 0)
         ttj = int(d.get("ttj_s") or 0)
         plaque = (h.vehicule.plaque if h.vehicule else None) or d.get("plaque")
@@ -181,7 +186,7 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
             if plaque:
                 c_data["jours"][j]["vehicules"].add(plaque)
 
-        # Extraction des intervalles de conduite pour le reset 24h
+        # Extraction des intervalles de conduite valides (≥ 0,3 km) pour le reset 24h
         trajets_snap = d.get("trajets") or []
         spans_trouves = False
         for t in trajets_snap:
@@ -208,7 +213,9 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 fin_def = deb_def + timedelta(seconds=max(1800, ttj or tcj))
                 c_data["spans"].append((deb_def, fin_def, plaque))
 
-    # B. Intégration des SuiviJournalier (prioritaire pour aujourd'hui et jours actifs)
+    # B. Intégration de SuiviJournalier :
+    #    - EXCLUSIF pour aujourd'hui (j == jour_courant)
+    #    - Repli pour jours passés non encore archivés dans HistoriqueJournalier
     for s in suivis:
         j = s.date_jour
         is_today = (j == jour_courant)
@@ -224,6 +231,11 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
             if conducteur_id_filtre and gid != conducteur_id_filtre:
                 continue
 
+            # Si le jour est déjà archivé dans HistoriqueJournalier, les trajets d'archive priment
+            if not is_today and (gid, j) in jours_archives_vus:
+                continue
+
+            # Règle absolue §2 : manœuvres rejetées < 0,3 km exclues
             if t.statut_validation == StatutValidationTrajet.REJETE:
                 continue
             if t.distance_km is not None and t.distance_km < 0.3:
@@ -246,26 +258,27 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         if gardien:
             gid = gardien.id
             if not conducteur_id_filtre or gid == conducteur_id_filtre:
+                # Si le jour est déjà archivé dans HistoriqueJournalier, l'archive scellée prime
+                if not is_today and (gid, j) in jours_archives_vus:
+                    continue
+
                 c_data = data_chauffeurs.setdefault(gid, {"gardien": gardien, "jours": {}, "spans": []})
                 tcj = int(s.tcj_s or 0)
                 ttj = int(s.ttj_s or 0)
 
-                if is_today or j not in c_data["jours"]:
-                    if j in c_data["jours"] and is_today:
-                        c_data["jours"][j]["tcj_s"] += tcj
-                        c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj)
-                        if plaque:
-                            c_data["jours"][j]["vehicules"].add(plaque)
-                        c_data["jours"][j]["en_cours"] = True
-                    else:
-                        c_data["jours"][j] = {
-                            "tcj_s": tcj, "ttj_s": ttj,
-                            "vehicules": {plaque} if plaque else set(),
-                            "en_cours": is_today
-                        }
+                if j not in c_data["jours"]:
+                    c_data["jours"][j] = {
+                        "tcj_s": tcj, "ttj_s": ttj,
+                        "vehicules": {plaque} if plaque else set(),
+                        "en_cours": is_today
+                    }
                 else:
+                    c_data["jours"][j]["tcj_s"] += tcj
+                    c_data["jours"][j]["ttj_s"] = max(c_data["jours"][j]["ttj_s"], ttj)
                     if plaque:
                         c_data["jours"][j]["vehicules"].add(plaque)
+                    if is_today:
+                        c_data["jours"][j]["en_cours"] = True
 
     # 4. Calcul de l'algorithme TCH (détection du reset 24h et cumul hebdomadaire)
     resultats_lignes = []

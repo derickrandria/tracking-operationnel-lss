@@ -420,9 +420,18 @@ export default function TempsConduite() {
                             ? "bg-blue-600/15 text-blue-600 dark:text-blue-400 font-extrabold"
                             : "bg-slate-100 dark:bg-nuit-800 font-bold text-slate-700 dark:text-slate-200"
                         )}
+                        title={isToday ? "Données issues du Suivi Journalier en temps réel" : "Données consolidées issues de l'Historique scellé"}
                       >
                         {d_str.split("-").reverse().slice(0, 2).join("/")}
-                        {isToday && <span className="ml-1 text-[10px] uppercase font-normal">(Aujourd'hui)</span>}
+                        {isToday ? (
+                          <span className="ml-1 text-[9.5px] uppercase font-semibold text-blue-600 dark:text-blue-400">
+                            (Aujourd'hui · En direct)
+                          </span>
+                        ) : (
+                          <span className="ml-1 text-[9.5px] uppercase font-normal text-slate-400 dark:text-slate-500">
+                            (Archivé)
+                          </span>
+                        )}
                       </th>
                     );
                   })}
