@@ -4,7 +4,7 @@ import os
 os.environ.setdefault("SIM_ENABLE", "0")
 os.environ["YMANE_ACTIVE"] = "0"
 import sys
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import delete, func, select
 from fastapi.testclient import TestClient
@@ -268,6 +268,74 @@ check("Chauffeur BADGE réaffecté au véhicule 2",
       suivi_b2.conducteur_id == c_badge.id and suivi_b2.conducteur_origine == "BADGE")
 check("Chauffeur BADGE détaché du véhicule 1 pour éviter tout doublon",
       suivi_b1.conducteur_id is None)
+
+print("\n[T10] Test Distinction des temps de conduite pour multi-chauffeurs sur un même camion")
+from app.routers.temps_conduite import extraire_donnees_chauffeurs
+
+v_partage = Vehicule(plaque="TEST-4926TBU", statut="ACTIF")
+c_dom = Conducteur(nom_prenom="RAKOTONINDRINA Solofohery Alain", prenom_usuel="DOMINIQUE",
+                   matricule="3968", code_badge_mzonex=3968,
+                   nom_normalise=normaliser_libelle("RAKOTONINDRINA Solofohery Alain"),
+                   tokens_set=calculer_tokens_set("RAKOTONINDRINA Solofohery Alain"), statut=StatutConducteur.ACTIF)
+c_ando = Conducteur(nom_prenom="ANDRIAMAMONJY Ando Lovasoa", prenom_usuel="Ando",
+                    matricule="39002", code_badge_mzonex=39002,
+                    nom_normalise=normaliser_libelle("ANDRIAMAMONJY Ando Lovasoa"),
+                    tokens_set=calculer_tokens_set("ANDRIAMAMONJY Ando Lovasoa"), statut=StatutConducteur.ACTIF)
+db.add_all([v_partage, c_dom, c_ando])
+db.commit()
+
+jour_hier = date.today() - timedelta(days=1)
+suivi_partage = SuiviJournalier(date_jour=jour_hier, vehicule_id=v_partage.id,
+                                conducteur_id=c_ando.id, conducteur_origine="BADGE")
+db.add(suivi_partage)
+db.flush()
+
+# Trajets de Dominique (de 05:00 à 15:00 = 10h)
+t1 = Trajet(suivi_id=suivi_partage.id, numero=1,
+            heure_debut=datetime.combine(jour_hier, datetime.min.time()).replace(hour=5),
+            heure_fin=datetime.combine(jour_hier, datetime.min.time()).replace(hour=15),
+            distance_km=250.0, statut_validation=StatutValidationTrajet.VALIDE,
+            conducteur_badge="RAKOTONINDRINA Solofohery Alain", conducteur_badge_id=c_dom.id)
+
+# Trajet de Ando (de 16:00 à 18:00 = 2h)
+t2 = Trajet(suivi_id=suivi_partage.id, numero=2,
+            heure_debut=datetime.combine(jour_hier, datetime.min.time()).replace(hour=16),
+            heure_fin=datetime.combine(jour_hier, datetime.min.time()).replace(hour=18),
+            distance_km=80.0, statut_validation=StatutValidationTrajet.VALIDE,
+            conducteur_badge="ANDRIAMAMONJY Ando Lovasoa", conducteur_badge_id=c_ando.id)
+
+db.add_all([t1, t2])
+db.commit()
+
+# Archiver ce jour dans HistoriqueJournalier
+from app.serializers import s_suivi
+from app.models import HistoriqueJournalier
+db.expire(suivi_partage, ["trajets"])
+db.add(HistoriqueJournalier(
+    date_jour=jour_hier, annee=jour_hier.year, mois=jour_hier.month,
+    vehicule_id=v_partage.id, conducteur_id=c_ando.id,
+    donnees=s_suivi(suivi_partage), nb_infractions=0, nb_alertes=0))
+db.commit()
+
+# Extraction des données TCH
+res_tch = extraire_donnees_chauffeurs(db, debut_fenetre=jour_hier, fin_fenetre=date.today())
+lignes_tch = {l["conducteur_id"]: l for l in res_tch["lignes"]}
+
+dom_tch = lignes_tch.get(c_dom.id)
+ando_tch = lignes_tch.get(c_ando.id)
+
+check("Dominique présent dans le calcul TCH", dom_tch is not None)
+check("Ando présent dans le calcul TCH", ando_tch is not None)
+
+# Dominique doit avoir ~10h (36000s) et non 0s
+dom_tcj_hier = dom_tch["historique"].get(jour_hier.isoformat(), {}).get("tcj_s", 0) if dom_tch else 0
+# Ando doit avoir ~2h (7200s) et non 12h
+ando_tcj_hier = ando_tch["historique"].get(jour_hier.isoformat(), {}).get("tcj_s", 0) if ando_tch else 0
+
+check(f"Dominique crédité de ses trajets (10h00 = 36000s, obtenu: {dom_tcj_hier}s)",
+      dom_tcj_hier == 36000)
+check(f"Ando crédité uniquement de ses trajets (2h00 = 7200s, obtenu: {ando_tcj_hier}s)",
+      ando_tcj_hier == 7200)
 
 print(f"\n{'=' * 60}\nRESULTAT : {R['ok']} OK / {R['ko']} KO\n{'=' * 60}")
 db.close()

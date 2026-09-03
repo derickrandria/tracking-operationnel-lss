@@ -81,6 +81,8 @@ def s_trajet(t: Trajet):
         # Addendum v1.5 §7.1 — validité métier (REJETE = jamais dans TCC/TCJ/TTJ)
         "statut_validation": (t.statut_validation.value
                               if t.statut_validation else "EN_ATTENTE"),
+        "conducteur_badge": t.conducteur_badge,
+        "conducteur_badge_id": t.conducteur_badge_id,
     }
 
 
@@ -166,6 +168,8 @@ def s_ligne(lg: LigneJournee, numero: int):
         "source_plateforme": getattr(ref, "source_plateforme", None),
         "distance_km": lg.distance_km,
         "statut_validation": "VALIDE" if officielle else "EN_ATTENTE",
+        "conducteur_badge": getattr(ref, "conducteur_badge", None),
+        "conducteur_badge_id": getattr(ref, "conducteur_badge_id", None),
         # information de transparence (modale « tous les trajets »)
         "segments": lg.nb_segments,
     }
@@ -200,7 +204,7 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     """§0undecies E1, amendée §0tricies decies G1/G2 (E3 abrogée le 25/08/2026)
     — deux lignes séparées par un arrêt STRICTEMENT < `seuil_fusion_s`
     (désormais 30 min) sont affichées comme UNE seule ligne (« sans bonder
-    les colonnes ») :
+    les colonnes ») pour un MÊME chauffeur :
 
     début = début de la 1re composante ; fin = fin de la dernière (vide si
     en cours) ; statut/couleur = ceux de la dernière composante ; distance =
@@ -217,9 +221,15 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     for t in (trajets or []):
         nt = dict(t)
         deb, fin = _dt_iso(nt.get("heure_debut")), _dt_iso(nt.get("heure_fin"))
+        meme_chauffeur = bool(
+            res and
+            res[-1].get("conducteur_badge_id") == nt.get("conducteur_badge_id") and
+            res[-1].get("conducteur_badge") == nt.get("conducteur_badge")
+        )
         if (res and deb is not None and res[-1]["_fin_dt"] is not None
+                and meme_chauffeur
                 and (deb - res[-1]["_fin_dt"]).total_seconds() < seuil_fusion_s):
-            # rupture courte → absorbée dans la ligne précédente
+            # rupture courte du même chauffeur → absorbée dans la ligne précédente
             m = res[-1]
             m["heure_fin"] = nt.get("heure_fin")
             m["_fin_dt"] = fin
