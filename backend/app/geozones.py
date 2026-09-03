@@ -266,3 +266,158 @@ def libelle_position(lat: float, lng: float) -> str | None:
     if proche_g is not None:
         return f"proche {proche_g[1]}"
     return None
+
+
+# =============================================================================
+# RECONNAISSANCE DES GEOFENCES LOGISTIQUES (SPÉCIFICATION MISSIONS)
+# =============================================================================
+DEPOTS_SUD_CODES = {"DABE", "DFIA", "DMDV", "DMKR"}
+
+ZONES_CANONIQUES = {
+    "BASETNR": {
+        "type": "BASETNR",
+        "code": "BASETNR",
+        "nom": "Base Tana (BASETNR)",
+        "mots_cles": ["jovenna by pass", "by pass", "alamabrah", "alasora",
+                      "ambohimangakely-iavoloha-cc", "iavoloha", "ambohimangakely",
+                      "base lss", "base tana", "base antananarivo"],
+        "coords": [(-18.8792, 47.5079, 4500), (-18.9600, 47.5800, 3500)],
+        "est_depot_sud": False,
+    },
+    "GRT": {
+        "type": "GRT",
+        "code": "GRT",
+        "nom": "Galana Rafinérie Terminale (GRT)",
+        "mots_cles": ["galana rafinérie terminale", "galana rafinerie", "galana terminal",
+                      "raffinerie tmt", "grt", "toamasina terminal", "terminal toamasina",
+                      "port toamasina", "dépôt toamasina", "galana"],
+        "coords": [(-18.1492, 49.4023, 3500)],
+        "est_depot_sud": False,
+    },
+    "BASETAM": {
+        "type": "BASETAM",
+        "code": "BASETAM",
+        "nom": "Base Tamatave (BASETAM)",
+        "mots_cles": ["base tamatave", "base tmt", "tamatave base"],
+        "coords": [(-18.1600, 49.3800, 3000)],
+        "est_depot_sud": False,
+    },
+    "DMMG": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DMMG",
+        "nom": "Moramanga (DMMG)",
+        "mots_cles": ["moramanga", "dmmg", "dépôt moramanga"],
+        "coords": [(-18.9489, 48.2257, 3500)],
+        "est_depot_sud": False,
+    },
+    "DABI": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DABI",
+        "nom": "Alarobia / Ambohibao (DABI)",
+        "mots_cles": ["alarobia", "dabi", "ambohibao", "dépôt alarobia"],
+        "coords": [(-18.8100, 47.4450, 3000)],
+        "est_depot_sud": False,
+    },
+    "DSNR": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DSNR",
+        "nom": "Soanierana (DSNR)",
+        "mots_cles": ["soanierana", "dsnr", "dépôt soanierana"],
+        "coords": [(-18.9300, 47.5200, 3000)],
+        "est_depot_sud": False,
+    },
+    "DABE": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DABE",
+        "nom": "Antsirabe (DABE)",
+        "mots_cles": ["antsirabe", "dabe", "dépôt antsirabe"],
+        "coords": [(-19.8659, 47.0333, 4000)],
+        "est_depot_sud": True,
+    },
+    "DFIA": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DFIA",
+        "nom": "Fianarantsoa (DFIA)",
+        "mots_cles": ["fianarantsoa", "dfia", "dépôt fianarantsoa"],
+        "coords": [(-21.4536, 47.0857, 4000)],
+        "est_depot_sud": True,
+    },
+    "DMDV": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DMDV",
+        "nom": "Morondava (DMDV)",
+        "mots_cles": ["morondava", "dmdv", "dépôt morondava"],
+        "coords": [(-15.7167, 46.3167, 5000), (-20.2800, 44.2800, 5000)],
+        "est_depot_sud": True,
+    },
+    "DMKR": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DMKR",
+        "nom": "Manakara (DMKR)",
+        "mots_cles": ["manakara", "dmkr", "dépôt manakara"],
+        "coords": [(-22.1486, 48.0106, 4000)],
+        "est_depot_sud": True,
+    },
+}
+
+
+def normaliser_code_depot(texte: str | None) -> str | None:
+    """Normalise un nom de dépôt (ou code) vers son code canonique (DMMG, DABI, DABE, etc.)."""
+    if not texte:
+        return None
+    t = texte.strip().lower()
+    if "moramanga" in t or "dmmg" in t:
+        return "DMMG"
+    if "alarobia" in t or "dabi" in t or "ambohibao" in t:
+        return "DABI"
+    if "soanierana" in t or "dsnr" in t:
+        return "DSNR"
+    if "antsirabe" in t or "dabe" in t:
+        return "DABE"
+    if "fianarantsoa" in t or "dfia" in t:
+        return "DFIA"
+    if "manakara" in t or "dmkr" in t:
+        return "DMKR"
+    if "morondava" in t or "dmdv" in t:
+        return "DMDV"
+    if "galana" in t or "grt" in t or "tamatave" in t or "toamasina" in t or "tmt" in t:
+        return "GRT"
+    return texte.strip().upper()
+
+
+def detecter_zone_logistique(lat: float | None, lng: float | None, adresse: str | None = None) -> dict:
+    """Classifie le lieu courant selon les zones logistiques clés (§1)."""
+    adr_l = (adresse or "").lower()
+    
+    # 1. Vérification par mots-clés dans le libellé d'adresse / géozone portail
+    if adr_l:
+        for code, z in ZONES_CANONIQUES.items():
+            for mot in z["mots_cles"]:
+                if mot in adr_l:
+                    return {
+                        "type": z["type"],
+                        "code": z["code"],
+                        "nom": z["nom"],
+                        "est_depot_sud": z["est_depot_sud"],
+                    }
+    
+    # 2. Vérification par coordonnées GPS (haversine)
+    if lat is not None and lng is not None:
+        for code, z in ZONES_CANONIQUES.items():
+            for (clat, clng, rayon_m) in z["coords"]:
+                if _haversine_m(lat, lng, clat, clng) <= rayon_m:
+                    return {
+                        "type": z["type"],
+                        "code": z["code"],
+                        "nom": z["nom"],
+                        "est_depot_sud": z["est_depot_sud"],
+                    }
+    
+    # 3. Vérification axe routier
+    if "rn2" in adr_l:
+        return {"type": "AXE_ROUTIER", "code": "RN2", "nom": "Axe RN2 (Est)", "est_depot_sud": False}
+    if "rn7" in adr_l:
+        return {"type": "AXE_ROUTIER", "code": "RN7", "nom": "Axe RN7 (Sud)", "est_depot_sud": True}
+    
+    return {"type": "AUTRE", "code": "AUTRE", "nom": adresse or "Hors zone", "est_depot_sud": False}
+

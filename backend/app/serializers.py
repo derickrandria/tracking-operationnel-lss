@@ -346,26 +346,71 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
     }
 
 
-def s_mission(m: Mission):
+def s_mission(m: Mission, nb_infractions: int | None = None):
+    code = getattr(m, "code_mission", None)
+    if not code:
+        if m.numero_ot and m.numero_ot.strip():
+            ot = m.numero_ot.strip()
+            if ot.upper().startswith("OT-") or ot.upper().startswith("OT_"):
+                code = f"MIS-{ot.upper()}"
+            elif ot.upper().startswith("MIS-"):
+                code = ot.upper()
+            else:
+                code = f"MIS-OT-{ot}"
+        else:
+            d_str = m.date_jour.strftime("%Y%m%d") if m.date_jour else "20260903"
+            code = f"MIS-{d_str}-{m.numero_mission_du_jour:02d}"
+
+    km_v = getattr(m, "km_vide", 0.0) or 0.0
+    km_c = getattr(m, "km_charge", 0.0) or 0.0
+    km_tot = getattr(m, "kilometrage_total", 0.0) or (m.kilometrage or 0.0) or (km_v + km_c)
+    if km_tot > 0 and km_v == 0.0 and km_c == 0.0:
+        if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE":
+            km_c = km_tot
+        else:
+            km_v = km_tot
+
+    if nb_infractions is None:
+        if hasattr(m, "infractions") and m.infractions:
+            nb_infractions = len([i for i in m.infractions if getattr(i, "validation", "") != "INVALIDE"])
+        else:
+            nb_infractions = 0
+
+    depot_prev = getattr(m, "depot_prevu", None) or m.depot
+    depot_eff = getattr(m, "depot_effectif", None) or depot_prev
+
     return {
         "id": m.id,
-        "date_jour": m.date_jour.isoformat(),
+        "code_mission": code,
+        "date_jour": m.date_jour.isoformat() if m.date_jour else None,
         "conducteur_id": m.conducteur_id,
-        "conducteur": s_conducteur(m.conducteur, court=True),
+        "conducteur": s_conducteur(m.conducteur, court=True) if m.conducteur else None,
         "vehicule_id": m.vehicule_id,
         "plaque": m.vehicule.plaque if m.vehicule else None,
         "numero_mission_du_jour": m.numero_mission_du_jour,
-        "statut": m.statut.value if m.statut else None,
+        "statut": m.statut.value if hasattr(m.statut, "value") else str(m.statut),
+        "statut_camion_actuel": getattr(m, "statut_camion_actuel", "VIDE") or "VIDE",
         "heure_debut": iso(m.heure_debut),
+        "heure_chargement": iso(getattr(m, "heure_chargement", None)),
         "heure_fin": iso(m.heure_fin),
-        "duree_s": m.duree_s,
+        "duree_s": m.duree_s or 0,
         "numero_ot": m.numero_ot,
         "produit": m.produit,
-        "depot": m.depot,
+        "depot": depot_prev,
+        "depot_prevu": depot_prev,
+        "depot_effectif": depot_eff,
+        "est_deviee": bool(getattr(m, "est_deviee", False)),
+        "motif_deviation": getattr(m, "motif_deviation", None),
         "distributeur": m.distributeur,
-        "kilometrage": round(m.kilometrage or 0, 1),
+        "km_vide": round(km_v, 1),
+        "km_charge": round(km_c, 1),
+        "kilometrage": round(km_tot, 1),
+        "kilometrage_total": round(km_tot, 1),
+        "nb_infractions": nb_infractions,
         "origine": m.origine,
         "etapes": m.etapes or [],
+        "created_at": iso(m.created_at),
+        "updated_at": iso(m.updated_at),
     }
 
 

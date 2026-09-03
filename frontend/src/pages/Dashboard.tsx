@@ -138,13 +138,13 @@ export default function Dashboard() {
         <Kpi label="Libres / Vides / Chargés" valeur={`${k.libres} · ${k.vides} · ${k.charges}`} sous={`${k.non_renseignes} non renseignés`} />
         <Kpi label="Missions du jour"
           valeur={<span>{k.missions_en_cours}<span className="text-[13px] font-semibold text-slate-400"> / {k.missions_terminees}</span></span>}
-          sous={`en cours / terminées${k.missions_retardees ? ` · ${k.missions_retardees} retardées` : ""}`} />
+          sous={`en cours / terminées${k.missions_deviees ? ` · ${k.missions_deviees} déviée${k.missions_deviees > 1 ? "s" : ""}` : ""}${k.missions_retardees ? ` · ${k.missions_retardees} retardée${k.missions_retardees > 1 ? "s" : ""}` : ""}`} />
         <Kpi label="Infractions" valeur={k.infractions_jour} sous={`${k.infractions_mois} ce mois`}
           accent={k.infractions_jour > 0 ? "border-red-500/50" : undefined} />
         <Kpi label="Alertes non vues" valeur={k.alertes_non_vues}
           accent={k.alertes_non_vues > 0 ? "border-amber-500/50" : undefined} />
         <Kpi label="Kilométrage du jour" valeur={`${Math.round(k.km_total_jour)} km`}
-          sous={`TCJ moy. ${fmtDuree(k.tcj_moyen_s)} · pauses ${fmtDuree(k.pause_moyenne_s)}`} />
+          sous={`${Math.round(k.km_vide_jour || 0)} km vide · ${Math.round(k.km_charge_jour || 0)} km chargé`} />
       </div>
 
       {/* Carte + colonnes */}

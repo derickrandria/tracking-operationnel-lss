@@ -16,7 +16,7 @@ from ..database import get_db
 from ..engine import ensure_suivi, get_seuils
 from ..event_bus import publish
 from ..models import (Alerte, Conducteur, ConducteurAlias, Infraction, Mission,
-                      SituationCamion, StatutCamion, StatutConducteur,
+                      SituationCamion, StatutCamion, StatutConducteur, StatutMission,
                       StatutVehicule, SuiviJournalier, Trajet, Vehicule)
 from ..security import ADMIN, ECRITURE, TOUS, audit, require_roles
 from ..serializers import s_conducteur, s_suivi, s_vehicule
@@ -78,6 +78,7 @@ def _vehicule_assigne(db: Session) -> dict:
 @router.get("/conducteurs")
 def liste_conducteurs(q: str | None = None, statut: str | None = None,
                       db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    aujourd = now_local().date()
     query = select(Conducteur)
     if q:
         motif = f"%{q.strip()}%"
@@ -88,9 +89,47 @@ def liste_conducteurs(q: str | None = None, statut: str | None = None,
         query = query.where(Conducteur.statut == statut)
     conducteurs = db.scalars(query.order_by(Conducteur.prenom_usuel)).all()
     plaques = _vehicule_assigne(db)
-    return [{**s_conducteur(c), "vehicule_plaque": plaques.get(c.id)} for c in conducteurs]
 
+    suivis = db.scalars(select(SuiviJournalier).where(SuiviJournalier.date_jour == aujourd)).all()
+    suivi_par_cond = {s.conducteur_id: s for s in suivis if s.conducteur_id}
 
+    missions_actives = db.scalars(select(Mission).where(
+        Mission.date_jour == aujourd,
+        Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE])
+    )).all()
+    mission_par_veh = {m.vehicule_id: m for m in missions_actives}
+    mission_par_cond = {m.conducteur_id: m for m in missions_actives if m.conducteur_id}
+
+    resultats = []
+    for c in conducteurs:
+        s = suivi_par_cond.get(c.id)
+        m = mission_par_cond.get(c.id)
+        if not m and s:
+            m = mission_par_veh.get(s.vehicule_id)
+
+        if m:
+            statut_op = "En mission (Chargé)" if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE" else "En mission (Vide)"
+        elif c.statut != StatutConducteur.ACTIF:
+            statut_op = "En repos"
+        elif plaques.get(c.id) or s:
+            statut_op = "Disponible"
+        else:
+            statut_op = "En repos"
+
+        resultats.append({
+            **s_conducteur(c),
+            "vehicule_plaque": plaques.get(c.id),
+            "statut_operationnel": statut_op,
+            "mission_active": {
+                "id": m.id,
+                "code_mission": m.code_mission or f"MIS-OT-{m.numero_ot or ''}",
+                "numero_ot": m.numero_ot,
+                "produit": m.produit,
+                "depot_prevu": m.depot_prevu or m.depot,
+                "statut_camion": getattr(m, "statut_camion_actuel", "VIDE"),
+            } if m else None
+        })
+    return resultats
 @router.post("/conducteurs", status_code=status.HTTP_201_CREATED)
 def creer_conducteur(data: ConducteurIn, db: Session = Depends(get_db),
                      user=Depends(require_roles(*ECRITURE))):
@@ -334,6 +373,7 @@ class VehiculePatch(BaseModel):
 @router.get("/vehicules")
 def liste_vehicules(q: str | None = None, statut: str | None = None,
                     db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    aujourd = now_local().date()
     query = select(Vehicule)
     if q:
         motif = f"%{q.strip()}%"
@@ -343,7 +383,48 @@ def liste_vehicules(q: str | None = None, statut: str | None = None,
                                 Vehicule.gps_associe.ilike(motif)))
     if statut:
         query = query.where(Vehicule.statut == statut)
-    return [s_vehicule(v) for v in db.scalars(query.order_by(Vehicule.plaque)).all()]
+    vehicules = db.scalars(query.order_by(Vehicule.plaque)).all()
+
+    suivis = db.scalars(select(SuiviJournalier).where(SuiviJournalier.date_jour == aujourd)).all()
+    suivi_par_veh = {s.vehicule_id: s for s in suivis}
+
+    missions_actives = db.scalars(select(Mission).where(
+        Mission.date_jour == aujourd,
+        Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE])
+    )).all()
+    mission_par_veh = {m.vehicule_id: m for m in missions_actives}
+
+    resultats = []
+    for v in vehicules:
+        s = suivi_par_veh.get(v.id)
+        m = mission_par_veh.get(v.id)
+
+        if s and s.situation and any(mot in s.situation.lower() for mot in ("garage", "maintenance", "atelier", "panne")):
+            statut_op = "En maintenance"
+        elif m:
+            statut_op = "CHARGÉ" if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE" else "VIDE"
+        elif s and s.statut_camion:
+            statut_op = s.statut_camion.value
+        elif v.statut == StatutVehicule.MAINTENANCE:
+            statut_op = "En maintenance"
+        else:
+            statut_op = "LIBRE"
+
+        resultats.append({
+            **s_vehicule(v),
+            "statut_operationnel": statut_op,
+            "situation": s.situation if s else None,
+            "statut_camion": statut_op,
+            "mission_active": {
+                "id": m.id,
+                "code_mission": m.code_mission or f"MIS-OT-{m.numero_ot or ''}",
+                "numero_ot": m.numero_ot,
+                "produit": m.produit,
+                "depot_prevu": m.depot_prevu or m.depot,
+                "statut_camion": getattr(m, "statut_camion_actuel", "VIDE"),
+            } if m else None
+        })
+    return resultats
 
 
 @router.post("/vehicules", status_code=status.HTTP_201_CREATED)

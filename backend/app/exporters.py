@@ -647,9 +647,153 @@ def export_historique_pdf(du, au, jours: list, synthese: list[dict],
                                f"{len(lignes)} camions", styles["Title"]))
         story.append(Spacer(1, 4))
         story.append(_table_suivi_pdf(lignes, detail))
-        if detail:
-            story += _note_provisoire_pdf()
+    doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
+              onLaterPages=_pied_page(titre, utilisateur))
+    return buf.getvalue()
 
+
+# =============================================================================
+# EXPORTS MISSIONS (Module 3 — Reconstitution & Suivi Logistique)
+# =============================================================================
+def export_missions_excel(titre_periode: str, missions: list[dict],
+                          utilisateur: str = "") -> bytes:
+    """Export Excel de l'onglet Missions avec les 4 blocs de colonnes."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Missions"
+
+    headers = [
+        "N° Mission", "Date", "Chauffeur", "Immatriculation",
+        "N° OT", "Distributeur", "Produit", "Dépôt Prévu", "Destination Réelle",
+        "Statut Camion", "Statut Mission",
+        "Départ OT", "Chargement GRT", "Livraison / Fin",
+        "Durée", "Km Vide", "Km Chargé", "Km Total", "Nb Infractions"
+    ]
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    c = ws.cell(row=1, column=1,
+                value=f"LSS — Registre des Missions — {titre_periode} · {len(missions)} missions"
+                      f" · exporté le {datetime.now():%d/%m/%Y %H:%M}"
+                      + (f" par {utilisateur}" if utilisateur else ""))
+    c.font = Font(bold=True, size=13, color="FFFFFF")
+    for k in range(1, len(headers) + 1):
+        ws.cell(row=1, column=k).fill = PatternFill("solid", fgColor="1F4E79")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+    logo = _logo_excel(30)
+    if logo is not None:
+        ws.add_image(logo, "A1")
+
+    for j, h in enumerate(headers, start=1):
+        cell = ws.cell(row=2, column=j, value=h)
+        cell.font = Font(bold=True, size=10)
+        cell.fill = PatternFill("solid", fgColor="EDF1F6")
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, m in enumerate(missions, start=3):
+        cond = m.get("conducteur") or {}
+        chauffeur_nom = cond.get("nom_prenom") or cond.get("prenom_usuel") or "—"
+        depot_eff = m.get("depot_effectif") or m.get("depot_prevu") or "—"
+        if m.get("est_deviee"):
+            depot_eff = f"{depot_eff} (DÉVIÉE)"
+
+        vals = [
+            m.get("code_mission") or f"MIS-{m.get('id', '')[:8]}",
+            m.get("date_jour") or "—",
+            chauffeur_nom,
+            m.get("plaque") or "—",
+            m.get("numero_ot") or "—",
+            m.get("distributeur") or "—",
+            m.get("produit") or "—",
+            m.get("depot_prevu") or m.get("depot") or "—",
+            depot_eff,
+            m.get("statut_camion_actuel") or "—",
+            m.get("statut") or "—",
+            _hhmm(m.get("heure_debut")),
+            _hhmm(m.get("heure_chargement")),
+            _hhmm(m.get("heure_fin")),
+            _fmt_duree_txt(m.get("duree_s")),
+            round(m.get("km_vide") or 0.0, 1),
+            round(m.get("km_charge") or 0.0, 1),
+            round(m.get("kilometrage_total") or m.get("kilometrage") or 0.0, 1),
+            m.get("nb_infractions") or 0,
+        ]
+        for j, val in enumerate(vals, start=1):
+            cell = ws.cell(row=i, column=j, value=val)
+            cell.font = Font(size=9)
+            if j in (1, 2, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19):
+                cell.alignment = Alignment(horizontal="center")
+
+    for j, h in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = max(12, len(h) + 3)
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}{len(missions) + 2}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def export_missions_pdf(titre_periode: str, missions: list[dict],
+                        utilisateur: str = "") -> bytes:
+    """Export PDF du registre des missions (Format A4 Paysage)."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Spacer, Paragraph, Table, TableStyle
+
+    titre = f"Registre des Missions — {titre_periode}"
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=8 * mm, rightMargin=8 * mm,
+                            topMargin=14 * mm, bottomMargin=11 * mm, title=titre,
+                            author="LSS Tracking")
+    styles, petit = _styles_pdf()
+    story = [
+        Paragraph(f"<b>{titre}</b> — {len(missions)} mission(s)", styles["Title"]),
+        Spacer(1, 4),
+    ]
+
+    headers = ["N° Mission", "Chauffeur", "Camion", "N° OT", "Produit",
+               "Dépôt Prévu", "Destination", "Statut", "Départ", "Livraison",
+               "Km Tot.", "Infr."]
+
+    data = [headers]
+    for m in missions:
+        cond = m.get("conducteur") or {}
+        chauffeur_nom = cond.get("prenom_usuel") or (cond.get("nom_prenom", "")[:16]) or "—"
+        depot_eff = m.get("depot_effectif") or m.get("depot_prevu") or "—"
+        if m.get("est_deviee"):
+            depot_eff = f"{depot_eff}*"
+
+        row = [
+            m.get("code_mission") or f"MIS-{m.get('id', '')[:6]}",
+            chauffeur_nom,
+            m.get("plaque") or "—",
+            m.get("numero_ot") or "—",
+            m.get("produit") or "—",
+            m.get("depot_prevu") or m.get("depot") or "—",
+            depot_eff,
+            m.get("statut") or "—",
+            _hhmm(m.get("heure_debut")),
+            _hhmm(m.get("heure_fin")),
+            f"{round(m.get('kilometrage_total') or m.get('kilometrage') or 0.0, 0):.0f} km",
+            str(m.get("nb_infractions") or 0),
+        ]
+        data.append(row)
+
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FA")]),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#C9D2DC")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (1, 1), (1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(t)
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()

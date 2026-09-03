@@ -14,9 +14,18 @@ export interface Conducteur {
   tokens_set?: string | null;
   telephone: string | null;
   statut: string;
+  statut_operationnel?: "En mission (Vide)" | "En mission (Chargé)" | "Disponible" | "En repos" | string;
   vehicule_plaque?: string | null;
   date_creation?: string;
   aliases?: ConducteurAlias[];
+  mission_active?: {
+    id: string;
+    code_mission: string;
+    numero_ot: string | null;
+    produit: string | null;
+    depot_prevu: string | null;
+    statut_camion: string;
+  } | null;
 }
 
 export interface Vehicule {
@@ -26,11 +35,22 @@ export interface Vehicule {
   marque: string | null;
   capacite: number | null;
   statut: string;
+  statut_operationnel?: "LIBRE" | "VIDE" | "CHARGÉ" | "En maintenance" | string;
+  situation?: string | null;
+  statut_camion?: string | null;
   gps_associe: string | null;
   plateforme_gps?: string | null;
   conducteur_actuel_id: string | null;
   conducteur: Conducteur | null;
   date_creation?: string;
+  mission_active?: {
+    id: string;
+    code_mission: string;
+    numero_ot: string | null;
+    produit: string | null;
+    depot_prevu: string | null;
+    statut_camion: string;
+  } | null;
   position?: {
     lat: number | null;
     lng: number | null;
@@ -105,23 +125,36 @@ export interface SuiviLigne {
 
 export interface Mission {
   id: string;
+  code_mission?: string;
   date_jour: string;
   conducteur_id: string | null;
   conducteur: Conducteur | null;
   vehicule_id: string;
   plaque: string;
   numero_mission_du_jour: number;
-  statut: "EN_COURS" | "TERMINÉE" | "RETARDÉE";
+  statut: "EN_COURS" | "TERMINÉE" | "DÉVIÉE" | "RETARDÉE";
+  statut_camion_actuel?: "VIDE" | "CHARGE" | "CHARGÉ" | "LIBRE" | string;
   heure_debut: string | null;
+  heure_chargement?: string | null;
   heure_fin: string | null;
   duree_s: number;
   numero_ot: string | null;
   produit: string | null;
   depot: string | null;
+  depot_prevu?: string | null;
+  depot_effectif?: string | null;
+  est_deviee?: boolean;
+  motif_deviation?: string | null;
   distributeur: string | null;
+  km_vide?: number;
+  km_charge?: number;
   kilometrage: number;
+  kilometrage_total?: number;
+  nb_infractions?: number;
   origine: string | null;
-  etapes: { etat: string; ts: string; lieu: string | null }[];
+  etapes: { etat: string; ts: string; lieu: string | null; zone?: string | null }[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Infraction {

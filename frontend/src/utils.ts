@@ -81,6 +81,7 @@ export const COULEURS_STATUT_CAMION: Record<string, string> = {
 export const COULEURS_STATUT_MISSION: Record<string, string> = {
   EN_COURS: "bg-blue-500/15 text-blue-600 dark:text-blue-400 border-blue-500/40",
   "TERMINÉE": "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/40",
+  "DÉVIÉE": "bg-purple-500/15 text-purple-600 dark:text-purple-400 border-purple-500/40",
   "RETARDÉE": "bg-red-500/15 text-red-600 dark:text-red-400 border-red-500/40",
 };
 
@@ -89,6 +90,17 @@ export const COULEURS_STATUT_ALERTE: Record<string, string> = {
   VUE: "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/40",
   TRAITEE: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/40",
 };
+
+export function firstDayOfMonthISO(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+}
+
+export function daysAgoISO(n: number = 30): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 export function todayISO(): string {
   const d = new Date();

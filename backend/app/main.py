@@ -507,9 +507,10 @@ async def lifespan(app: FastAPI):
     reparer_conducteurs_non_personnes()    # §0quinquies D5 (14/08/2026)
     try:
         from . import reparation
+        reparation.migrer_schema_missions()
         reparation.reparer_historique_conducteurs_passes()
     except Exception:
-        log.exception("Réparation initiale historique conducteurs en échec")
+        log.exception("Réparation initiale historique / missions en échec")
     daily.rattraper_au_demarrage()
     event_bus.attacher_boucle(asyncio.get_running_loop())
 

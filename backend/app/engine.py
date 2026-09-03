@@ -21,12 +21,14 @@ from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, calculer_tokens_set
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
 from .event_bus import publish
+from .geozones import (DEPOTS_SUD_CODES, detecter_zone_logistique,
+                       normaliser_code_depot)
 from .models import (Alerte, AuditLog, Conducteur, ConducteurAlias, EvenementGPS,
                      GraviteAlerte, GraviteInfraction, Infraction, Mission,
                      ParametrageSeuil, SourceEvenement, StatutAlerte,
                      StatutCamion, StatutConducteur, StatutMission, StatutValidationTrajet,
                      StatutVehicule, SuiviJournalier, Trajet, TypeAlerte,
-                     TypeEvenement, TypeInfraction, Vehicule)
+                     TypeEvenement, TypeInfraction, Vehicule, uid)
 from .serializers import iso, s_alerte, s_infraction, s_mission, s_suivi
 
 log = logging.getLogger("lss.engine")
@@ -181,13 +183,18 @@ def libelle_derniere_position(db, vehicule_id: str, jour: date) -> str | None:
         or f"{ev.latitude:.4f}, {ev.longitude:.4f}"
 
 
-def ensure_suivi(db, vehicule: Vehicule, jour: date) -> SuiviJournalier:
+def ensure_suivi(db, vehicule: Vehicule | str, jour: date) -> SuiviJournalier:
     """Retourne la ligne du jour (créée si besoin).
 
     À la création (§8) : Partie A synchronisée du référentiel, Partie B
     recopiée de la veille (aucune ressaisie), emplacement J-1 repris de
     l'arrêt final précédent ; Parties C et D restent vides.
     """
+    if isinstance(vehicule, str):
+        vehicule = db.get(Vehicule, vehicule)
+        if not vehicule:
+            raise ValueError("Véhicule introuvable")
+
     s = db.scalar(select(SuiviJournalier).where(
         SuiviJournalier.date_jour == jour, SuiviJournalier.vehicule_id == vehicule.id))
     if s:
@@ -767,7 +774,12 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                 if suivi.mission_id:
                     m = db.get(Mission, suivi.mission_id)
                     if m:
-                        m.kilometrage = (m.kilometrage or 0) + dist
+                        if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE":
+                            m.km_charge = round((m.km_charge or 0.0) + dist, 3)
+                        else:
+                            m.km_vide = round((m.km_vide or 0.0) + dist, 3)
+                        m.kilometrage_total = round((m.km_vide or 0.0) + (m.km_charge or 0.0), 3)
+                        m.kilometrage = m.kilometrage_total
 
         if not trajets:
             trajets = [_nouveau_trajet(suivi, 1, ts, vehicule, source)]
@@ -885,6 +897,76 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
             with _lock:
                 _flags[flag_h] = ts
 
+    # --- Détection automatique logistique & transitions géographiques (§3) ---
+    if suivi.mission_id:
+        m_actuelle = db.get(Mission, suivi.mission_id)
+        if m_actuelle and m_actuelle.statut in (StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE):
+            z_info = detecter_zone_logistique(lat, lon, adresse)
+            z_type, z_code, z_nom = z_info["type"], z_info["code"], z_info["nom"]
+
+            # A. Chargement au Dépôt GRT (Tamatave) : VIDE -> CHARGÉ
+            if getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "VIDE":
+                if z_type == "GRT":
+                    if not any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ENTREE_GRT", "ts": iso(ts), "lieu": z_nom, "zone": "GRT"}]
+                elif any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
+                    # Sortie de GRT -> Chargement Effectué
+                    m_actuelle.statut_camion_actuel = "CHARGE"
+                    m_actuelle.heure_chargement = ts
+                    suivi.statut_camion = StatutCamion.CHARGE
+                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": "Galana Rafinérie Terminale (GRT)", "zone": "GRT"}]
+                    log.info("Chargement GRT validé pour %s (Mission %s) -> Statut Camion CHARGÉ",
+                             vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.update", s_mission(m_actuelle))
+
+            # B. Transit & Dépôts Récepteurs : Déviation & Déchargement (arrêt >= 3h)
+            elif getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
+                code_prevu = normaliser_code_depot(m_actuelle.depot_prevu)
+
+                # Tolérance Dépôts Sud : passage BASETNR conserve statut CHARGÉ
+                if z_type == "BASETNR" and (code_prevu in DEPOTS_SUD_CODES or z_info.get("est_depot_sud")):
+                    pass
+                elif z_type == "DEPOT_RECEPTEUR":
+                    if z_code == code_prevu:
+                        if not any(e.get("etat") == "ARRIVEE_DEPOT_RECEPTEUR" for e in (m_actuelle.etapes or [])):
+                            m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ARRIVEE_DEPOT_RECEPTEUR", "ts": iso(ts), "lieu": z_nom, "zone": z_code}]
+                            if PUBLISH_ENABLED["on"]:
+                                publish("mission.update", s_mission(m_actuelle))
+                    else:
+                        # Déviation détectée vers un autre dépôt
+                        if not m_actuelle.est_deviee:
+                            m_actuelle.est_deviee = True
+                            m_actuelle.statut = StatutMission.DEVIEE
+                            m_actuelle.depot_effectif = z_nom
+                            m_actuelle.motif_deviation = f"Déviation constatée : réorienté vers {z_nom} (prévu : {m_actuelle.depot_prevu or '—'})"
+                            m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEVIATION_DETECTEE", "ts": iso(ts), "lieu": z_nom, "zone": z_code}]
+                            log.warning("Déviation détectée pour %s (Mission %s) : nouveau dépôt %s",
+                                        vehicule.plaque, m_actuelle.code_mission or m_actuelle.id, z_nom)
+                            if PUBLISH_ENABLED["on"]:
+                                publish("mission.update", s_mission(m_actuelle))
+
+                # Contrôle de déchargement : arrêt >= 3h (10800 s) dans un dépôt récepteur
+                if z_type == "DEPOT_RECEPTEUR" or any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") for e in (m_actuelle.etapes or [])):
+                    arret_depot_s = 0
+                    if not roule and trajets and trajets[-1].heure_fin is not None:
+                        arret_depot_s = (ts - trajets[-1].heure_fin).total_seconds()
+                    if arret_depot_s >= 10800 and not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.statut = StatutMission.TERMINEE
+                        m_actuelle.statut_camion_actuel = "LIBRE"
+                        m_actuelle.heure_fin = ts
+                        if m_actuelle.heure_debut:
+                            m_actuelle.duree_s = int((ts - m_actuelle.heure_debut).total_seconds())
+                        if not m_actuelle.depot_effectif:
+                            m_actuelle.depot_effectif = m_actuelle.depot_prevu or z_nom
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": m_actuelle.depot_effectif, "zone": z_code}]
+                        suivi.statut_camion = StatutCamion.LIBRE
+                        suivi.mission_id = None
+                        log.info("Déchargement validé après arrêt >= 3h pour %s (Mission %s) -> LIBRE / TERMINÉE",
+                                 vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
+                        if PUBLISH_ENABLED["on"]:
+                            publish("mission.update", s_mission(m_actuelle))
+
     db.commit()
 
     # Addendum v1.4 §2.3 — notification « trajet terminé » (hook : validation
@@ -911,64 +993,139 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
 def _mission_ouverte(db, vehicule_id, jour) -> Mission | None:
     return db.scalar(select(Mission).where(
         Mission.vehicule_id == vehicule_id, Mission.date_jour == jour,
-        Mission.statut.in_([StatutMission.EN_COURS, StatutMission.RETARDEE])
+        Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE])
     ).order_by(Mission.numero_mission_du_jour.desc()))
+
+
+def _formater_code_mission(numero_ot: str | None, jour: date, numero: int = 1) -> str:
+    if numero_ot and numero_ot.strip():
+        ot = numero_ot.strip()
+        if ot.upper().startswith("OT-") or ot.upper().startswith("OT_"):
+            return f"MIS-{ot.upper()}"
+        elif ot.upper().startswith("MIS-"):
+            return ot.upper()
+        else:
+            return f"MIS-OT-{ot}"
+    return f"MIS-{jour.strftime('%Y%m%d')}-{numero:02d}"
+
+
+def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
+                              numero_ot: str | None, distributeur: str | None,
+                              produit: str | None, depot_prevu: str | None,
+                              ts: datetime | None = None) -> Mission:
+    """Initialise ou met à jour une mission logistique lors de l'attribution d'un OT (Option A).
+    Bascule automatiquement le camion de LIBRE à VIDE.
+    """
+    ts = ts or now_local()
+    jour = suivi.date_jour
+    ouverte = _mission_ouverte(db, vehicule.id, jour)
+    if ouverte:
+        if numero_ot:
+            ouverte.numero_ot = numero_ot
+            ouverte.code_mission = _formater_code_mission(numero_ot, jour, ouverte.numero_mission_du_jour)
+        if distributeur:
+            ouverte.distributeur = distributeur
+        if produit:
+            ouverte.produit = produit
+        if depot_prevu:
+            ouverte.depot = depot_prevu
+            ouverte.depot_prevu = depot_prevu
+            if not ouverte.depot_effectif:
+                ouverte.depot_effectif = depot_prevu
+        suivi.mission_id = ouverte.id
+        if PUBLISH_ENABLED["on"]:
+            publish("mission.update", s_mission(ouverte))
+        return ouverte
+
+    numero = (db.scalar(select(func.count(Mission.id)).where(
+        Mission.vehicule_id == vehicule.id, Mission.date_jour == jour)) or 0) + 1
+    code = _formater_code_mission(numero_ot, jour, numero)
+
+    m = Mission(
+        id=uid(),
+        code_mission=code,
+        date_jour=jour,
+        conducteur_id=suivi.conducteur_id or (vehicule.conducteur_actuel_id if vehicule else None),
+        vehicule_id=vehicule.id,
+        numero_mission_du_jour=numero,
+        statut=StatutMission.EN_COURS,
+        statut_camion_actuel="VIDE",
+        heure_debut=ts,
+        numero_ot=numero_ot,
+        distributeur=distributeur,
+        produit=produit,
+        depot=depot_prevu,
+        depot_prevu=depot_prevu,
+        depot_effectif=depot_prevu,
+        est_deviee=False,
+        km_vide=0.0,
+        km_charge=0.0,
+        kilometrage=0.0,
+        kilometrage_total=0.0,
+        origine=vehicule.last_adresse if vehicule else "Base LSS — Antananarivo",
+        etapes=[{"etat": "INITIALISATION_OT", "ts": iso(ts),
+                 "lieu": (vehicule.last_adresse if vehicule else None) or "Base LSS — Antananarivo",
+                 "zone": "BASETNR"}]
+    )
+    db.add(m)
+    db.flush()
+    suivi.mission_id = m.id
+    suivi.statut_camion = StatutCamion.VIDE
+    if numero_ot:
+        suivi.numero_ot = numero_ot
+    if distributeur:
+        suivi.distributeur = distributeur
+    if produit:
+        suivi.produit = produit
+    if depot_prevu:
+        suivi.depot_recepteur = depot_prevu
+    log.info("Mission %s (%s) initialisée pour %s -> Statut Camion VIDE",
+             code, numero_ot or "Sans OT", vehicule.plaque if vehicule else "?")
+    if PUBLISH_ENABLED["on"]:
+        publish("mission.new", s_mission(m))
+    return m
 
 
 def transition_statut(db, suivi: SuiviJournalier, vehicule: Vehicule,
                       ancien: str | None, nouveau: str | None, ts: datetime):
-    """Segmentation générique (§6.3) : une nouvelle mission démarre à chaque
-    transition LIBRE → VIDE (sans attendre un retour à la base principale) ;
-    CHARGÉ clôture le chargement ; LIBRE après CHARGÉ clôture la mission
-    (déchargement). Supporte nativement plusieurs missions/chauffeur/jour
-    (cas Moramanga).
+    """Segmentation logistique automatique (§3) :
+    - LIBRE -> VIDE (attribution OT / départ transit vers Tamatave)
+    - VIDE -> CHARGÉ (chargement GRT)
+    - CHARGÉ -> LIBRE (déchargement validé)
     """
     if ancien == nouveau:
         return
     jour = suivi.date_jour
 
     if nouveau == StatutCamion.VIDE.value and ancien != StatutCamion.VIDE.value:
-        ouverte = _mission_ouverte(db, vehicule.id, jour)
-        if ouverte:  # robustesse : une mission restée ouverte est clôturée
-            ouverte.statut = StatutMission.TERMINEE
-            ouverte.heure_fin = ts
-            if ouverte.heure_debut:
-                ouverte.duree_s = int((ts - ouverte.heure_debut).total_seconds())
-        numero = (db.scalar(select(func.count(Mission.id)).where(
-            Mission.vehicule_id == vehicule.id, Mission.date_jour == jour)) or 0) + 1
-        m = Mission(
-            date_jour=jour, conducteur_id=suivi.conducteur_id, vehicule_id=vehicule.id,
-            numero_mission_du_jour=numero, statut=StatutMission.EN_COURS, heure_debut=ts,
-            numero_ot=suivi.numero_ot, produit=suivi.produit,
-            depot=suivi.depot_recepteur, distributeur=suivi.distributeur,
-            origine=vehicule.last_adresse,
-            etapes=[{"etat": "TRANSIT_CHARGEMENT", "ts": iso(ts),
-                     "lieu": vehicule.last_adresse}])
-        db.add(m)
-        db.flush()
-        suivi.mission_id = m.id
-        log.info("Mission %s n°%s ouverte (%s)", vehicule.plaque, numero, iso(ts))
-        if PUBLISH_ENABLED["on"]:
-            publish("mission.new", s_mission(m))
+        initialiser_ou_maj_mission(db, suivi, vehicule, suivi.numero_ot,
+                                   suivi.distributeur, suivi.produit,
+                                   suivi.depot_recepteur, ts)
 
     elif nouveau == StatutCamion.CHARGE.value and ancien == StatutCamion.VIDE.value:
         m = _mission_ouverte(db, vehicule.id, jour)
         if m:
-            m.etapes = (m.etapes or []) + [{"etat": "CHARGEMENT_TERMINE", "ts": iso(ts),
-                                            "lieu": vehicule.last_adresse}]
+            m.statut_camion_actuel = "CHARGE"
+            m.heure_chargement = ts
+            m.etapes = (m.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts),
+                                            "lieu": vehicule.last_adresse or "Galana Rafinérie Terminale (GRT)",
+                                            "zone": "GRT"}]
             m.produit = suivi.produit or m.produit
             m.depot = suivi.depot_recepteur or m.depot
+            m.depot_prevu = suivi.depot_recepteur or m.depot_prevu
             m.numero_ot = suivi.numero_ot or m.numero_ot
             m.distributeur = suivi.distributeur or m.distributeur
             if PUBLISH_ENABLED["on"]:
                 publish("mission.update", s_mission(m))
 
-    elif nouveau == StatutCamion.LIBRE.value and ancien == StatutCamion.CHARGE.value:
+    elif nouveau == StatutCamion.LIBRE.value and ancien in (StatutCamion.CHARGE.value, StatutCamion.VIDE.value):
         m = _mission_ouverte(db, vehicule.id, jour)
         if m:
-            m.etapes = (m.etapes or []) + [{"etat": "DECHARGEMENT_TERMINE", "ts": iso(ts),
-                                            "lieu": vehicule.last_adresse}]
+            m.etapes = (m.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts),
+                                            "lieu": vehicule.last_adresse or "Dépôt récepteur",
+                                            "zone": normaliser_code_depot(m.depot_effectif or m.depot_prevu) or "DEPOT"}]
             m.statut = StatutMission.TERMINEE
+            m.statut_camion_actuel = "LIBRE"
             m.heure_fin = ts
             if m.heure_debut:
                 m.duree_s = int((ts - m.heure_debut).total_seconds())
@@ -1032,6 +1189,11 @@ def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
     nouveau_statut = suivi.statut_camion.value if suivi.statut_camion else None
     if "statut_camion" in champs and ancien_statut != nouveau_statut:
         transition_statut(db, suivi, vehicule, ancien_statut, nouveau_statut, ts)
+    elif any(k in champs for k in ("numero_ot", "produit", "depot_recepteur", "distributeur")):
+        if suivi.numero_ot or suivi.depot_recepteur:
+            initialiser_ou_maj_mission(db, suivi, vehicule, suivi.numero_ot,
+                                       suivi.distributeur, suivi.produit,
+                                       suivi.depot_recepteur, ts)
 
     suivi.updated_at = now_local()
     db.commit()
@@ -1094,7 +1256,8 @@ def boucle_surveillance():
 
         # Missions retardées (durée réelle > durée prévisionnelle paramétrée)
         missions = db.scalars(select(Mission).where(
-            Mission.statut == StatutMission.EN_COURS, Mission.date_jour == jour)).all()
+            Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE]),
+            Mission.date_jour == jour)).all()
         for m in missions:
             if m.heure_debut and (now - m.heure_debut).total_seconds() > seuils["DUREE_MISSION_PREVUE"]:
                 m.statut = StatutMission.RETARDEE

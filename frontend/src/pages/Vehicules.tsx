@@ -6,7 +6,7 @@ import Icon from "../components/icons";
 import { Badge, Btn, Card, Champ, inputCls, Modal, PageHeader, Spinner, Vide } from "../components/ui";
 import { addToast } from "../components/toast";
 import { Conducteur, Vehicule } from "../types";
-import { cls, fmtHeure } from "../utils";
+import { cls, COULEURS_STATUT_CAMION, fmtHeure } from "../utils";
 import { on } from "../ws";
 
 const COULEURS_STATUT: Record<string, string> = {
@@ -92,46 +92,62 @@ export default function Vehicules() {
             <table className="table-pro">
               <thead><tr>
                 <th>Plaque</th><th>Description</th><th>Marque</th><th>Capacité (L)</th>
-                <th>GPS associé (OBC)</th><th>Conducteur actuel</th><th>Dernier point GPS</th>
-                <th>Statut</th>{ecriture && <th className="w-28">Actions</th>}
+                <th>GPS associé (OBC)</th><th>Conducteur actuel</th><th>État Camion</th><th>Mission Active</th><th>Dernier point GPS</th>
+                <th>Statut Fiche</th>{ecriture && <th className="w-28">Actions</th>}
               </tr></thead>
               <tbody>
-                {items.map((v) => (
-                  <tr key={v.id}>
-                    <td className="font-bold whitespace-nowrap">{v.plaque}</td>
-                    <td className="text-[12px] text-slate-400 whitespace-nowrap">{v.description}</td>
-                    <td className="whitespace-nowrap">{v.marque || "—"}</td>
-                    <td className="tabular-nums">{v.capacite?.toLocaleString("fr-FR") || "—"}</td>
-                    <td className="font-mono text-[12px] text-slate-400">
-                      <span className={cls("mr-1.5 rounded px-1 py-0.5 text-[9.5px] font-bold font-sans",
-                        (v.plateforme_gps || "MZONEX") === "CAMTRACKPRO"
-                          ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
-                          : "bg-sky-500/15 text-sky-600 dark:text-sky-400")}
-                        title="Portail GPS de remontée des données (flotte mixte)">
-                        {(v.plateforme_gps || "MZONEX") === "CAMTRACKPRO" ? "CTPRO" : "MZX"}
-                      </span>
-                      {v.gps_associe || "—"}
-                    </td>
-                    <td className="font-medium whitespace-nowrap">{v.conducteur?.prenom_usuel || <span className="text-slate-400">—</span>}</td>
-                    <td className="max-w-[220px] text-[11.5px] text-slate-400">
-                      {v.position?.adresse ? (
-                        <span title={v.position.adresse} className="block truncate">
-                          {v.position.adresse}
-                          <span className="text-slate-500"> · {fmtHeure(v.position.maj)}</span>
+                {items.map((v) => {
+                  const statutOp = v.statut_operationnel || v.statut_camion || "LIBRE";
+                  const coulOp = COULEURS_STATUT_CAMION[statutOp] || "bg-slate-500/15 text-slate-500";
+                  return (
+                    <tr key={v.id}>
+                      <td className="font-bold whitespace-nowrap">{v.plaque}</td>
+                      <td className="text-[12px] text-slate-400 whitespace-nowrap">{v.description}</td>
+                      <td className="whitespace-nowrap">{v.marque || "—"}</td>
+                      <td className="tabular-nums">{v.capacite?.toLocaleString("fr-FR") || "—"}</td>
+                      <td className="font-mono text-[12px] text-slate-400">
+                        <span className={cls("mr-1.5 rounded px-1 py-0.5 text-[9.5px] font-bold font-sans",
+                          (v.plateforme_gps || "MZONEX") === "CAMTRACKPRO"
+                            ? "bg-violet-500/15 text-violet-600 dark:text-violet-400"
+                            : "bg-sky-500/15 text-sky-600 dark:text-sky-400")}
+                          title="Portail GPS de remontée des données (flotte mixte)">
+                          {(v.plateforme_gps || "MZONEX") === "CAMTRACKPRO" ? "CTPRO" : "MZX"}
                         </span>
-                      ) : "—"}
-                    </td>
-                    <td><Badge couleur={COULEURS_STATUT[v.statut]}>{v.statut}</Badge></td>
-                    {ecriture && (
-                      <td className="whitespace-nowrap">
-                        <Btn variante="fantome" className="!px-2 !py-0.5 text-[11.5px]" onClick={() => setForm(v)}>Modifier</Btn>
-                        {admin && (
-                          <Btn variante="fantome" className="!px-2 !py-0.5 text-[11.5px] text-red-500" onClick={() => supprimer(v)}>Suppr.</Btn>
+                        {v.gps_associe || "—"}
+                      </td>
+                      <td className="font-medium whitespace-nowrap">{v.conducteur?.prenom_usuel || <span className="text-slate-400">—</span>}</td>
+                      <td>
+                        <Badge couleur={coulOp}>{statutOp}</Badge>
+                      </td>
+                      <td className="text-[12px]">
+                        {v.mission_active ? (
+                          <span className="font-mono font-semibold text-blue-600 dark:text-blue-400">
+                            {v.mission_active.code_mission || v.mission_active.numero_ot}
+                          </span>
+                        ) : (
+                          <span className="text-slate-400 italic text-[11px]">—</span>
                         )}
                       </td>
-                    )}
-                  </tr>
-                ))}
+                      <td className="max-w-[220px] text-[11.5px] text-slate-400">
+                        {v.position?.adresse ? (
+                          <span title={v.position.adresse} className="block truncate">
+                            {v.position.adresse}
+                            <span className="text-slate-500"> · {fmtHeure(v.position.maj)}</span>
+                          </span>
+                        ) : "—"}
+                      </td>
+                      <td><Badge couleur={COULEURS_STATUT[v.statut]}>{v.statut}</Badge></td>
+                      {ecriture && (
+                        <td className="whitespace-nowrap">
+                          <Btn variante="fantome" className="!px-2 !py-0.5 text-[11.5px]" onClick={() => setForm(v)}>Modifier</Btn>
+                          {admin && (
+                            <Btn variante="fantome" className="!px-2 !py-0.5 text-[11.5px] text-red-500" onClick={() => supprimer(v)}>Suppr.</Btn>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

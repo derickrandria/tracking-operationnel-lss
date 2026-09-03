@@ -32,8 +32,11 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
                                .where(Vehicule.statut == StatutVehicule.ACTIF)) or 0
     missions_jour = db.scalars(select(Mission).where(Mission.date_jour == aujourd)).all()
     missions_en_cours = sum(1 for m in missions_jour if m.statut == StatutMission.EN_COURS)
+    missions_deviees = sum(1 for m in missions_jour if m.statut == StatutMission.DEVIEE or getattr(m, "est_deviee", False))
     missions_retardees = sum(1 for m in missions_jour if m.statut == StatutMission.RETARDEE)
     missions_terminees = sum(1 for m in missions_jour if m.statut == StatutMission.TERMINEE)
+    km_vide_jour = round(sum(getattr(m, "km_vide", 0.0) or 0.0 for m in missions_jour), 1)
+    km_charge_jour = round(sum(getattr(m, "km_charge", 0.0) or 0.0 for m in missions_jour), 1)
 
     # v3 AM-5/C3 (22/08/2026) : seules les infractions d'une plateforme EXTERNE
     # comptent — comme l'onglet Infractions (vitre en attente de source : 0)
@@ -148,8 +151,11 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
             "charges": par_statut.get("CHARGÉ", 0),
             "non_renseignes": par_statut.get("NON_RENSEIGNÉ", 0),
             "missions_en_cours": missions_en_cours,
+            "missions_deviees": missions_deviees,
             "missions_retardees": missions_retardees,
             "missions_terminees": missions_terminees,
+            "km_vide_jour": km_vide_jour,
+            "km_charge_jour": km_charge_jour,
             "infractions_jour": infractions_jour,
             "infractions_mois": infractions_mois,
             "alertes_non_vues": alertes_non_vues,

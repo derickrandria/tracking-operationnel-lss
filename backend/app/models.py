@@ -50,6 +50,7 @@ class StatutCamion(str, enum.Enum):
 class StatutMission(str, enum.Enum):
     EN_COURS = "EN_COURS"
     TERMINEE = "TERMINÉE"
+    DEVIEE = "DÉVIÉE"
     RETARDEE = "RETARDÉE"
 
 
@@ -369,20 +370,30 @@ class Trajet(Base):
 class Mission(Base):
     __tablename__ = "missions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    code_mission: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     date_jour: Mapped[date] = mapped_column(Date, index=True)
     conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
     vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
     numero_mission_du_jour: Mapped[int] = mapped_column(Integer, default=1)
     statut: Mapped[StatutMission] = mapped_column(
         SAEnum(StatutMission, **SA_ENUM_KW), default=StatutMission.EN_COURS)
+    statut_camion_actuel: Mapped[str] = mapped_column(String(20), default="VIDE")
     heure_debut: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heure_chargement: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     heure_fin: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     duree_s: Mapped[int] = mapped_column(Integer, default=0)
     numero_ot: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    produit: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    depot: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    distributeur: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    kilometrage: Mapped[float] = mapped_column(Float, default=0)
+    produit: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    depot: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    depot_prevu: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    depot_effectif: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    est_deviee: Mapped[bool] = mapped_column(Boolean, default=False)
+    motif_deviation: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    distributeur: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    km_vide: Mapped[float] = mapped_column(Float, default=0.0)
+    km_charge: Mapped[float] = mapped_column(Float, default=0.0)
+    kilometrage: Mapped[float] = mapped_column(Float, default=0.0)
+    kilometrage_total: Mapped[float] = mapped_column(Float, default=0.0)
     origine: Mapped[str | None] = mapped_column(String(200), nullable=True)
     etapes: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_local)
@@ -390,6 +401,7 @@ class Mission(Base):
 
     vehicule = relationship("Vehicule", lazy="joined")
     conducteur = relationship("Conducteur", lazy="joined")
+    infractions = relationship("Infraction", back_populates="mission", lazy="selectin")
 
 
 # ------------------------------------------------------------- infractions/alertes
@@ -442,6 +454,7 @@ class Infraction(Base):
 
     vehicule = relationship("Vehicule", lazy="joined")
     conducteur = relationship("Conducteur", lazy="joined")
+    mission = relationship("Mission", back_populates="infractions", foreign_keys=[mission_id], lazy="joined")
 
 
 class Alerte(Base):

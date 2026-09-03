@@ -1002,6 +1002,7 @@ def reparer_historique_conducteurs_passes(db=None) -> dict:
 
         db.commit()
         log.info("Réparation historique conducteurs terminée : %s", stats)
+        migrer_schema_missions(db)
     except Exception:
         db.rollback()
         log.exception("Erreur lors de la réparation de l'historique des conducteurs")
@@ -1009,3 +1010,45 @@ def reparer_historique_conducteurs_passes(db=None) -> dict:
         if propre:
             db.close()
     return stats
+
+
+def migrer_schema_missions(db=None) -> dict:
+    """Vérifie et ajoute les colonnes manquantes dans la table `missions` (idempotent, SQLite/PostgreSQL)."""
+    propre = False
+    if db is None:
+        db = SessionLocal()
+        propre = True
+    resultat = {"ajouts": []}
+    try:
+        from sqlalchemy import text
+        colonnes_existantes = set()
+        for row in db.execute(text("PRAGMA table_info(missions)")).fetchall():
+            colonnes_existantes.add(row[1])
+
+        ajouts = [
+            ("code_mission", "VARCHAR(50)"),
+            ("statut_camion_actuel", "VARCHAR(20) DEFAULT 'VIDE'"),
+            ("depot_prevu", "VARCHAR(50)"),
+            ("depot_effectif", "VARCHAR(50)"),
+            ("est_deviee", "BOOLEAN DEFAULT 0"),
+            ("motif_deviation", "VARCHAR(200)"),
+            ("heure_chargement", "DATETIME"),
+            ("km_vide", "FLOAT DEFAULT 0.0"),
+            ("km_charge", "FLOAT DEFAULT 0.0"),
+            ("kilometrage_total", "FLOAT DEFAULT 0.0"),
+        ]
+        for nom_col, type_col in ajouts:
+            if nom_col not in colonnes_existantes:
+                try:
+                    db.execute(text(f"ALTER TABLE missions ADD COLUMN {nom_col} {type_col}"))
+                    resultat["ajouts"].append(nom_col)
+                    log.info("Migration table missions : colonne %s ajoutée", nom_col)
+                except Exception as e:
+                    log.warning("Migration colonne missions.%s : %s", nom_col, e)
+        db.commit()
+    except Exception as e:
+        log.warning("migrer_schema_missions ignoré : %s", e)
+    finally:
+        if propre:
+            db.close()
+    return resultat

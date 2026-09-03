@@ -284,6 +284,159 @@ def seed_si_vide():
                             adresse=rng.choice(["RN2 · PK 74 (avant Moramanga)", "RN2 · PK 201 (après Beforona)",
                                                 "RN7 · PK 96 (avant Antsirabe)"])))
             log.info("Historique de démonstration généré (6 jours archivés)")
+
+        # ------------------------------------------------ Missions de démonstration
+        from .models import Mission, StatutMission, SuiviJournalier, StatutCamion, uid
+        if db.scalar(select(func.count(Mission.id))) == 0 and db.scalar(select(func.count(Vehicule.id))) > 0:
+            from datetime import date, datetime, timedelta
+            def iso_fmt(dt): return dt.isoformat() if dt else None
+            rng = random.Random(888)
+            auj = date.today()
+            vehicules = db.scalars(select(Vehicule).where(Vehicule.statut == "ACTIF")).all()
+            distributeurs = ["TOTAL", "GALANA", "VIVO", "JOVENA"]
+            produits = ["Gasoil (GO)", "Super (SP95)", "Pétrole Lampant (PL)"]
+            depots_nord = ["DMMG", "DABI", "DSNR"]
+            depots_sud = ["DABE", "DFIA", "DMDV", "DMKR"]
+            all_depots = depots_nord + depots_sud
+
+            # 1. Missions passées (sur les 6 derniers jours)
+            ot_cpt = 1000
+            for recul in range(6, 0, -1):
+                jour = auj - timedelta(days=recul)
+                sample_v = rng.sample(vehicules, k=min(len(vehicules), rng.randint(12, 18)))
+                for v in sample_v:
+                    c = v.conducteur_actuel
+                    ot_cpt += 1
+                    ot_num = f"OT-{jour.strftime('%y%m%d')}-{ot_cpt:04d}"
+                    depot_dest = rng.choice(all_depots)
+                    dist = rng.choice(distributeurs)
+                    prod = rng.choice(produits)
+                    est_dev = (rng.random() < 0.15)
+                    depot_eff = rng.choice([d for d in all_depots if d != depot_dest]) if est_dev else depot_dest
+
+                    km_v = round(rng.uniform(70, 120), 1)
+                    km_c = round(rng.uniform(150, 380), 1)
+                    km_tot = round(km_v + km_c, 1)
+
+                    h_deb = datetime.combine(jour, datetime.min.time()).replace(hour=rng.randint(4, 6), minute=rng.randint(0, 50))
+                    h_charg = h_deb + timedelta(hours=rng.randint(3, 5))
+                    h_fin = h_charg + timedelta(hours=rng.randint(6, 10))
+
+                    etapes = [
+                        {"etat": "INITIALISATION_OT", "ts": iso_fmt(h_deb), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"},
+                        {"etat": "TRANSIT_CHARGEMENT", "ts": iso_fmt(h_deb + timedelta(hours=2)), "lieu": "RN2 PK 110", "zone": "RN2"},
+                        {"etat": "ENTREE_GRT", "ts": iso_fmt(h_charg - timedelta(minutes=45)), "lieu": "Tamatave Port / GRT", "zone": "GRT"},
+                        {"etat": "CHARGEMENT_EFFECTUE", "ts": iso_fmt(h_charg), "lieu": "Raffinerie GRT Tamatave", "zone": "GRT"},
+                        {"etat": "TRANSIT_LIVRAISON", "ts": iso_fmt(h_charg + timedelta(hours=3)), "lieu": "RN2 Moramanga", "zone": "DMMG" if "DMMG" in depot_dest else "RN2"},
+                    ]
+                    if est_dev:
+                        etapes.append({"etat": "DEVIATION_DETECTEE", "ts": iso_fmt(h_fin - timedelta(hours=2)), "lieu": f"Réorientation vers {depot_eff}", "zone": depot_eff})
+                    etapes.append({"etat": "DECHARGEMENT_EFFECTUE", "ts": iso_fmt(h_fin), "lieu": f"Dépôt {depot_eff}", "zone": depot_eff})
+                    etapes.append({"etat": "DECHARGEMENT_TERMINE", "ts": iso_fmt(h_fin + timedelta(hours=3, minutes=15)), "lieu": f"Dépôt {depot_eff}", "zone": depot_eff})
+
+                    db.add(Mission(
+                        id=uid(),
+                        code_mission=f"MIS-{ot_num}",
+                        date_jour=jour,
+                        conducteur_id=c.id if c else None,
+                        vehicule_id=v.id,
+                        numero_mission_du_jour=1,
+                        statut=StatutMission.DEVIEE if est_dev else StatutMission.TERMINEE,
+                        statut_camion_actuel="LIBRE",
+                        depot_prevu=depot_dest,
+                        depot_effectif=depot_eff,
+                        est_deviee=est_dev,
+                        motif_deviation="Réorientation logistique requise par le distributeur" if est_dev else None,
+                        km_vide=km_v,
+                        km_charge=km_c,
+                        kilometrage_total=km_tot,
+                        kilometrage=km_tot,
+                        heure_debut=h_deb,
+                        heure_chargement=h_charg,
+                        heure_fin=h_fin + timedelta(hours=3, minutes=15),
+                        numero_ot=ot_num,
+                        distributeur=dist,
+                        produit=prod,
+                        depot=depot_eff,
+                        origine="Base LSS — Antananarivo",
+                        etapes=etapes
+                    ))
+
+            # 2. Missions en cours aujourd'hui
+            sample_auj = rng.sample(vehicules, k=min(len(vehicules), 12))
+            for i, v in enumerate(sample_auj):
+                c = v.conducteur_actuel
+                ot_cpt += 1
+                ot_num = f"OT-{auj.strftime('%y%m%d')}-{ot_cpt:04d}"
+                depot_dest = rng.choice(all_depots)
+                dist = rng.choice(distributeurs)
+                prod = rng.choice(produits)
+                h_deb = datetime.combine(auj, datetime.min.time()).replace(hour=rng.randint(4, 7), minute=rng.randint(0, 45))
+
+                est_charge = (i % 2 == 1)
+                est_dev = (i == 3)
+                depot_eff = "DFIA" if est_dev else depot_dest
+
+                statut_camion = "CHARGÉ" if est_charge else "VIDE"
+                h_charg = (h_deb + timedelta(hours=3, minutes=30)) if est_charge else None
+                km_v = round(rng.uniform(50, 95), 1) if est_charge else round(rng.uniform(15, 60), 1)
+                km_c = round(rng.uniform(30, 140), 1) if est_charge else 0.0
+
+                etapes = [
+                    {"etat": "INITIALISATION_OT", "ts": iso_fmt(h_deb), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"},
+                    {"etat": "TRANSIT_CHARGEMENT", "ts": iso_fmt(h_deb + timedelta(hours=2)), "lieu": "RN2 PK 74", "zone": "RN2"},
+                ]
+                if est_charge:
+                    etapes.extend([
+                        {"etat": "ENTREE_GRT", "ts": iso_fmt(h_charg - timedelta(minutes=40)), "lieu": "Tamatave Port / GRT", "zone": "GRT"},
+                        {"etat": "CHARGEMENT_EFFECTUE", "ts": iso_fmt(h_charg), "lieu": "Raffinerie GRT Tamatave", "zone": "GRT"},
+                        {"etat": "TRANSIT_LIVRAISON", "ts": iso_fmt(h_charg + timedelta(hours=2)), "lieu": "RN2 Moramanga", "zone": "RN2"}
+                    ])
+                if est_dev:
+                    etapes.append({"etat": "DEVIATION_DETECTEE", "ts": iso_fmt(h_charg + timedelta(hours=3)), "lieu": f"Réorientation vers {depot_eff}", "zone": depot_eff})
+
+                mis = Mission(
+                    id=uid(),
+                    code_mission=f"MIS-{ot_num}",
+                    date_jour=auj,
+                    conducteur_id=c.id if c else None,
+                    vehicule_id=v.id,
+                    numero_mission_du_jour=1,
+                    statut=StatutMission.DEVIEE if est_dev else StatutMission.EN_COURS,
+                    statut_camion_actuel=statut_camion,
+                    depot_prevu=depot_dest,
+                    depot_effectif=depot_eff,
+                    est_deviee=est_dev,
+                    motif_deviation="Ordre distributeur changement dépôt" if est_dev else None,
+                    km_vide=km_v,
+                    km_charge=km_c,
+                    kilometrage_total=round(km_v + km_c, 1),
+                    kilometrage=round(km_v + km_c, 1),
+                    heure_debut=h_deb,
+                    heure_chargement=h_charg,
+                    numero_ot=ot_num,
+                    distributeur=dist,
+                    produit=prod,
+                    depot=depot_eff,
+                    origine="Base LSS — Antananarivo",
+                    etapes=etapes
+                )
+                db.add(mis)
+                db.flush()
+
+                # Sync sur le suivi du jour
+                suivi = db.scalar(select(SuiviJournalier).where(
+                    SuiviJournalier.date_jour == auj,
+                    SuiviJournalier.vehicule_id == v.id
+                ))
+                if suivi:
+                    suivi.mission_id = mis.id
+                    suivi.statut_camion = StatutCamion.CHARGE if est_charge else StatutCamion.VIDE
+                    suivi.numero_ot = ot_num
+                    suivi.distributeur = dist
+                    suivi.produit = prod
+                    suivi.depot_recepteur = depot_eff
+            log.info("Missions de démonstration seedées (passées et en cours)")
         db.commit()
     finally:
         db.close()

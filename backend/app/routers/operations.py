@@ -1,16 +1,17 @@
 """Module 2 — Suivi Journalier (cœur du système) et Module 3 — Missions."""
-from datetime import date
+from datetime import date, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from ..config import now_local
 from ..database import get_db
-from ..engine import (appliquer_champs_suivi, ensure_suivis_du_jour,
-                      get_seuils, prefill_positions_gps)
-from ..models import Mission, SuiviJournalier, Vehicule
+from ..engine import (appliquer_champs_suivi, ensure_suivi, ensure_suivis_du_jour,
+                      get_seuils, initialiser_ou_maj_mission, prefill_positions_gps)
+from ..models import (Conducteur, Infraction, Mission, StatutCamion,
+                      StatutMission, SuiviJournalier, Vehicule)
 from ..security import ECRITURE, TOUS, audit, require_roles
 from ..serializers import s_mission, s_suivi
 
@@ -212,18 +213,318 @@ def prefill_gps(date: str | None = None, db: Session = Depends(get_db),
 
 
 # ============================== MISSIONS ==============================
-@router.get("/missions")
-def liste_missions(date: str | None = None, statut: str | None = None,
-                   conducteur_id: str | None = None,
-                   db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
-    jour = _jour(date)
-    query = select(Mission).where(Mission.date_jour == jour)
-    if statut:
-        query = query.where(Mission.statut == statut)
+class MissionCreate(BaseModel):
+    vehicule_id: str
+    conducteur_id: str | None = None
+    numero_ot: str | None = None
+    distributeur: str | None = None
+    produit: str | None = None
+    depot_prevu: str | None = None
+    date_jour: str | None = None
+
+
+class MissionPatch(BaseModel):
+    numero_ot: str | None = None
+    distributeur: str | None = None
+    produit: str | None = None
+    depot_prevu: str | None = None
+    depot_effectif: str | None = None
+    est_deviee: bool | None = None
+    motif_deviation: str | None = None
+    statut: str | None = None  # EN_COURS, TERMINÉE, DÉVIÉE, RETARDÉE
+    statut_camion_actuel: str | None = None  # VIDE, CHARGÉ, LIBRE
+
+
+def _calculer_stats_missions(missions: list[Mission], db: Session) -> dict:
+    total = len(missions)
+    en_cours = [m for m in missions if m.statut == StatutMission.EN_COURS]
+    terminees = sum(1 for m in missions if m.statut == StatutMission.TERMINEE)
+    deviees = sum(1 for m in missions if m.statut == StatutMission.DEVIEE or getattr(m, "est_deviee", False))
+    retardees = sum(1 for m in missions if m.statut == StatutMission.RETARDEE)
+
+    nb_vide = sum(1 for m in en_cours if getattr(m, "statut_camion_actuel", "VIDE") == "VIDE")
+    nb_charge = sum(1 for m in en_cours if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE")
+
+    km_vide = sum(getattr(m, "km_vide", 0.0) or 0.0 for m in missions)
+    km_charge = sum(getattr(m, "km_charge", 0.0) or 0.0 for m in missions)
+    km_tot = sum(getattr(m, "kilometrage_total", 0.0) or (m.kilometrage or 0.0) or (getattr(m, "km_vide", 0.0) or 0.0) + (getattr(m, "km_charge", 0.0) or 0.0) for m in missions)
+
+    # Infractions
+    m_ids = [m.id for m in missions]
+    if m_ids:
+        nb_inf = db.scalar(
+            select(func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids),
+                   Infraction.validation != "INVALIDE")
+        ) or 0
+    else:
+        nb_inf = 0
+
+    return {
+        "total": total,
+        "en_cours": len(en_cours),
+        "nb_en_cours_vide": nb_vide,
+        "nb_en_cours_charge": nb_charge,
+        "terminees": terminees,
+        "deviees": deviees,
+        "retardees": retardees,
+        "km_vide": round(km_vide, 1),
+        "km_charge": round(km_charge, 1),
+        "km_total": round(km_tot, 1),
+        "nb_infractions": nb_inf,
+    }
+
+
+def _recuperer_missions_filtrees(db: Session, date_debut: str | None,
+                                 date_fin: str | None, statut: str | None,
+                                 conducteur_id: str | None, vehicule_id: str | None,
+                                 depot: str | None, distributeur: str | None,
+                                 q: str | None) -> tuple[date, date, list[Mission]]:
+    now = now_local()
+    fin = date.fromisoformat(date_fin) if date_fin else now.date()
+    debut = date.fromisoformat(date_debut) if date_debut else (fin - timedelta(days=30))
+
+    query = select(Mission).where(Mission.date_jour >= debut, Mission.date_jour <= fin)
+
+    if statut and statut != "TOUTES":
+        try:
+            st_enum = StatutMission(statut)
+            query = query.where(Mission.statut == st_enum)
+        except ValueError:
+            pass
+
     if conducteur_id:
         query = query.where(Mission.conducteur_id == conducteur_id)
-    missions = db.scalars(query.order_by(Mission.heure_debut)).all()
-    return {"date": jour.isoformat(), "missions": [s_mission(m) for m in missions]}
+    if vehicule_id:
+        query = query.where(Mission.vehicule_id == vehicule_id)
+    if distributeur:
+        query = query.where(Mission.distributeur == distributeur)
+    if depot:
+        depot_l = f"%{depot.lower()}%"
+        query = query.where(func.lower(Mission.depot_prevu).like(depot_l) |
+                            func.lower(Mission.depot_effectif).like(depot_l) |
+                            func.lower(Mission.depot).like(depot_l))
+
+    missions = db.scalars(query.order_by(Mission.date_jour.desc(), Mission.heure_debut.desc())).all()
+
+    if q and q.strip():
+        motif = q.strip().lower()
+        missions = [
+            m for m in missions
+            if motif in (m.code_mission or "").lower()
+            or motif in (m.numero_ot or "").lower()
+            or (m.vehicule and motif in m.vehicule.plaque.lower())
+            or (m.conducteur and (
+                motif in (m.conducteur.nom_prenom or "").lower()
+                or motif in (m.conducteur.prenom_usuel or "").lower()
+                or motif in (m.conducteur.matricule or "").lower()
+            ))
+        ]
+
+    return debut, fin, missions
+
+
+@router.get("/missions")
+def liste_missions(date_debut: str | None = None, date_fin: str | None = None,
+                   statut: str | None = None, conducteur_id: str | None = None,
+                   vehicule_id: str | None = None, depot: str | None = None,
+                   distributeur: str | None = None, q: str | None = None,
+                   date: str | None = None,  # compatibilité rétroactive
+                   db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    if date and not date_debut and not date_fin:
+        date_debut = date_fin = date
+
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+
+    stats = _calculer_stats_missions(missions, db)
+
+    # Récupération en lot des infractions par mission
+    m_ids = [m.id for m in missions]
+    inf_counts = {}
+    if m_ids:
+        rows = db.execute(
+            select(Infraction.mission_id, func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids), Infraction.validation != "INVALIDE")
+            .group_by(Infraction.mission_id)
+        ).all()
+        inf_counts = {r[0]: r[1] for r in rows}
+
+    return {
+        "date_debut": debut.isoformat(),
+        "date_fin": fin.isoformat(),
+        "stats": stats,
+        "missions": [s_mission(m, inf_counts.get(m.id, 0)) for m in missions],
+    }
+
+
+@router.post("/missions")
+def creer_mission(data: MissionCreate, db: Session = Depends(get_db),
+                  user=Depends(require_roles(*ECRITURE))):
+    """Option A : Attribution d'un OT / Création de mission depuis l'UI."""
+    vehicule = db.get(Vehicule, data.vehicule_id)
+    if not vehicule:
+        raise HTTPException(404, "Véhicule introuvable")
+
+    jour = date.fromisoformat(data.date_jour) if data.date_jour else now_local().date()
+    suivi = ensure_suivi(db, vehicule.id, jour)
+
+    if data.conducteur_id:
+        suivi.conducteur_id = data.conducteur_id
+
+    m = initialiser_ou_maj_mission(
+        db, suivi, vehicule,
+        numero_ot=data.numero_ot,
+        distributeur=data.distributeur,
+        produit=data.produit,
+        depot_prevu=data.depot_prevu,
+    )
+    audit(db, user, "mission.creation", "mission", m.id, {
+        "plaque": vehicule.plaque, "ot": data.numero_ot, "produit": data.produit,
+        "distributeur": data.distributeur, "depot": data.depot_prevu
+    })
+    db.commit()
+    return s_mission(m)
+
+
+@router.patch("/missions/{mid}")
+def modifier_mission(mid: str, data: MissionPatch, db: Session = Depends(get_db),
+                     user=Depends(require_roles(*ECRITURE))):
+    """Mise à jour / Forçage manuel de statut d'une mission."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    diffs = {}
+    for cle, val in data.model_dump(exclude_unset=True).items():
+        if val is None and cle not in ("motif_deviation", "depot_effectif"):
+            continue
+        if cle == "statut" and val:
+            try:
+                st_val = StatutMission(val)
+                if m.statut != st_val:
+                    diffs["statut"] = {"avant": m.statut.value, "apres": st_val.value}
+                    m.statut = st_val
+                    if st_val == StatutMission.TERMINEE:
+                        m.heure_fin = m.heure_fin or now_local()
+                        m.statut_camion_actuel = "LIBRE"
+                        if m.heure_debut:
+                            m.duree_s = int((m.heure_fin - m.heure_debut).total_seconds())
+                        # Détachement du suivi actif si présent
+                        suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+                        if suivi:
+                            suivi.statut_camion = StatutCamion.LIBRE
+                            suivi.mission_id = None
+            except ValueError:
+                pass
+            continue
+
+        if cle == "statut_camion_actuel" and val:
+            if m.statut_camion_actuel != val:
+                diffs["statut_camion_actuel"] = {"avant": m.statut_camion_actuel, "apres": val}
+                m.statut_camion_actuel = val
+                if val == "CHARGE":
+                    m.heure_chargement = m.heure_chargement or now_local()
+                elif val == "LIBRE":
+                    m.statut = StatutMission.TERMINEE
+                    m.heure_fin = m.heure_fin or now_local()
+                    if m.heure_debut:
+                        m.duree_s = int((m.heure_fin - m.heure_debut).total_seconds())
+                    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+                    if suivi:
+                        suivi.statut_camion = StatutCamion.LIBRE
+                        suivi.mission_id = None
+            continue
+
+        anc = getattr(m, cle, None)
+        if anc != val:
+            diffs[cle] = {"avant": anc, "apres": val}
+            setattr(m, cle, val)
+
+    if diffs:
+        audit(db, user, "mission.modification", "mission", m.id, diffs)
+        db.commit()
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("mission.update", s_mission(m))
+
+    return s_mission(m)
+
+
+@router.get("/missions/stats")
+def stats_missions(date_debut: str | None = None, date_fin: str | None = None,
+                   statut: str | None = None, conducteur_id: str | None = None,
+                   vehicule_id: str | None = None, depot: str | None = None,
+                   distributeur: str | None = None, q: str | None = None,
+                   db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+    stats = _calculer_stats_missions(missions, db)
+    return {"date_debut": debut.isoformat(), "date_fin": fin.isoformat(), "stats": stats}
+
+
+@router.get("/missions/export.xlsx")
+def export_missions_excel_endpoint(date_debut: str | None = None, date_fin: str | None = None,
+                                  statut: str | None = None, conducteur_id: str | None = None,
+                                  vehicule_id: str | None = None, depot: str | None = None,
+                                  distributeur: str | None = None, q: str | None = None,
+                                  db: Session = Depends(get_db),
+                                  user=Depends(require_roles(*TOUS))):
+    from ..exporters import export_missions_excel
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+
+    m_ids = [m.id for m in missions]
+    inf_counts = {}
+    if m_ids:
+        rows = db.execute(
+            select(Infraction.mission_id, func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids), Infraction.validation != "INVALIDE")
+            .group_by(Infraction.mission_id)
+        ).all()
+        inf_counts = {r[0]: r[1] for r in rows}
+
+    lignes = [s_mission(m, inf_counts.get(m.id, 0)) for m in missions]
+    titre_periode = f"du {debut:%d/%m/%Y} au {fin:%d/%m/%Y}"
+    audit(db, user, "mission.export_excel", "mission", titre_periode, {"nb_missions": len(lignes)})
+    db.commit()
+
+    contenu = export_missions_excel(titre_periode, lignes, utilisateur=user.nom_complet)
+    nom = f"Missions_{debut.isoformat()}_{fin.isoformat()}.xlsx"
+    return Response(contenu, media_type=XLSX_MIME,
+                    headers={"Content-Disposition": f"attachment; filename={nom}"})
+
+
+@router.get("/missions/export.pdf")
+def export_missions_pdf_endpoint(date_debut: str | None = None, date_fin: str | None = None,
+                                 statut: str | None = None, conducteur_id: str | None = None,
+                                 vehicule_id: str | None = None, depot: str | None = None,
+                                 distributeur: str | None = None, q: str | None = None,
+                                 db: Session = Depends(get_db),
+                                 user=Depends(require_roles(*TOUS))):
+    from ..exporters import export_missions_pdf
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+
+    m_ids = [m.id for m in missions]
+    inf_counts = {}
+    if m_ids:
+        rows = db.execute(
+            select(Infraction.mission_id, func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids), Infraction.validation != "INVALIDE")
+            .group_by(Infraction.mission_id)
+        ).all()
+        inf_counts = {r[0]: r[1] for r in rows}
+
+    lignes = [s_mission(m, inf_counts.get(m.id, 0)) for m in missions]
+    titre_periode = f"du {debut:%d/%m/%Y} au {fin:%d/%m/%Y}"
+    audit(db, user, "mission.export_pdf", "mission", titre_periode, {"nb_missions": len(lignes)})
+    db.commit()
+
+    contenu = export_missions_pdf(titre_periode, lignes, utilisateur=user.nom_complet)
+    nom = f"Missions_{debut.isoformat()}_{fin.isoformat()}.pdf"
+    return Response(contenu, media_type="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename={nom}"})
 
 
 @router.get("/missions/jour/{date_param}")

@@ -28,13 +28,15 @@ const iso = (d: Date) =>
 function presets() {
   const maintenant = new Date();
   const auj = iso(maintenant);
+  const j31 = new Date(maintenant); j31.setDate(j31.getDate() - 30);
   const j7 = new Date(maintenant); j7.setDate(j7.getDate() - 6);
   const debutMois = new Date(maintenant.getFullYear(), maintenant.getMonth(), 1);
   const debutMoisPrec = new Date(maintenant.getFullYear(), maintenant.getMonth() - 1, 1);
   const finMoisPrec = new Date(maintenant.getFullYear(), maintenant.getMonth(), 0);
   return [
-    { id: "jour", label: "Aujourd'hui", du: auj, au: auj },
+    { id: "31j", label: "31 derniers jours (Défaut)", du: iso(j31), au: auj },
     { id: "7j", label: "7 derniers jours", du: iso(j7), au: auj },
+    { id: "jour", label: "Aujourd'hui", du: auj, au: auj },
     { id: "mois", label: "Ce mois-ci", du: iso(debutMois), au: auj },
     { id: "mois_prec", label: "Mois dernier", du: iso(debutMoisPrec), au: iso(finMoisPrec) },
   ];
@@ -74,8 +76,8 @@ export default function Historique() {
   const [onglet, setOnglet] = useState<Onglet>("suivi");
   const [params, setParams] = useSearchParams();
   const P = useMemo(presets, []);
-  const [du, setDu] = useState(params.get("du") || P[2].du);   // défaut : ce mois-ci
-  const [au, setAu] = useState(params.get("au") || P[2].au);
+  const [du, setDu] = useState(params.get("du") || P[0].du);   // défaut : 31 jours glissants (P[0])
+  const [au, setAu] = useState(params.get("au") || P[0].au);
   const [q, setQ] = useState("");
   const [data, setData] = useState<any | null>(null);
   const [stats, setStats] = useState<any | null>(null);
@@ -183,40 +185,82 @@ export default function Historique() {
       {onglet === "suivi" && (
         <>
           {/* ------- sélecteur de plage de dates (§4.3) ------- */}
-          <Card className="!p-3" titre="">
-            <div className="flex flex-wrap items-center gap-2">
-              <Icon nom="calendrier" className="h-4 w-4 text-slate-400" />
-              <span className="text-[12px] font-semibold text-slate-400">Du</span>
-              <input type="date" value={du} max={todayISO()} className={inputDate}
-                onChange={(e) => changerPlage(e.target.value, au)} />
-              <span className="text-[12px] font-semibold text-slate-400">Au</span>
-              <input type="date" value={au} max={todayISO()} className={inputDate}
-                onChange={(e) => changerPlage(du, e.target.value)} />
-              <div className="mx-1 h-5 w-px bg-slate-200 dark:bg-slate-700" />
-              {P.map((p) => (
-                <button key={p.id} onClick={() => changerPlage(p.du, p.au)}
-                  className={cls("rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
-                    raccourciActif === p.id
-                      ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                      : "border-slate-200 dark:border-slate-700 text-slate-400 hover:border-slate-400")}>
-                  {p.label}
-                </button>
-              ))}
-              {raccourciActif === "custom" && (
-                <span className="rounded-full border border-violet-500 bg-violet-500/10 px-3 py-1 text-[12px] font-medium text-violet-500">
-                  Personnalisé
-                </span>
-              )}
-              <div className="ml-auto flex items-center gap-2">
-                <input value={q} onChange={(e) => setQ(e.target.value)}
+          <Card className="!p-3 bg-slate-50/50 dark:bg-slate-900/40" titre="">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* Sélecteurs Début & Fin distincts et labellisés */}
+                <div className="flex items-center gap-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-1 shadow-sm">
+                  <Icon nom="calendrier" className="h-4 w-4 text-blue-500" />
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Date début :</span>
+                    <input
+                      type="date"
+                      value={du}
+                      max={au || todayISO()}
+                      className="bg-transparent text-[13px] font-medium text-slate-800 dark:text-slate-100 outline-none cursor-pointer"
+                      onChange={(e) => changerPlage(e.target.value, au)}
+                    />
+                  </div>
+                  <span className="text-slate-300 dark:text-slate-600 font-bold px-0.5">➔</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Date fin :</span>
+                    <input
+                      type="date"
+                      value={au}
+                      min={du}
+                      max={todayISO()}
+                      className="bg-transparent text-[13px] font-medium text-slate-800 dark:text-slate-100 outline-none cursor-pointer"
+                      onChange={(e) => changerPlage(du, e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="mx-0.5 h-6 w-px bg-slate-200 dark:bg-slate-700 hidden sm:block" />
+
+                {/* Raccourcis rapides */}
+                <div className="flex flex-wrap items-center gap-1">
+                  {P.map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={() => changerPlage(p.du, p.au)}
+                      className={cls(
+                        "rounded-md border px-2.5 py-1 text-[12px] font-medium transition-colors",
+                        raccourciActif === p.id
+                          ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold"
+                          : "border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-400"
+                      )}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                  {raccourciActif === "custom" && (
+                    <span className="rounded-md border border-violet-500 bg-violet-500/10 px-2.5 py-1 text-[12px] font-semibold text-violet-500">
+                      Plage personnalisée
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Recherche et exports */}
+              <div className="flex items-center gap-2">
+                <input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
                   placeholder="Rechercher (chauffeur, plaque)…"
-                  className="w-52 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px]" />
-                <Btn variante="secondaire" onClick={() => exporter("xlsx")}
-                  title="§4.4 — une feuille par jour (JJ-MM-AAAA) + feuille Synthèse, format identique au Suivi Journalier">
+                  className="w-52 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px] shadow-sm"
+                />
+                <Btn
+                  variante="secondaire"
+                  onClick={() => exporter("xlsx")}
+                  title="§4.4 — une feuille par jour (JJ-MM-AAAA) + feuille Synthèse, format identique au Suivi Journalier"
+                >
                   <Icon nom="telecharger" /> Excel
                 </Btn>
-                <Btn variante="secondaire" onClick={() => exporter("pdf")}
-                  title="§4.4 — page de garde + une section par jour, format identique au Suivi Journalier">
+                <Btn
+                  variante="secondaire"
+                  onClick={() => exporter("pdf")}
+                  title="§4.4 — page de garde + une section par jour, format identique au Suivi Journalier"
+                >
                   <Icon nom="telecharger" /> PDF
                 </Btn>
               </div>

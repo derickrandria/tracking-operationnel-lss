@@ -15,6 +15,13 @@ const COULEURS_STATUT: Record<string, string> = {
   INACTIF: "bg-slate-500/15 text-slate-500 border-slate-500/40",
 };
 
+const COULEURS_STATUT_OP: Record<string, string> = {
+  "En mission (Vide)": "bg-sky-500/15 text-sky-600 dark:text-sky-400 border-sky-500/40",
+  "En mission (Chargé)": "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/40",
+  "Disponible": "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/40",
+  "En repos": "bg-slate-500/15 text-slate-600 dark:text-slate-400 border-slate-500/40",
+};
+
 export default function Conducteurs() {
   const [params] = useSearchParams();
   const [items, setItems] = useState<Conducteur[] | null>(null);
@@ -189,7 +196,8 @@ export default function Conducteurs() {
                 <th>Alias connus</th>
                 <th>Téléphone</th>
                 <th>Véhicule affecté</th>
-                <th>Statut</th>
+                <th>Activité Opérationnelle</th>
+                <th>Statut Fiche</th>
                 <th>Créé le</th>
                 {ecriture && <th className="w-36 text-center">Actions</th>}
               </tr></thead>
@@ -226,6 +234,15 @@ export default function Conducteurs() {
                       </td>
                       <td className="tabular-nums text-[12.5px]">{c.telephone || <span className="text-slate-400">non renseigné</span>}</td>
                       <td>{c.vehicule_plaque ? <Badge>{c.vehicule_plaque}</Badge> : <span className="text-slate-400">—</span>}</td>
+                      <td>
+                        {c.statut_operationnel ? (
+                          <Badge couleur={COULEURS_STATUT_OP[c.statut_operationnel] || "bg-slate-500/15 text-slate-500"}>
+                            {c.statut_operationnel}
+                          </Badge>
+                        ) : (
+                          <span className="text-slate-400 text-[11px]">—</span>
+                        )}
+                      </td>
                       <td><Badge couleur={COULEURS_STATUT[c.statut]}>{c.statut}</Badge></td>
                       <td className="text-[12px] text-slate-400">{c.date_creation?.slice(0, 10).split("-").reverse().join("/")}</td>
                       {ecriture && (
