@@ -20,7 +20,7 @@ export default function Conducteurs() {
   const [items, setItems] = useState<Conducteur[] | null>(null);
   const [q, setQ] = useState(params.get("q") || "");
   const [statut, setStatut] = useState("");
-  const [filtreType, setFiltreType] = useState<"TOUS" | "MZONEX" | "CAMTRACK" | "AUTO">("TOUS");
+  const [filtreType, setFiltreType] = useState<"TOUS" | "MZONEX" | "CAMTRACK">("TOUS");
   const [tri, setTri] = useState<"prenom_usuel" | "nom_prenom" | "matricule">("prenom_usuel");
   const [form, setForm] = useState<Partial<Conducteur> | null>(null);
   const [fusionSource, setFusionSource] = useState<Conducteur | null>(null);
@@ -107,7 +107,6 @@ export default function Conducteurs() {
       addToast({ type: "succes", titre: "Alias ajouté" });
       setNouvelAlias("");
       charger();
-      // Mettre à jour form localement si ouvert
       if (form && form.id === cid) {
         const frais = (items || []).find((x) => x.id === cid);
         if (frais) setForm(frais);
@@ -134,15 +133,17 @@ export default function Conducteurs() {
   }
 
   const listeFiltree = (items || []).filter((c) => {
-    if (filtreType === "MZONEX") return !!c.code_badge_mzonex || (c.matricule && !c.matricule.startsWith("AUTO-"));
-    if (filtreType === "CAMTRACK") return !c.code_badge_mzonex && !c.matricule;
-    if (filtreType === "AUTO") return c.matricule?.startsWith("AUTO-");
+    const code = c.code_badge_mzonex || c.matricule;
+    if (filtreType === "MZONEX") return !!code;
+    if (filtreType === "CAMTRACK") return !code;
     return true;
   });
 
   const liste = listeFiltree.slice().sort((a, b) => {
     if (tri === "matricule") {
-      return (a.matricule || a.code_badge_mzonex?.toString() || "").localeCompare(b.matricule || b.code_badge_mzonex?.toString() || "");
+      const codeA = a.code_badge_mzonex?.toString() || a.matricule || "";
+      const codeB = b.code_badge_mzonex?.toString() || b.matricule || "";
+      return codeA.localeCompare(codeB);
     }
     return (a[tri] || "").localeCompare(b[tri] || "");
   });
@@ -159,15 +160,14 @@ export default function Conducteurs() {
             {["ACTIF", "SUSPENDU", "CONGÉ", "INACTIF"].map((s) => <option key={s}>{s}</option>)}
           </select>
           <select value={filtreType} onChange={(e) => setFiltreType(e.target.value as any)} className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-[13px]">
-            <option value="TOUS">Toutes flottes</option>
-            <option value="MZONEX">MZoneX (avec code)</option>
+            <option value="TOUS">Tous les chauffeurs</option>
+            <option value="MZONEX">MZoneX (avec driverKeyCode)</option>
             <option value="CAMTRACK">CamtrackPro (sans code)</option>
-            <option value="AUTO">Découvertes auto (AUTO-)</option>
           </select>
           <select value={tri} onChange={(e) => setTri(e.target.value as any)} className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2 py-1.5 text-[13px]">
             <option value="prenom_usuel">Trier : prénom usuel</option>
             <option value="nom_prenom">Trier : nom complet</option>
-            <option value="matricule">Trier : matricule / code</option>
+            <option value="matricule">Trier : driverKeyCode</option>
           </select>
           {ecriture && (
             <Btn onClick={() => setForm({ statut: "ACTIF" })}><Icon nom="plus" /> Ajouter</Btn>
@@ -183,7 +183,7 @@ export default function Conducteurs() {
           <div>
             <table className="table-pro">
               <thead><tr>
-                <th>Code / Matricule</th>
+                <th>driverKeyCode</th>
                 <th>Nom et Prénom (complet)</th>
                 <th>Prénom usuel</th>
                 <th>Alias connus</th>
@@ -195,21 +195,16 @@ export default function Conducteurs() {
               </tr></thead>
               <tbody>
                 {liste.map((c) => {
-                  const estAuto = c.matricule?.startsWith("AUTO-");
-                  const aCodeMzonex = c.code_badge_mzonex || (c.matricule && !estAuto);
+                  const codeAffiche = c.code_badge_mzonex || (c.matricule && !c.matricule.startsWith("CH") && !c.matricule.startsWith("AUTO-") ? c.matricule : null);
                   return (
-                    <tr key={c.id} className={estAuto ? "bg-amber-500/5 dark:bg-amber-500/10" : ""}>
+                    <tr key={c.id}>
                       <td className="font-mono text-[12px]">
-                        {estAuto ? (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11px] font-semibold bg-amber-500/15 text-amber-600 border border-amber-500/30">
-                            ⚠️ {c.matricule}
-                          </span>
-                        ) : aCodeMzonex ? (
-                          <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[11.5px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
-                            {c.matricule || c.code_badge_mzonex}
+                        {codeAffiche ? (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11.5px] font-semibold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20">
+                            {codeAffiche}
                           </span>
                         ) : (
-                          <span className="text-slate-400 italic text-[11.5px]">— (Camtrack)</span>
+                          <span className="text-slate-400 italic text-[11.5px]">—</span>
                         )}
                       </td>
                       <td>
@@ -277,9 +272,14 @@ export default function Conducteurs() {
               </Champ>
             </div>
             <div className="grid grid-cols-2 gap-3">
-              <Champ label="Matricule / Code (laisser vide si Camtrack)">
-                <input className={inputCls} value={form.matricule || ""} placeholder="Ex. CH017 ou 10583 (vide pour Camtrack)"
-                  onChange={(e) => setForm({ ...form, matricule: e.target.value })} />
+              <Champ label="driverKeyCode MZoneX (laisser vide si CamtrackPro)">
+                <input type="number" className={inputCls} value={form.code_badge_mzonex ?? (form.matricule && !isNaN(Number(form.matricule)) ? Number(form.matricule) : "")}
+                  placeholder="Ex. 10583 (laisser vide pour CamtrackPro)"
+                  onChange={(e) => {
+                    const val = e.target.value.trim();
+                    const num = val ? parseInt(val, 10) : null;
+                    setForm({ ...form, code_badge_mzonex: num, matricule: val || null });
+                  }} />
               </Champ>
               <Champ label="Statut">
                 <select className={inputCls} value={form.statut || "ACTIF"}
@@ -335,19 +335,19 @@ export default function Conducteurs() {
             <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg text-[12.5px] text-amber-800 dark:text-amber-300">
               <div className="font-bold mb-1">Chauffeur source à fusionner :</div>
               <div>• Nom : <strong>{fusionSource.nom_prenom}</strong></div>
-              <div>• Matricule/Code : <strong>{fusionSource.matricule || "—"}</strong></div>
+              <div>• driverKeyCode : <strong>{fusionSource.code_badge_mzonex || fusionSource.matricule || "—"}</strong></div>
               <div>• Véhicule affecté : <strong>{fusionSource.vehicule_plaque || "Aucun"}</strong></div>
             </div>
 
-            <Champ label="Chauffeur officiel cible (destinataire de tous les trajets/suivis)">
+            <Champ label="Chauffeur cible (destinataire de tous les trajets/suivis)">
               <select required className={inputCls} value={fusionCibleId} onChange={(e) => setFusionCibleId(e.target.value)}>
-                <option value="">Sélectionner le chauffeur officiel…</option>
+                <option value="">Sélectionner le chauffeur cible…</option>
                 {(items || [])
                   .filter((c) => c.id !== fusionSource.id)
                   .sort((a, b) => a.nom_prenom.localeCompare(b.nom_prenom))
                   .map((c) => (
                     <option key={c.id} value={c.id}>
-                      {c.nom_prenom} {c.matricule ? `(${c.matricule})` : "(Camtrack)"}
+                      {c.nom_prenom} {c.code_badge_mzonex || c.matricule ? `[Code: ${c.code_badge_mzonex || c.matricule}]` : ""}
                     </option>
                   ))}
               </select>
@@ -362,7 +362,7 @@ export default function Conducteurs() {
             </div>
 
             <div className="text-[11.5px] text-slate-500 dark:text-slate-400">
-              ℹ️ Après la fusion, la fiche source sera supprimée. Tous les trajets, temps de conduite, infractions et suivis seront immédiatement réassignés au chauffeur officiel cible.
+              ℹ️ Après la fusion, la fiche source sera supprimée. Tous les trajets, temps de conduite, infractions et suivis seront immédiatement réassignés au chauffeur cible.
             </div>
 
             <div className="flex justify-end gap-2 pt-2">

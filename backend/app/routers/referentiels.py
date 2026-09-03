@@ -91,15 +91,6 @@ def liste_conducteurs(q: str | None = None, statut: str | None = None,
     return [{**s_conducteur(c), "vehicule_plaque": plaques.get(c.id)} for c in conducteurs]
 
 
-def _prochain_matricule(db: Session) -> str:
-    n = db.scalar(select(func.count(Conducteur.id))) or 0
-    while True:
-        n += 1
-        m = f"CH{n:03d}"
-        if not db.scalar(select(Conducteur).where(Conducteur.matricule == m)):
-            return m
-
-
 @router.post("/conducteurs", status_code=status.HTTP_201_CREATED)
 def creer_conducteur(data: ConducteurIn, db: Session = Depends(get_db),
                      user=Depends(require_roles(*ECRITURE))):
@@ -112,7 +103,7 @@ def creer_conducteur(data: ConducteurIn, db: Session = Depends(get_db),
     if db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == norm)):
         raise HTTPException(409, "Ce libellé est déjà enregistré comme alias pour un autre chauffeur")
 
-    # Code badge MZoneX / matricule
+    # Code badge MZoneX (driverKeyCode) / matricule
     badge_code = data.code_badge_mzonex
     mat = (data.matricule or "").strip() or (str(badge_code) if badge_code else None)
     if mat and db.scalar(select(Conducteur).where(Conducteur.matricule == mat)):
@@ -130,6 +121,15 @@ def creer_conducteur(data: ConducteurIn, db: Session = Depends(get_db),
         tokens_set=tset)
     db.add(c)
     db.flush()
+
+    # Propagation automatique du driverKeyCode aux homonymes sémantiques (même tokens_set)
+    if c.code_badge_mzonex and tset:
+        for c_hom in db.scalars(select(Conducteur).where(
+                Conducteur.tokens_set == tset,
+                Conducteur.code_badge_mzonex.is_(None))).all():
+            c_hom.code_badge_mzonex = c.code_badge_mzonex
+            c_hom.matricule = str(c.code_badge_mzonex)
+
     audit(db, user, "conducteur.creation", "conducteur", c.id, {"apres": s_conducteur(c)})
     db.commit()
     publish("referentiels.changed", {"entite": "conducteur", "action": "creation", "id": c.id})
@@ -167,6 +167,17 @@ def modifier_conducteur(cid: str, data: ConducteurPatch, db: Session = Depends(g
         if badge and db.scalar(select(Conducteur).where(Conducteur.code_badge_mzonex == badge, Conducteur.id != cid)):
             raise HTTPException(409, "Code badge MZoneX déjà utilisé")
         c.code_badge_mzonex = badge
+        if badge and not c.matricule:
+            c.matricule = str(badge)
+
+    # Propagation automatique du code badge aux homonymes sémantiques (même tokens_set)
+    if c.code_badge_mzonex and c.tokens_set:
+        for c_hom in db.scalars(select(Conducteur).where(
+                Conducteur.tokens_set == c.tokens_set,
+                Conducteur.id != c.id,
+                Conducteur.code_badge_mzonex.is_(None))).all():
+            c_hom.code_badge_mzonex = c.code_badge_mzonex
+            c_hom.matricule = str(c.code_badge_mzonex)
 
     for champ, val in donnees.items():
         if champ in ("matricule", "code_badge_mzonex"):
@@ -382,6 +393,16 @@ def modifier_vehicule(vid: str, data: VehiculePatch, db: Session = Depends(get_d
 
     # --- synchronisation immédiate vers le Suivi Journalier (§9) ----------
     if changement_conducteur:
+        if v.conducteur_actuel_id:
+            cond = db.get(Conducteur, v.conducteur_actuel_id)
+            if cond and cond.tokens_set and cond.code_badge_mzonex:
+                for c_hom in db.scalars(select(Conducteur).where(
+                        Conducteur.tokens_set == cond.tokens_set,
+                        Conducteur.id != cond.id,
+                        Conducteur.code_badge_mzonex.is_(None))).all():
+                    c_hom.code_badge_mzonex = cond.code_badge_mzonex
+                    c_hom.matricule = str(cond.code_badge_mzonex)
+
         suivi = db.scalar(select(SuiviJournalier).where(
             SuiviJournalier.vehicule_id == vid, SuiviJournalier.date_jour == now_local().date()))
         if suivi:

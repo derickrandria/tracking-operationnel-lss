@@ -1495,6 +1495,14 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
         ex_badge = db.scalar(select(Conducteur).where(
             (Conducteur.code_badge_mzonex == badge_code) | (Conducteur.matricule == str(badge_code))))
         if ex_badge is not None:
+            tset_badge = ex_badge.tokens_set or (calculer_tokens_set(ex_badge.nom_prenom)[:170] if ex_badge.nom_prenom else "")
+            if tset_badge:
+                for c_hom in db.scalars(select(Conducteur).where(
+                        Conducteur.tokens_set == tset_badge,
+                        Conducteur.id != ex_badge.id,
+                        Conducteur.code_badge_mzonex.is_(None))).all():
+                    c_hom.code_badge_mzonex = badge_code
+                    c_hom.matricule = str(badge_code)
             if nom and len(nom) >= 3:
                 cible = normaliser_libelle(nom)[:170]
                 if cible and cible != ex_badge.nom_normalise:
@@ -1562,24 +1570,34 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
             existant.code_badge_mzonex = badge_code
             if not existant.matricule:
                 existant.matricule = str(badge_code)
+        # Propagation automatique du code badge aux fiches ayant le même tokens_set
+        if existant.code_badge_mzonex and existant.tokens_set:
+            for c_hom in db.scalars(select(Conducteur).where(
+                    Conducteur.tokens_set == existant.tokens_set,
+                    Conducteur.code_badge_mzonex.is_(None))).all():
+                c_hom.code_badge_mzonex = existant.code_badge_mzonex
+                c_hom.matricule = str(existant.code_badge_mzonex)
         return existant
 
     # Échelon 6 : Création nouvelle fiche
-    import uuid as _uuid
     tokens = nom.split()
     prenom_usuel = tokens[1] if tokens[0].isupper() and len(tokens) > 1 else tokens[-1]
-    if badge_code and badge_code > 0:
-        matricule = str(badge_code)
-    elif plateforme == "CAMTRACKPRO":
-        matricule = None
-    else:
-        matricule = f"AUTO-{_uuid.uuid4().hex[:8].upper()}"
+    matricule = str(badge_code) if (badge_code and badge_code > 0) else None
 
     c = Conducteur(nom_prenom=nom, prenom_usuel=prenom_usuel.capitalize(),
                    matricule=matricule, code_badge_mzonex=badge_code if (badge_code and badge_code > 0) else None,
                    nom_normalise=cible, tokens_set=tset)
     db.add(c)
     db.flush()
+
+    # Propagation automatique du code badge aux homonymes sémantiques (même tokens_set)
+    if c.code_badge_mzonex and tset:
+        for c_hom in db.scalars(select(Conducteur).where(
+                Conducteur.tokens_set == tset,
+                Conducteur.code_badge_mzonex.is_(None))).all():
+            c_hom.code_badge_mzonex = c.code_badge_mzonex
+            c_hom.matricule = str(c.code_badge_mzonex)
+
     creer_alerte(
         db, TypeAlerte.NOUVEAU_CONDUCTEUR, GraviteAlerte.INFORMATION,
         f"Nouveau chauffeur détecté sur les relevés : {nom} — fiche créée "
@@ -1640,7 +1658,21 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
     """B2 — le badge fait foi sur le chauffeur du JOUR (grille Parties A) :
     l'attribution « MANUEL » n'est jamais écrasée ; une attribution « BADGE »
     (ou absente) suit le dernier badge valide publié. Idempotent, audité au
-    changement seulement (les lignes reviennent à chaque sync Niveau 2)."""
+    changement seulement (les lignes reviennent à chaque sync Niveau 2).
+    Auto-assignation du véhicule + propagation du driverKeyCode via tokens_set."""
+    if suivi.vehicule_id:
+        vehicule = db.get(Vehicule, suivi.vehicule_id)
+        if vehicule and vehicule.conducteur_actuel_id != fiche.id:
+            vehicule.conducteur_actuel_id = fiche.id
+
+    # Propagation automatique du code badge aux homonymes sémantiques (même tokens_set)
+    if fiche.code_badge_mzonex and fiche.tokens_set:
+        for c_hom in db.scalars(select(Conducteur).where(
+                Conducteur.tokens_set == fiche.tokens_set,
+                Conducteur.code_badge_mzonex.is_(None))).all():
+            c_hom.code_badge_mzonex = fiche.code_badge_mzonex
+            c_hom.matricule = str(fiche.code_badge_mzonex)
+
     if getattr(suivi, "conducteur_origine", None) == "MANUEL":
         return
     if suivi.conducteur_id == fiche.id and suivi.conducteur_origine == "BADGE":

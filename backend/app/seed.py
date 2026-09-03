@@ -9,6 +9,7 @@ import random
 
 from sqlalchemy import func, select
 
+from .config import calculer_tokens_set, normaliser_libelle
 from .database import SessionLocal, Base, engine as _engine
 from .engine import SEUILS_DEFAUT
 from .models import (Conducteur, ParametrageSeuil, Role, SituationCamion, User,
@@ -192,7 +193,10 @@ def seed_si_vide():
                 elif i == 54:
                     statut = "SUSPENDU"
                 c = Conducteur(nom_prenom=nom, prenom_usuel=usuel,
-                               matricule=f"CH{i:03d}", telephone=tel, statut=statut)
+                               matricule=None, code_badge_mzonex=None,
+                               nom_normalise=normaliser_libelle(nom),
+                               tokens_set=calculer_tokens_set(nom),
+                               telephone=tel, statut=statut)
                 db.add(c)
                 conducteurs.append(c)
             db.flush()
@@ -203,12 +207,24 @@ def seed_si_vide():
                 if plaque in ("0926TBV", "5716TBS"):
                     statut = "MAINTENANCE"
                 conducteur = disponibles[i] if i < len(disponibles) else None
+                est_camtrack = plaque in VEHICULES_CAMTRACKPRO
+                plateforme_gps = "CAMTRACKPRO" if est_camtrack else "MZONEX"
+                if conducteur:
+                    if not est_camtrack:
+                        # Flotte MZoneX : driverKeyCode officiel (numérique)
+                        badge_code = 10000 + i
+                        conducteur.code_badge_mzonex = badge_code
+                        conducteur.matricule = str(badge_code)
+                    else:
+                        # Flotte CamtrackPro : code vide
+                        conducteur.code_badge_mzonex = None
+                        conducteur.matricule = None
+
                 db.add(Vehicule(
                     plaque=plaque, description=desc, marque=MARQUES[i % len(MARQUES)],
                     capacite=CAPACITES[i % len(CAPACITES)], statut=statut,
                     gps_associe=f"OBC-{plaque}",
-                    plateforme_gps=("CAMTRACKPRO" if plaque in VEHICULES_CAMTRACKPRO
-                                    else "MZONEX"),
+                    plateforme_gps=plateforme_gps,
                     conducteur_actuel_id=conducteur.id if conducteur else None))
             log.info("Référentiels seedés : %d véhicules, %d chauffeurs, %d situations",
                      len(VEHICULES), len(CHAUFFEURS), len(SITUATIONS))

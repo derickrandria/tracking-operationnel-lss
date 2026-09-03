@@ -206,6 +206,9 @@ def migrer_schema():
                         "ON conducteur_aliases (conducteur_id)"))
         cx.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_conducteur_aliases_normalise "
                         "ON conducteur_aliases (alias_normalise)"))
+        # Purge des préfixes hérités 'CH...' ou 'AUTO-...' : seuls les driverKeyCode MZoneX sont conservés
+        cx.execute(text("UPDATE conducteurs SET matricule = NULL WHERE matricule LIKE 'CH%' OR matricule LIKE 'AUTO-%'"))
+        cx.execute(text("UPDATE conducteurs SET matricule = CAST(code_badge_mzonex AS TEXT) WHERE code_badge_mzonex IS NOT NULL AND (matricule IS NULL OR matricule = '')"))
         # §0decies (24/08/2026) : marqueur segment B d'un trajet franchissant
         # minuit (revérification portail sans faux « sans source »)
         if "suite_minuit" not in cols_t:

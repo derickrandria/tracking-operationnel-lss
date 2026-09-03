@@ -72,12 +72,12 @@ check("Alias permanent automatique créé pour la variante inversée",
       alias_cree is not None and alias_cree.conducteur_id == c_t1.id)
 
 print("\n[T2] Test Inclusion de patronyme (Nom court dans Nom long)")
-# CH017 dans seed_si_vide() est "RAKOTOMALALA Johnny horlando"
-# Ingestion de "RAKOTOMALALA Johnny" -> doit être rattaché par inclusion à CH017
-c_ch017 = db.scalar(select(Conducteur).where(Conducteur.matricule == "CH017"))
+# Dans seed_si_vide(), "RAKOTOMALALA Johnny horlando" est présent
+# Ingestion de "RAKOTOMALALA Johnny" -> doit être rattaché par inclusion à "RAKOTOMALALA Johnny horlando"
+c_johnny = db.scalar(select(Conducteur).where(Conducteur.nom_prenom.ilike("%RAKOTOMALALA Johnny horlando%")))
 c_inc = creer_conducteur_auto(db, "RAKOTOMALALA Johnny")
-check("Nom court 'RAKOTOMALALA Johnny' rattaché par inclusion à CH017 'RAKOTOMALALA Johnny horlando'",
-      c_inc is not None and c_inc.id == c_ch017.id)
+check("Nom court 'RAKOTOMALALA Johnny' rattaché par inclusion à 'RAKOTOMALALA Johnny horlando'",
+      c_inc is not None and c_johnny is not None and c_inc.id == c_johnny.id)
 
 print("\n[T3] Test driverKeyCode MZoneX vs CamtrackPro")
 # MZoneX avec badge_code 9988
@@ -96,6 +96,29 @@ c_camtrack = creer_conducteur_auto(db, "RABENJANAHARY Patrick", badge_code=None,
 db.commit()
 check("Création chauffeur CamtrackPro sans code (matricule vide)",
       c_camtrack is not None and c_camtrack.code_badge_mzonex is None and c_camtrack.matricule is None)
+
+# Test synchronisation automatique driverKeyCode par tokens_set
+print("\n[T3b] Test synchronisation automatique driverKeyCode par tokens_set")
+# On crée un chauffeur sans badge
+c_homonyme = Conducteur(nom_prenom="Patrick RABENJANAHARY", prenom_usuel="PATRICK",
+                        matricule=None, code_badge_mzonex=None,
+                        nom_normalise=normaliser_libelle("Patrick RABENJANAHARY"),
+                        tokens_set=calculer_tokens_set("Patrick RABENJANAHARY"),
+                        statut=StatutConducteur.ACTIF)
+db.add(c_homonyme)
+db.commit()
+
+# On attribue un driverKeyCode à la fiche c_camtrack
+c_camtrack.code_badge_mzonex = 54321
+c_camtrack.matricule = "54321"
+db.commit()
+# Appel de creer_conducteur_auto ou modification via referentiel
+creer_conducteur_auto(db, "RABENJANAHARY Patrick", badge_code=54321, plateforme="MZONEX")
+db.commit()
+
+db.refresh(c_homonyme)
+check("driverKeyCode 54321 synchronisé automatiquement sur l'homonyme 'Patrick RABENJANAHARY' via tokens_set",
+      c_homonyme.code_badge_mzonex == 54321 and c_homonyme.matricule == "54321")
 
 print("\n[T4] Test API REST Fusion de chauffeurs")
 client = TestClient(app)
