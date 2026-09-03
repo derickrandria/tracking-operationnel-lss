@@ -62,6 +62,10 @@ def test_missions_complet():
     aujourd = date.today()
     maintenant = datetime.combine(aujourd, time(6, 0))
 
+    # Réinitialisation des missions pour le test unitaire isolé
+    db.query(Mission).delete()
+    db.commit()
+
     # Récupération d'un véhicule et d'un chauffeur
     v = db.scalar(select(Vehicule).where(Vehicule.statut == StatutVehicule.ACTIF))
     c = db.scalar(select(Conducteur).where(Conducteur.statut == StatutConducteur.ACTIF))
@@ -69,12 +73,14 @@ def test_missions_complet():
 
     suivi = ensure_suivi(db, v.id, aujourd)
     suivi.conducteur_id = c.id
+    suivi.mission_id = None
+    suivi.statut_camion = StatutCamion.LIBRE
     db.commit()
 
     # -------------------------------------------------------------------------
     # 1. Test Attribution d'OT (Option A) & Création Mission
     # -------------------------------------------------------------------------
-    print("\n[T1] Attribution OT & Démarrage Mission (Option A)")
+    print("\n[T1] Attribution OT (Préparation administrative, heure_debut non déclenchée)")
     m = initialiser_ou_maj_mission(
         db, suivi, v,
         numero_ot="OT-99881",
@@ -89,21 +95,28 @@ def test_missions_complet():
     assert m.code_mission == "MIS-OT-99881"
     assert m.statut == StatutMission.EN_COURS
     assert m.statut_camion_actuel == "VIDE"
+    assert m.heure_debut is None, "La date_debut ne doit pas être définie administrativement lors de l'attribution OT"
     assert suivi.statut_camion == StatutCamion.VIDE
     assert suivi.mission_id == m.id
     assert suivi.numero_ot == "OT-99881"
     assert len(m.etapes) >= 1
     print("  ✅ Mission créée avec code MIS-OT-99881")
     print("  ✅ Statut camion basculé automatiquement à VIDE")
+    print("  ✅ Heure de début de mission reste None (en attente départ physique base)")
 
     # -------------------------------------------------------------------------
-    # 2. Test Ingestion GPS & Calcul Kilométrage à VIDE
+    # 2. Test Départ Physique Base & Déclenchement Réel Heure Début
     # -------------------------------------------------------------------------
-    print("\n[T2] Roulage à VIDE vers Tamatave (km_vide)")
-    # Simulation départ Base Tana -> RN2 vers Tamatave
+    print("\n[T2] Sortie physique Base Tana & Roulage à VIDE vers Tamatave (km_vide)")
+    # Simulation départ physique Base Tana -> RN2 vers Tamatave
     t_ev1 = maintenant + timedelta(minutes=30)
-    ingest_event(db, v, t_ev1, -18.8792, 47.5079, "Base LSS — Antananarivo", 40.0, "ON", source="SIMULATEUR")
+    ingest_event(db, v, t_ev1, -18.9100, 47.7500, "RN2 · PK 45 (Sortie Base Tana)", 40.0, "ON", source="SIMULATEUR")
     
+    db.refresh(m)
+    assert m.heure_debut is not None, "L'heure de début doit être capturée à la sortie physique de la base"
+    assert m.heure_debut == t_ev1
+    print(f"  ✅ Début réel de mission capturé au franchissement base : {m.heure_debut:%H:%M}")
+
     t_ev2 = maintenant + timedelta(hours=2)
     ingest_event(db, v, t_ev2, -18.9489, 48.2257, "Moramanga", 45.0, "ON", source="SIMULATEUR")
     
@@ -193,6 +206,20 @@ def test_missions_complet():
     assert any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in m.etapes)
     print("  ✅ Déchargement validé après arrêt >= 3h")
     print(f"  ✅ Mission TERMINÉE, camion revenu à LIBRE, durée : {m.duree_s//3600}h{(m.duree_s%3600)//60:02d}")
+
+    # -------------------------------------------------------------------------
+    # 6b. Test Verrouillage de Protection Post-Déchargement
+    # -------------------------------------------------------------------------
+    print("\n[T6b] Verrouillage de Protection (Trame télématique rétrospective GRT)")
+    # Envoi d'une trame retardée GRT postérieure à la clôture
+    t_retard_grt = maintenant + timedelta(hours=16)
+    ingest_event(db, v, t_retard_grt, -18.1492, 49.4023, "GRT Tamatave (trame rétrospective)", 20.0, "ON", source="SIMULATEUR")
+    db.refresh(m)
+    db.refresh(suivi)
+    assert m.statut == StatutMission.TERMINEE, "La mission terminée ne doit pas être rouverte par une trame retardée"
+    assert suivi.statut_camion == StatutCamion.LIBRE, "Le statut LIBRE post-déchargement ne doit pas être écrasé"
+    assert suivi.mission_id is None
+    print("  ✅ Verrouillage confirmé : la mission terminée reste clôturée et le camion reste LIBRE")
 
     # -------------------------------------------------------------------------
     # 7. Test Endpoints API REST /api/missions & Exports

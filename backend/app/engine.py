@@ -898,30 +898,55 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                 _flags[flag_h] = ts
 
     # --- Détection automatique logistique & transitions géographiques (§3) ---
+    z_info = detecter_zone_logistique(lat, lon, adresse)
+    z_type, z_code, z_nom = z_info["type"], z_info["code"], z_info["nom"]
+
     if suivi.mission_id:
         m_actuelle = db.get(Mission, suivi.mission_id)
+        # Verrouillage de protection : si la mission est déjà terminée, aucun événement ne peut la modifier
         if m_actuelle and m_actuelle.statut in (StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE):
-            z_info = detecter_zone_logistique(lat, lon, adresse)
-            z_type, z_code, z_nom = z_info["type"], z_info["code"], z_info["nom"]
 
-            # A. Chargement au Dépôt GRT (Tamatave) : VIDE -> CHARGÉ
-            if getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "VIDE":
-                if z_type == "GRT":
-                    if not any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
-                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ENTREE_GRT", "ts": iso(ts), "lieu": z_nom, "zone": "GRT"}]
-                elif any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
-                    # Sortie de GRT -> Chargement Effectué
+            # 1. Détection du départ physique (BASETNR ou Moramanga) -> Début réel de mission (heure_debut)
+            if m_actuelle.heure_debut is None:
+                if z_type == "BASETNR":
+                    if not any(e.get("etat") == "PRESENCE_BASE" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "PRESENCE_BASE", "ts": iso(ts), "lieu": z_nom, "zone": "BASETNR"}]
+                else:
+                    # Sortie physique effective de BASETNR (ou Moramanga)
+                    m_actuelle.heure_debut = ts
+                    m_actuelle.statut = StatutMission.EN_COURS
+                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEPART_BASE", "ts": iso(ts), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
+                    log.info("Sortie physique Base détectée pour %s -> Début réel mission %s à %s",
+                             vehicule.plaque, m_actuelle.code_mission or m_actuelle.id, ts)
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.update", s_mission(m_actuelle))
+
+            # 2. Chargement au Dépôt GRT (Tamatave) : Écrasement Télématique VIDE/LIBRE -> CHARGÉ
+            if z_type == "GRT":
+                if not any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
+                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ENTREE_GRT", "ts": iso(ts), "lieu": z_nom, "zone": "GRT"}]
+            elif any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
+                # Sortie effective de la zone GRT
+                if getattr(m_actuelle, "statut_camion_actuel", "VIDE") in ("VIDE", "LIBRE") or suivi.statut_camion in (StatutCamion.VIDE, StatutCamion.LIBRE):
+                    # Règle d'écrasement télématique
                     m_actuelle.statut_camion_actuel = "CHARGE"
                     m_actuelle.heure_chargement = ts
                     suivi.statut_camion = StatutCamion.CHARGE
                     m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": "Galana Rafinérie Terminale (GRT)", "zone": "GRT"}]
-                    log.info("Chargement GRT validé pour %s (Mission %s) -> Statut Camion CHARGÉ",
+                    log.info("Chargement GRT validé (écrasement télématique) pour %s (Mission %s) -> Statut Camion CHARGÉ",
                              vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
                     if PUBLISH_ENABLED["on"]:
                         publish("mission.update", s_mission(m_actuelle))
+                elif getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
+                    # Règle de forçage manuel préalable : mise à jour avec l'horodatage GPS réel de sortie
+                    if not m_actuelle.heure_chargement or not any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.heure_chargement = ts
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": "Galana Rafinérie Terminale (GRT) (GPS)", "zone": "GRT"}]
+                        if PUBLISH_ENABLED["on"]:
+                            publish("mission.update", s_mission(m_actuelle))
 
-            # B. Transit & Dépôts Récepteurs : Déviation & Déchargement (arrêt >= 3h)
-            elif getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
+            # 3. Transit & Dépôts Récepteurs : Déviation & Déchargement
+            if getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
                 code_prevu = normaliser_code_depot(m_actuelle.depot_prevu)
 
                 # Tolérance Dépôts Sud : passage BASETNR conserve statut CHARGÉ
@@ -961,8 +986,8 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                             m_actuelle.depot_effectif = m_actuelle.depot_prevu or z_nom
                         m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": m_actuelle.depot_effectif, "zone": z_code}]
                         suivi.statut_camion = StatutCamion.LIBRE
-                        suivi.mission_id = None
-                        log.info("Déchargement validé après arrêt >= 3h pour %s (Mission %s) -> LIBRE / TERMINÉE",
+                        suivi.mission_id = None  # Verrouillage absolu : la mission est terminée et détachée
+                        log.info("Déchargement validé après arrêt >= 3h pour %s (Mission %s) -> LIBRE / TERMINÉE (Verrouillage actif)",
                                  vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
                         if PUBLISH_ENABLED["on"]:
                             publish("mission.update", s_mission(m_actuelle))
@@ -1013,8 +1038,9 @@ def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
                               numero_ot: str | None, distributeur: str | None,
                               produit: str | None, depot_prevu: str | None,
                               ts: datetime | None = None) -> Mission:
-    """Initialise ou met à jour une mission logistique lors de l'attribution d'un OT (Option A).
-    Bascule automatiquement le camion de LIBRE à VIDE.
+    """Enregistre les informations administratives de l'OT (N° OT, Distributeur, Produit, Dépôt).
+    - Bascule le camion de LIBRE à VIDE si état = LIBRE.
+    - NE DÉCLENCHE PAS la date/heure de début de mission (réservée au départ physique réel de la base).
     """
     ts = ts or now_local()
     jour = suivi.date_jour
@@ -1032,7 +1058,14 @@ def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
             ouverte.depot_prevu = depot_prevu
             if not ouverte.depot_effectif:
                 ouverte.depot_effectif = depot_prevu
+        if not any(e.get("etat") == "INITIALISATION_OT" for e in (ouverte.etapes or [])):
+            ouverte.etapes = (ouverte.etapes or []) + [{"etat": "INITIALISATION_OT", "ts": iso(ts),
+                     "lieu": (vehicule.last_adresse if vehicule else None) or "Base LSS — Antananarivo",
+                     "zone": "BASETNR"}]
         suivi.mission_id = ouverte.id
+        if suivi.statut_camion == StatutCamion.LIBRE:
+            suivi.statut_camion = StatutCamion.VIDE
+            ouverte.statut_camion_actuel = "VIDE"
         if PUBLISH_ENABLED["on"]:
             publish("mission.update", s_mission(ouverte))
         return ouverte
@@ -1041,6 +1074,8 @@ def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
         Mission.vehicule_id == vehicule.id, Mission.date_jour == jour)) or 0) + 1
     code = _formater_code_mission(numero_ot, jour, numero)
 
+    # Note : heure_debut reste None à la saisie administrative de l'OT
+    # si le véhicule n'est pas encore sorti physiquement de BASETNR
     m = Mission(
         id=uid(),
         code_mission=code,
@@ -1050,7 +1085,7 @@ def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
         numero_mission_du_jour=numero,
         statut=StatutMission.EN_COURS,
         statut_camion_actuel="VIDE",
-        heure_debut=ts,
+        heure_debut=None,  # Début réel télématique au départ physique de la base
         numero_ot=numero_ot,
         distributeur=distributeur,
         produit=produit,
@@ -1079,7 +1114,7 @@ def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
         suivi.produit = produit
     if depot_prevu:
         suivi.depot_recepteur = depot_prevu
-    log.info("Mission %s (%s) initialisée pour %s -> Statut Camion VIDE",
+    log.info("Mission %s (%s) rattachée à l'OT pour %s -> Statut Camion VIDE (heure_debut en attente départ physique)",
              code, numero_ot or "Sans OT", vehicule.plaque if vehicule else "?")
     if PUBLISH_ENABLED["on"]:
         publish("mission.new", s_mission(m))

@@ -93,7 +93,8 @@ def migrer_schema():
     from .seed import VEHICULES_CAMTRACKPRO
     insp = inspect(_engine)
     tables = set(insp.get_table_names())
-    if "trajets" not in tables or "vehicules" not in tables:
+    required_tables = {"trajets", "vehicules", "suivi_journalier", "infractions", "conducteurs"}
+    if not required_tables.issubset(tables):
         return
     cols_t = {c["name"] for c in insp.get_columns("trajets")}
     cols_v = {c["name"] for c in insp.get_columns("vehicules")}

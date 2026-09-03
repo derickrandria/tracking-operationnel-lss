@@ -386,22 +386,10 @@ def normaliser_code_depot(texte: str | None) -> str | None:
 
 
 def detecter_zone_logistique(lat: float | None, lng: float | None, adresse: str | None = None) -> dict:
-    """Classifie le lieu courant selon les zones logistiques clés (§1)."""
-    adr_l = (adresse or "").lower()
-    
-    # 1. Vérification par mots-clés dans le libellé d'adresse / géozone portail
-    if adr_l:
-        for code, z in ZONES_CANONIQUES.items():
-            for mot in z["mots_cles"]:
-                if mot in adr_l:
-                    return {
-                        "type": z["type"],
-                        "code": z["code"],
-                        "nom": z["nom"],
-                        "est_depot_sud": z["est_depot_sud"],
-                    }
-    
-    # 2. Vérification par coordonnées GPS (haversine)
+    """Classifie le lieu courant selon les zones logistiques clés (§1).
+    La télématique GPS (lat/lng) constitue la vérité terrain prioritaire.
+    """
+    # 1. Vérification par coordonnées GPS (vérité terrain prioritaire)
     if lat is not None and lng is not None:
         for code, z in ZONES_CANONIQUES.items():
             for (clat, clng, rayon_m) in z["coords"]:
@@ -412,12 +400,25 @@ def detecter_zone_logistique(lat: float | None, lng: float | None, adresse: str 
                         "nom": z["nom"],
                         "est_depot_sud": z["est_depot_sud"],
                     }
-    
+
+    # 2. Vérification par mots-clés dans le libellé d'adresse si coordonnées absentes
+    adr_l = (adresse or "").lower()
+    if (lat is None or lng is None) and adr_l:
+        for code, z in ZONES_CANONIQUES.items():
+            for mot in z["mots_cles"]:
+                if mot in adr_l:
+                    return {
+                        "type": z["type"],
+                        "code": z["code"],
+                        "nom": z["nom"],
+                        "est_depot_sud": z["est_depot_sud"],
+                    }
+
     # 3. Vérification axe routier
     if "rn2" in adr_l:
         return {"type": "AXE_ROUTIER", "code": "RN2", "nom": "Axe RN2 (Est)", "est_depot_sud": False}
     if "rn7" in adr_l:
         return {"type": "AXE_ROUTIER", "code": "RN7", "nom": "Axe RN7 (Sud)", "est_depot_sud": True}
-    
+
     return {"type": "AUTRE", "code": "AUTRE", "nom": adresse or "Hors zone", "est_depot_sud": False}
 
