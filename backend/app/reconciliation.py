@@ -200,6 +200,22 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
     if change_pos:
         donnees.update(pos_apres)
         change = True
+    champs_suivi = (
+        "situation", "statut_camion", "depot_recepteur", "distributeur",
+        "produit", "numero_ot", "emplacement_j_moins_1", "arret_final",
+        "km_parcourus", "mission_id")
+    champs_apres = {}
+    for champ in champs_suivi:
+        valeur = getattr(suivi, champ, None)
+        if hasattr(valeur, "value"):
+            valeur = valeur.value
+        champs_apres[champ] = valeur
+    if any(donnees.get(c) != v for c, v in champs_apres.items()):
+        donnees.update(champs_apres)
+        change = True
+    if h.conducteur_id != suivi.conducteur_id:
+        h.conducteur_id = suivi.conducteur_id
+        h.conducteur = suivi.conducteur
     if change:
         _audit(db, "archive.raffraichie", None, {
             "plaque": suivi.vehicule.plaque if suivi.vehicule else None,
@@ -1049,6 +1065,11 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 stats["ignores"] += 1
                 log.info("Trajet validé sans véhicule connu (%r) — ignoré",
                          it.get("gps_associe") or it.get("plaque"))
+                continue
+            if vehicule.statut != "ACTIF":
+                stats["ignores"] += 1
+                log.info("Trajet validé pour véhicule non actif %s — ignoré",
+                         vehicule.plaque)
                 continue
 
             suivi = ensure_suivi(db, vehicule, jour)

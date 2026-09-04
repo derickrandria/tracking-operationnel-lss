@@ -48,6 +48,7 @@ def liste_suivi(date: str | None = None, db: Session = Depends(get_db),
         .options(selectinload(SuiviJournalier.trajets))
         .where(SuiviJournalier.date_jour == jour)
         .join(Vehicule, SuiviJournalier.vehicule_id == Vehicule.id)
+        .where(Vehicule.statut == "ACTIF")
         .order_by(Vehicule.plaque)).all()
     seuils = get_seuils(db)
     lignes = _masquer_tcc_si_jour_passe(

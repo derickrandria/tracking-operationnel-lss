@@ -203,10 +203,13 @@ def ensure_suivi(db, vehicule: Vehicule | str, jour: date) -> SuiviJournalier:
     precedent = db.scalar(select(SuiviJournalier).where(
         SuiviJournalier.vehicule_id == vehicule.id,
         SuiviJournalier.date_jour < jour).order_by(SuiviJournalier.date_jour.desc()))
+    conducteur_id = (precedent.conducteur_id if precedent is not None
+                     else vehicule.conducteur_actuel_id)
     s = SuiviJournalier(
         date_jour=jour,
         vehicule_id=vehicule.id,
-        conducteur_id=vehicule.conducteur_actuel_id or (precedent.conducteur_id if precedent else None),
+        conducteur_id=conducteur_id,
+        conducteur_origine=(precedent.conducteur_origine if precedent else None),
         # Partie B — report de la veille (§8.3)
         situation=precedent.situation if precedent else None,
         statut_camion=precedent.statut_camion if precedent else None,
@@ -233,7 +236,7 @@ def ensure_suivi(db, vehicule: Vehicule | str, jour: date) -> SuiviJournalier:
 
 def ensure_suivis_du_jour(db, jour: date | None = None):
     jour = jour or now_local().date()
-    vehicules = db.scalars(select(Vehicule).where(Vehicule.statut != "INACTIF")).all()
+    vehicules = db.scalars(select(Vehicule).where(Vehicule.statut == StatutVehicule.ACTIF)).all()
     for v in vehicules:
         ensure_suivi(db, v, jour)
     db.commit()
@@ -2235,6 +2238,9 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
     Gestion stricte anti-doublon et détection de conflit (saisie manuelle vs portail)."""
     if suivi is None or fiche is None:
         return
+    vehicule = db.get(Vehicule, suivi.vehicule_id)
+    if vehicule is None or vehicule.statut != StatutVehicule.ACTIF:
+        return
 
     # 1. Si la ligne de suivi actuelle est déjà attribuée MANUELLEMENT :
     # La saisie manuelle prime TOUJOURS sur les relevés des portails.
@@ -2282,12 +2288,6 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
         autre_suivi.conducteur_origine = None
         log.info("Changement de camion pour %s : détaché de %s et réaffecté à %s",
                  nom_ch, plaque_autre, plaque_ceci)
-
-    # 3. Auto-assignation du véhicule & propagation driverKeyCode
-    if suivi.vehicule_id:
-        vehicule = db.get(Vehicule, suivi.vehicule_id)
-        if vehicule and vehicule.conducteur_actuel_id != fiche.id:
-            vehicule.conducteur_actuel_id = fiche.id
 
     # Propagation automatique du code badge aux homonymes sémantiques (même tokens_set)
     if fiche.code_badge_mzonex and fiche.tokens_set:

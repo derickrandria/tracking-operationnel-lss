@@ -218,7 +218,7 @@ def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
 
         # nouvelle journée : 1 ligne par véhicule actif, A+B reportées,
         # C et D vides (assuré par ensure_suivi), emplacement J-1 = arrêt final J-1.
-        vehicules = db.scalars(select(Vehicule).where(Vehicule.statut != "INACTIF")).all()
+        vehicules = db.scalars(select(Vehicule).where(Vehicule.statut == "ACTIF")).all()
         for v in vehicules:
             ensure_suivi(db, v, jour_nouveau)
         db.commit()
