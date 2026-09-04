@@ -117,8 +117,6 @@ Ces fichiers ne doivent plus être utilisés comme référence normative en prod
 - La production doit se référer uniquement à [SPEC_RULES_v3.md](SPEC_RULES_v3.md).
 - L’archivage est recommandé au lieu d’une suppression immédiate, pour préserver la traçabilité métier.
 
----
-
 ## 7. Fichiers historiques concernés
 
 - [REFERENCE_IA_REGLES.md](REFERENCE_IA_REGLES.md)
@@ -126,3 +124,17 @@ Ces fichiers ne doivent plus être utilisés comme référence normative en prod
 - [SPEC_RULES_v3.md](SPEC_RULES_v3.md)
 
 Les fichiers historiques peuvent ensuite être déplacés dans un dossier archive si le projet veut un dépôt documentaire plus net.
+
+---
+
+## 8. Arbitrages postérieurs à la version canonique (traçabilité)
+
+### 8.1 v1.46 — abrogation de l'arbitrage O4 : session Wialon unique partagée
+- Date : 2026-09-04
+- Décision : l'exploitant accepte la correction proposée et refusée le 01/09/2026 (O4, REFERENCE_IA_REGLES.md §O4).
+- Cause mesurée : chaque nouvelle session API Wialon invalide la précédente ; la collecte ouvrait une session par cycle (~60 s), ce qui dégradait le flux CamtrackPro (constat du 04/09/2026 : 2–15 points/h au lieu de 150–220) et déconnectait le portail web sur la machine serveur.
+- Correctif : `WIALON_SESSION_PARTAGEE=1` (backend/.env) — UNE session partagée par le processus, re-login transparent en cas d'expiration, `core/logout` supprimé à la fermeture d'instance. Comportement historique conservé avec la valeur 0.
+- Conséquence : le contournement documenté en O4 (« consulter le portail web depuis un autre poste ou après arrêt de la plateforme ») n'est plus nécessaire.
+
+---
+
