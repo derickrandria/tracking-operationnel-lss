@@ -1905,6 +1905,66 @@ def synchroniser_trajets_valides(source: str | None = None) -> dict:
     return totaux
 
 
+# ═══════════ Correctif v1.46 — RELECTURE N1 (Événements MZoneX) ═══════════
+# Constats du 04/09/2026 : (a) le plafond de pagination tronquait silencieusement
+# des fenêtres larges ; (b) toute panne de collecte > 3 h était PERDUE à jamais
+# (fenêtre incrémentale FENETRE_MAX_S) ; (c) la relecture M1 ne couvre que les
+# TRAJETS (N2), jamais les ÉVÉNEMENTS (N1). Or le fil « Events » de l'API OData
+# est rejouable à la demande, et l'anti-rejeu de CollectorBase.inserer rend le
+# rejeu IDOMPOTENT (zéro doublon). On rejoue donc les J derniers jours en
+# tranches horaires (le découpage v1.46 d'evenements() garantit < 9 000/tranche).
+RELECTURE_N1_ACTIVE = os.getenv("RELECTURE_N1_ACTIVE", "1") == "1"
+RELECTURE_N1_JOURS = int(os.getenv("RELECTURE_N1_JOURS", "7"))
+RELECTURE_N1_PERIODE_S = int(os.getenv("RELECTURE_N1_PERIODE_S", "3600"))
+_relecture_n1_memo: dict = {"mono": 0.0}
+
+
+def relecture_n1_mzonex(jours: int | None = None) -> int:
+    """Rejoue les Événements MZoneX des J derniers jours (J-7 → J-1 jours
+    complets + partie du jour courant ANTÉRIEURE à la fenêtre incrémentale 3 h)
+    et les insère par le MÊME pipeline. Retourne le nombre de points insérés.
+    Toute exception est journalisée, jamais propagée (§10)."""
+    if not RELECTURE_N1_ACTIVE or not _mzonex_api_active():
+        return 0
+    jours = RELECTURE_N1_JOURS if jours is None else max(0, jours)
+    maintenant = now_local()
+    coll = MZoneXApiCollector()
+    total = 0
+    try:
+        # Jours passés : journée locale complète [00:00 → 24:00]
+        for k in range(jours, 0, -1):
+            jour = maintenant.date() - timedelta(days=k)
+            debut_local = datetime.combine(jour, datetime.min.time())
+            fin_local = debut_local + timedelta(days=1)
+            brut = coll.api.evenements(coll.api._utc_naive(debut_local),
+                                       coll.api._utc_naive(fin_local))
+            points = coll.normaliser(brut)
+            if points:
+                n = coll.inserer(points)
+                total += n
+                log.info("Relecture N1 MZoneX %s : %d point(s) inséré(s)",
+                         jour.isoformat(), n)
+        # Jour courant : uniquement ce qui PRÉCÈDE la fenêtre incrémentale
+        from .api_mzonex import FENETRE_MAX_S
+        plancher = maintenant - timedelta(seconds=FENETRE_MAX_S)
+        debut_jour = datetime.combine(maintenant.date(), datetime.min.time())
+        if plancher > debut_jour:
+            brut = coll.api.evenements(coll.api._utc_naive(debut_jour),
+                                       coll.api._utc_naive(plancher))
+            points = coll.normaliser(brut)
+            if points:
+                n = coll.inserer(points)
+                total += n
+                log.info("Relecture N1 MZoneX (jour courant, %s → %s) : "
+                         "%d point(s) inséré(s)",
+                         debut_jour.strftime("%H:%M"),
+                         plancher.strftime("%H:%M"), n)
+    except Exception:
+        log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
+                      "passage)")
+    return total
+
+
 def boucle_collecte():
     """Collecte planifiée Niveau 1 en continu (période COLLECTOR_PERIODE_S, §10).
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
@@ -1961,6 +2021,20 @@ def boucle_collecte():
             if n_ctp:
                 log.info("Collecte CAMTRACKPRO (API) : %d points insérés",
                          n_ctp)
+        # Correctif v1.46 — relecture N1 (Événements MZoneX) : au démarrage puis
+        # toutes les RELECTURE_N1_PERIODE_S (défaut 1 h) — rattrape les trous
+        # > 3 h laissés par une panne de collecte (idempotent, anti-rejeu).
+        mono_n1 = time.monotonic()
+        if (_relecture_n1_memo["mono"] == 0.0
+                or mono_n1 - _relecture_n1_memo["mono"] >= RELECTURE_N1_PERIODE_S):
+            _relecture_n1_memo["mono"] = mono_n1
+            try:
+                n_n1 = relecture_n1_mzonex()
+                if n_n1:
+                    log.info("Relecture N1 (Événements MZoneX, %d jours) : "
+                             "%d point(s) rattrapé(s)", RELECTURE_N1_JOURS, n_n1)
+            except Exception:
+                log.exception("Relecture N1 MZoneX — échec (retraité)")
         # §0quater R2 (arbitrage 14/08/2026) — jamais un camion en route sans
         # ligne : (ré)ouverture des lignes manquantes d'après le dernier signal
         try:

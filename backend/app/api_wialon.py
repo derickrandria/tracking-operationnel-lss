@@ -46,6 +46,13 @@ log = logging.getLogger("lss.api_wialon")
 API_URL = os.getenv("WIALON_API_URL",
                     "https://hst-api.wialon.com/wialon/ajax.html")
 _TIMEOUT = 60
+# Correctif PROPOSÉ v1.46 — opt-in STRICT (l'arbitrage O4 du 01/09/2026 « laisser
+# tel quel » reste le comportement PAR DÉFAUT) : WIALON_SESSION_PARTAGEE=1 fait
+# réutiliser UNE session Wialon unique par le processus (plus d'invalidation de
+# session à chaque cycle — cause mesurée de la dégradation CamtrackPro du
+# 04/09/2026 : 2-15 pts/h au lieu de 150-220). Le portail web reste utilisable.
+SESSION_PARTAGEE = os.getenv("WIALON_SESSION_PARTAGEE", "0") == "1"
+_sid_partage: dict = {"sid": None}
 NOM_RAPPORT = os.getenv("CAMTRACKPRO_API_RAPPORT_NOM", "Detail Trajet Vehicule")
 RESSOURCE_ID = os.getenv("CAMTRACKPRO_API_RESSOURCE_ID", "").strip()
 GABARIT_ID = os.getenv("CAMTRACKPRO_API_GABARIT_ID", "").strip()
@@ -189,6 +196,8 @@ class ApiWialon:
         if not self._jeton:
             raise ErreurApiWialon("CAMTRACKPRO_TOKEN absent de backend/.env")
         self._sid: str | None = None
+        if SESSION_PARTAGEE:
+            self._sid = _sid_partage.get("sid")
         self._ids_rapport: tuple[int, int] | None = None
         self._verrou = threading.Lock()
 
@@ -220,6 +229,8 @@ class ApiWialon:
             if "eid" not in r:
                 raise ErreurApiWialon(f"jeton refusé : {r}")
             self._sid = r["eid"]
+            if SESSION_PARTAGEE:
+                _sid_partage["sid"] = self._sid
             log.info("CamtrackPro API : session Wialon ouverte (%s)",
                      r.get("user", {}).get("nm"))
             return self._sid
@@ -230,6 +241,12 @@ class ApiWialon:
 
     def fermer(self) -> None:
         if self._sid:
+            if SESSION_PARTAGEE:
+                # session partagée : on NE se déconnecte PAS (les autres
+                # utilisateurs du processus continuent de s'en servir) ;
+                # le re-login transparent couvre l'expiration naturelle.
+                self._sid = None
+                return
             try:
                 self._appel("core/logout", {}, reessai=False)
             except ErreurApiWialon:

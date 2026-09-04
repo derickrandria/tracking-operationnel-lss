@@ -182,7 +182,14 @@ class ApiMZoneX:
                 f"{type(e).__name__}") from e
 
     def _pages(self, chemin_requete: str) -> list:
-        """Pagination par $skip (le serveur n'émet pas de @odata.nextLink)."""
+        """Pagination par $skip (le serveur n'émet pas de @odata.nextLink).
+
+        Correctif v1.46 (constat du 04/09/2026) : quand le plafond MAX_PAGES ×
+        TAILLE_PAGE est atteint, la troncature était SILENCIEUSE — des données
+        disparaissaient sans aucun log. Le plafond est maintenant signalé en
+        WARNING (les volumes réels mesurés montent à ~2 600 évts/h, soit > 9 000
+        sur une simple demi-journée : toute fenêtre large doit être découpée,
+        cf. `evenements()` ci-dessous)."""
         lignes: list = []
         saute = 0
         sep = "&" if "?" in chemin_requete else "?"
@@ -194,6 +201,14 @@ class ApiMZoneX:
             if len(vals) < TAILLE_PAGE:
                 break
             saute += TAILLE_PAGE
+        else:
+            log.warning(
+                "MZoneX API — PLAFOND DE PAGINATION ATTEINT (%d pages × %d = "
+                "%d lignes) pour « %s » : des DONNÉES ONT ÉTÉ TRONQUÉES — "
+                "augmentez MZONEX_API_MAX_PAGES / MZONEX_API_TAILLE_PAGE ou "
+                "découpez la fenêtre (le découpage horaire d'`evenements()` "
+                "est là pour ça)", MAX_PAGES, TAILLE_PAGE, len(lignes),
+                chemin_requete.split("?")[0])
         return lignes
 
     # ---------------------------------------------------------------- flotte
@@ -237,10 +252,24 @@ class ApiMZoneX:
                    self.groupe_flotte()))
 
     def evenements(self, debut_utc: datetime, fin_utc: datetime) -> list[dict]:
-        """Fil d'événements de la flotte sur [debut_utc ; fin_utc] (UTC naïves)."""
-        chemin = ("Events?" + self._fenetre(debut_utc, fin_utc)
-                  + "&$orderby=utcTimestamp")
-        return self._pages(chemin)
+        """Fil d'événements de la flotte sur [debut_utc ; fin_utc] (UTC naïves).
+
+        Correctif v1.46 (constat du 04/09/2026) : la fenêtre est DÉCOUPÉE en
+        tranches d'une heure — les volumes réels (~2 600 évts/h, pic mesuré)
+        dépassent le plafond de pagination 9 000 dès qu'une fenêtre couvre
+        plusieurs heures, ce qui tronquait silencieusement le fil. Chaque
+        tranche horaire reste très en dessous du plafond ; l'anti-rejeu amont
+        dédoublonne, le résultat est identique à un appel monolithique."""
+        pas = timedelta(hours=1)
+        evs: list[dict] = []
+        borne = debut_utc
+        while borne < fin_utc:
+            bout = min(borne + pas, fin_utc)
+            chemin = ("Events?" + self._fenetre(borne, bout)
+                      + "&$orderby=utcTimestamp")
+            evs.extend(self._pages(chemin))
+            borne = bout
+        return evs
 
     def _utc_naive(self, d_locale: datetime) -> datetime:
         return d_locale.replace(tzinfo=TZ).astimezone(

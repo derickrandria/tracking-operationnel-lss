@@ -107,6 +107,10 @@ class TypeAlerte(str, enum.Enum):
     # Détection de conflits et doublons d'affectation chauffeur
     CONFLIT_AFFECTATION = "CONFLIT_AFFECTATION"  # Chauffeur attribué manuellement vs détecté sur un autre camion
     DOUBLON_CONDUCTEUR = "DOUBLON_CONDUCTEUR"    # Doublon chauffeur sur la même journée
+    # Correctif v1.46 (constat du 04/09/2026) — la collecte portails peut traîner
+    # ou se bloquer SILENCIEUSEMENT (base arrêtée à 12h19, portails sains) :
+    # alerte dès que le dernier événement ingéré dépasse le seuil de retard.
+    COLLECTE_RETARD = "COLLECTE_RETARD"
 
 
 class TypeEvenement(str, enum.Enum):

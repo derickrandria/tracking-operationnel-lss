@@ -10,6 +10,7 @@ Aucune valeur seuil n'est codée en dur : tout vient de `ParametrageSeuil` (§5.
 """
 import logging
 import math
+import os
 from datetime import date, datetime, time, timedelta
 from threading import RLock
 
@@ -1511,6 +1512,22 @@ SITUATIONS_TRANQUILLES = (
 )
 
 
+# Correctif v1.46 — retard d'ingestion global (alerte COLLECTE_RETARD).
+SEUIL_RETARD_COLLECTE_S = int(os.getenv("SEUIL_RETARD_COLLECTE_S", "900"))
+
+
+def retard_collecte_s(db, maintenant: datetime) -> int | None:
+    """Écart en secondes entre `maintenant` et le dernier événement GPS des
+    portails ingéré. None si aucun événement sur les dernières 24 h."""
+    dernier = db.scalar(select(func.max(EvenementGPS.horodatage)).where(
+        EvenementGPS.source.in_([SourceEvenement.MZONEX,
+                                 SourceEvenement.CAMTRACKPRO]),
+        EvenementGPS.horodatage >= maintenant - timedelta(hours=24)))
+    if dernier is None:
+        return None
+    return int((maintenant - dernier).total_seconds())
+
+
 def boucle_surveillance():
     """Chien de garde (appelé périodiquement) : GPS hors ligne, camion
     immobile anormal, missions retardées (§6.3/§6.5)."""
@@ -1553,6 +1570,29 @@ def boucle_surveillance():
                             lien_module=f"/suivi?date={jour.isoformat()}&vehicule={v.id}")
                         if PUBLISH_ENABLED["on"]:
                             publish("alerte.new", s_alerte(a))
+
+        # Correctif v1.46 — retard d'ingestion de la collecte portails : les
+        # portails peuvent être sains pendant que la boucle locale traîne ou
+        # se bloque (constat du 04/09/2026 : base arrêtée à 12h19, portails à
+        # jour jusqu'à 14h59) — alerte visible au tableau, jamais bloquante.
+        # Fenêtre 05h–22h : le serveur est normalement éteint la nuit (§8).
+        if 5 <= now.hour < 22:
+            try:
+                retard = retard_collecte_s(db, now)
+                if (retard is not None
+                        and retard > SEUIL_RETARD_COLLECTE_S
+                        and not _alerte_recente(db, TypeAlerte.COLLECTE_RETARD,
+                                                None, 60)):
+                    a = creer_alerte(
+                        db, TypeAlerte.COLLECTE_RETARD, GraviteAlerte.MOYENNE,
+                        f"Collecte GPS en retard : dernier événement ingéré il y a "
+                        f"{retard // 60} min (seuil {SEUIL_RETARD_COLLECTE_S // 60} min) — "
+                        "vérifier la boucle de collecte et les logs portails",
+                        lien_module="/suivi")
+                    if PUBLISH_ENABLED["on"]:
+                        publish("alerte.new", s_alerte(a))
+            except Exception:
+                log.exception("Contrôle de retard de collecte en échec")
 
         # Missions retardées (durée réelle > durée prévisionnelle paramétrée)
         missions = db.scalars(select(Mission).where(
