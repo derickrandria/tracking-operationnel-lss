@@ -1908,6 +1908,25 @@ def aligner_archives_positions(db, jour: date) -> list[str]:
     return synchronises
 
 
+def _existe_alias_en_session_ou_db(db, alias_normalise: str, conducteur_id: str | None = None) -> ConducteurAlias | None:
+    """Retourne un alias déjà présent dans la session courante ou la base.
+
+    Le point clé ici est que SQLAlchemy ne voit pas les objets ajoutés en
+    mémoire tant qu'un flush n'a pas eu lieu. Dans un batch réél, plusieurs
+    appels à `creer_conducteur_auto()` peuvent donc créer des `ConducteurAlias`
+    identiques avant l'insertion SQL effective, ce qui déclenche le UNIQUE
+    constraint sur `alias_normalise`.
+    """
+    if not alias_normalise:
+        return None
+    for obj in db.new:
+        if isinstance(obj, ConducteurAlias) and obj.alias_normalise == alias_normalise:
+            if conducteur_id is None or obj.conducteur_id == conducteur_id:
+                return obj
+    return db.scalar(select(ConducteurAlias).where(
+        ConducteurAlias.alias_normalise == alias_normalise))
+
+
 # ------------------------------------------------------------------ §0quater D1/D2
 def creer_vehicule_auto(db, ident: str, plateforme: str) -> Vehicule | None:
     """Arbitrage §0quater D1 (14/08/2026) — DÉCOUVERTE AUTOMATIQUE : identifiant
@@ -1989,7 +2008,7 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
             if nom and len(nom) >= 3:
                 cible = normaliser_libelle(nom)[:170]
                 if cible and cible != ex_badge.nom_normalise:
-                    if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible)):
+                    if _existe_alias_en_session_ou_db(db, cible, ex_badge.id) is None:
                         db.add(ConducteurAlias(conducteur_id=ex_badge.id, alias_brut=nom,
                                                alias_normalise=cible, source=plateforme or "MZONEX"))
             return ex_badge
@@ -2026,7 +2045,7 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
                     break
         if existant is not None:
             # Enregistrer comme alias permanent
-            if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible)):
+            if _existe_alias_en_session_ou_db(db, cible, existant.id) is None:
                 db.add(ConducteurAlias(conducteur_id=existant.id, alias_brut=nom,
                                        alias_normalise=cible, source=plateforme or "AUTO"))
                 db.flush()
@@ -2042,7 +2061,7 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
                     candidats.append(c0)
             if len(candidats) == 1:
                 existant = candidats[0]
-                if not db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible)):
+                if _existe_alias_en_session_ou_db(db, cible, existant.id) is None:
                     db.add(ConducteurAlias(conducteur_id=existant.id, alias_brut=nom,
                                            alias_normalise=cible, source=plateforme or "INCLUSION"))
                     db.flush()
