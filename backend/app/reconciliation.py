@@ -1024,6 +1024,12 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
     for it in items:
         try:
             debut, fin = it["debut"], it.get("fin")
+            # v146 — GARDE D'INTÉGRITÉ : une `fin` antérieure au `debut` est
+            # toujours impossible (ex. fin recopiée d'un voisin par un mauvais
+            # rapprochement). On n'écrit jamais une telle heure : la ligne est
+            # traitée « en cours » (fin None). Non destructif (AM-2/R2).
+            if fin is not None and fin < debut:
+                fin = None
             # Référence v2 §8.2/§8.3 — jour d'ATTRIBUTION du trajet (début
             # < 01h00 → veille ; la journée logistique court de 01h00 à 01h00)
             jour = jour_attribution(debut)

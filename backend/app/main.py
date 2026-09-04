@@ -479,6 +479,13 @@ async def _am4_puis_reparation_v130():
         await asyncio.to_thread(reparation.reparer_historique_conducteurs_passes)
     except Exception:
         log.exception("Réparation historique conducteurs passés en échec")
+    try:
+        # v146 — garde d'intégrité des heures de fin (fin < début → « en
+        # cours » / jumeau REJETÉ). Idempotente, exécutée à CHAQUE démarrage.
+        await asyncio.to_thread(reparation.reparer_fins_incoherentes)
+    except Exception:
+        log.exception("v146 : réparation fins incohérentes en échec — reprise "
+                      "au prochain démarrage")
 
 
 def _rattrapage_j1():

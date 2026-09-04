@@ -15,6 +15,7 @@ import {
   daysAgoISO,
   firstDayOfMonthISO,
   fmtDateFr,
+  fmtDateHeure,
   fmtDuree,
   fmtHeure,
   todayISO

@@ -226,13 +226,33 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
             res[-1].get("conducteur_badge_id") == nt.get("conducteur_badge_id") and
             res[-1].get("conducteur_badge") == nt.get("conducteur_badge")
         )
+        # §0undecies E1 FIX v147 — un même camion ne peut pas rouler 2 trajets
+        # en même temps : un chevauchement temporel (début < fin de la ligne
+        # précédente) est fusionné MÊME si le badge chauffeur diffère (le badge
+        # est une attribution, pas une preuve de 2 trajets simultanés).
+        chevauche = bool(
+            res and deb is not None and res[-1]["_fin_dt"] is not None
+            and deb < res[-1]["_fin_dt"]
+        )
         if (res and deb is not None and res[-1]["_fin_dt"] is not None
-                and meme_chauffeur
-                and (deb - res[-1]["_fin_dt"]).total_seconds() < seuil_fusion_s):
-            # rupture courte du même chauffeur → absorbée dans la ligne précédente
+                and (chevauche
+                     or (meme_chauffeur
+                         and (deb - res[-1]["_fin_dt"]).total_seconds()
+                         < seuil_fusion_s))):
+            # fusion : rupture courte (même chauffeur) OU chevauchement
+            # temporel (règle AM-6 : un même instant ne peut pas être deux
+            # trajets d'un même camion — on fusionne même si le badge diffère).
             m = res[-1]
-            m["heure_fin"] = nt.get("heure_fin")
-            m["_fin_dt"] = fin
+            # fin = UNION des deux (la plus tardive ; vide si une ligne en
+            # cours) — on conserve la CHAÎNE ISO d'origine, jamais un datetime.
+            if fin is not None and m["_fin_dt"] is not None:
+                if fin > m["_fin_dt"]:
+                    m["_fin_dt"] = fin
+                    m["heure_fin"] = nt.get("heure_fin")
+                # sinon la ligne précédente est déjà la plus tardive → intacte
+            elif fin is None:
+                m["heure_fin"] = None
+                m["_fin_dt"] = None
             m["statut_source"] = nt.get("statut_source")
             m["statut_validation"] = nt.get("statut_validation")
             d1, d2 = m.get("distance_km"), nt.get("distance_km")

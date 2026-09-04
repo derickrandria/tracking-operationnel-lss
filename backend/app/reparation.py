@@ -1052,3 +1052,98 @@ def migrer_schema_missions(db=None) -> dict:
         if propre:
             db.close()
     return resultat
+
+
+def reparer_fins_incoherentes(db=None) -> dict:
+    """GARDE D'INTÉGRITÉ idempotente (exécutée à chaque démarrage) — un trajet
+    NON rejeté dont `heure_fin < heure_debut` est CORROMPU (surface constatée :
+    la fin d'un trajet recopiée sur le suivant lors d'un rapprochement, qui
+    faussait la colonne de pauses à l'écran — « pauses vides »). RÈGLE de
+    correction NON destructive (AM-2 / R2 : jamais de suppression, aucune heure
+    inventée) :
+      · s'il existe un AUTRE trajet non rejeté au MÊME `heure_debut` (jumeau du
+        vrai trajet) → le corrompu est marqué REJETÉ (conservé en base, masqué,
+        comme les manœuvres) ;
+      · sinon la fin impossible est écartée → `heure_fin = None` (le trajet est
+        « en cours », sa ligne, sa distance et son statut sont conservés).
+    Les pauses (`_recalculer_pauses`), les compteurs réglementaires
+    (`recalculer_temps` : TCC/TCJ/TTJ) et l'archive éventuelle
+    (`_synchroniser_archive`) sont recalculés. Retourne un dict de statistiques.
+    """
+    propre = db is None
+    db = db or SessionLocal()
+    stats = {"corriges": 0, "rejetes": 0, "suivis": 0}
+    try:
+        corrompus = db.scalars(select(Trajet).where(
+            Trajet.heure_fin.isnot(None),
+            Trajet.heure_fin < Trajet.heure_debut,
+            Trajet.statut_validation != StatutValidationTrajet.REJETE)).all()
+        if not corrompus:
+            db.commit()
+            return stats
+
+        def _plaque(sid):
+            sv = db.get(SuiviJournalier, sid)
+            return sv.vehicule.plaque if sv and sv.vehicule else None
+
+        touches: set[str] = set()
+        for t in corrompus:
+            avant = {"debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
+                     "distance_km": t.distance_km}
+            jumeau = db.scalar(select(Trajet.id).where(
+                Trajet.suivi_id == t.suivi_id,
+                Trajet.id != t.id,
+                Trajet.statut_validation != StatutValidationTrajet.REJETE,
+                Trajet.heure_debut == t.heure_debut))
+            if jumeau:
+                t.statut_validation = StatutValidationTrajet.REJETE
+                stats["rejetes"] += 1
+                _audit(db, "trajet.fin_incoherente", t.id, {
+                    "plaque": _plaque(t.suivi_id),
+                    "avant": avant,
+                    "action": "rejete_jumeau",
+                    "regle": "v146 : heure_fin < heure_debut et jumeau présent "
+                             "au même début → marqué REJETÉ (conservé, masqué, "
+                             "comme les manœuvres)"})
+            else:
+                t.heure_fin = None
+                stats["corriges"] += 1
+                _audit(db, "trajet.fin_incoherente", t.id, {
+                    "plaque": _plaque(t.suivi_id),
+                    "avant": avant,
+                    "action": "fin_nulle_en_cours",
+                    "regle": "v146 : heure_fin < heure_debut → fin impossible "
+                             "écartée (traité « en cours »), ligne/distance/"
+                             "statut conservés — aucune donnée supprimée"})
+            touches.add(t.suivi_id)
+
+        from .engine import recalculer_temps
+        for sid in touches:
+            suivi = db.get(SuiviJournalier, sid)
+            if suivi is None:
+                continue
+            trajets = list(db.scalars(select(Trajet).where(
+                Trajet.suivi_id == sid).order_by(Trajet.numero)).all())
+            _renumeroter(sorted(trajets, key=lambda t: t.heure_debut))
+            _recalculer_pauses(trajets)
+            db.flush()
+            try:
+                recalculer_temps(db, suivi, now_local())
+            except Exception:
+                log.exception("reparer_fins_incoherentes : recalcul échoué %s",
+                              sid)
+            _synchroniser_archive(db, suivi)
+            stats["suivis"] += 1
+        db.commit()
+        if stats["corriges"] or stats["rejetes"]:
+            log.warning("Réparation v146 (fins incohérentes, %s) : %s",
+                        now_local().date(), stats)
+    except Exception:
+        db.rollback()
+        log.exception("Réparation v146 (fins incohérentes) en échec — reprise "
+                      "au prochain démarrage")
+        stats["erreur"] = True
+    finally:
+        if propre:
+            db.close()
+    return stats
