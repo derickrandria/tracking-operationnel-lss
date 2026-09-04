@@ -322,6 +322,9 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
              manœuvre ≥ 30 min coupe aussi, AM-6) ; 0 si le camion est
              actuellement dans une pause coupante ; arrêt court EN COURS :
              le chrono continue (H2) ;
+             v1.46 : mini-manœuvres CUMULÉES ≥ 30 min dans la session
+             → TCC = 0 (AM-6 étendu) ; ligne ouverte + camion arrêté
+             ≥ 30 min → TCC = 0 (arbitrage LSS du 04/09/2026) ;
              R1 (v3) : le TCC traverse minuit — si la première ligne du jour
              est le segment B d'un split (début 00:00) et que la veille
              s'est close à 23:59:59 avec un TCC ouvert, la session s'amorce
@@ -348,10 +351,11 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
 
     vehicule = db.get(Vehicule, suivi.vehicule_id)
     roule, fin_sub = etat_roulage(vehicule, maintenant, seuils)
+    segs_tous = [Segment(debut=t.heure_debut, fin=t.heure_fin, distance_km=t.distance_km,
+                         rejete=(t.statut_validation == StatutValidationTrajet.REJETE), ref=t)
+                 for t in tous if t.heure_debut is not None]
     journee = construire_journee(
-        [Segment(debut=t.heure_debut, fin=t.heure_fin, distance_km=t.distance_km,
-                 rejete=(t.statut_validation == StatutValidationTrajet.REJETE), ref=t)
-         for t in tous if t.heure_debut is not None],
+        segs_tous,
         maintenant=maintenant, pause_min=pause_min, seuil_km=seuil_km,
         roule=roule, fin_substitution=fin_sub,
         pause_affichee_min=pause_tcc)
@@ -429,6 +433,34 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
     derniere = lignes[-1]
     if (derniere.fin is not None
             and (maintenant - derniere.fin).total_seconds() >= pause_tcc):
+        tcc = 0.0
+
+    # ── Correctif v1.46 (arbitrage LSS du 04/09/2026) — deux garde-fous qui
+    # ramènent le chrono à ZÉRO, demandés par l'exploitant :
+    # (a) MINI-MANŒUVRES CUMULÉES : la durée TOTALE des trajets invalides
+    #     (manœuvres < 0,3 km, rejetées) de la session courante atteint
+    #     SEUIL_PAUSE_COUPURE_TCC (30 min) → le camion est en réalité à l'arrêt
+    #     depuis une pause coupante → TCC = 0 (AM-6 étendu : avant, une
+    #     manœuvre ne coupait que si ELLE SEULE faisait ≥ 30 min).
+    # (b) LIGNE OUVERTE + CAMION ARRÊTÉ : une ligne « en cours » (GPS muet ou
+    #     signal de roulage absent) faisait courir le chrono INDÉFINIMENT —
+    #     même camion garé depuis des heures. Si le camion ne roule PAS
+    #     (etat_roulage, signal > 15 min ou vitesse ≤ 3 km/h) et que le
+    #     dernier signal connu date de ≥ 30 min → TCC = 0 (H2 honoré :
+    #     en dessous de 30 min le chrono continue de s'écouler).
+    if session:
+        debut_session = session[0].debut
+        fin_session_ref = fin_session
+        manoeuvres_s = sum(
+            (s.fin - s.debut).total_seconds()
+            for s in segs_tous
+            if s.rejete and s.debut is not None and s.fin is not None
+            and debut_session <= s.debut <= fin_session_ref)
+        if manoeuvres_s >= pause_tcc:
+            tcc = 0.0
+    if (session and session[-1].fin is None
+            and not roule and fin_sub is not None
+            and (maintenant - fin_sub).total_seconds() >= pause_tcc):
         tcc = 0.0
     suivi.tcc_s = int(max(0.0, tcc))
 

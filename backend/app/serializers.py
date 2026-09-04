@@ -221,11 +221,14 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     for t in (trajets or []):
         nt = dict(t)
         deb, fin = _dt_iso(nt.get("heure_debut")), _dt_iso(nt.get("heure_fin"))
-        meme_chauffeur = bool(
-            res and
-            res[-1].get("conducteur_badge_id") == nt.get("conducteur_badge_id") and
-            res[-1].get("conducteur_badge") == nt.get("conducteur_badge")
-        )
+        # Correctif v1.46 (constat 4866TBU du 04/09/2026) : un badge ABSENT d'un
+        # côté ne prouve PAS un changement de chauffeur (trou d'attribution N1) —
+        # il ne doit pas empêcher la fusion G1 (rupture < 30 min → UNE ligne).
+        # Avant : `meme_chauffeur` exigeait l'égalité des deux badges → deux
+        # lignes séparées par une case pause vide, contre la règle G1.
+        b1 = res[-1].get("conducteur_badge_id") if res else None
+        b2 = nt.get("conducteur_badge_id")
+        meme_chauffeur = bool(res and (b1 is None or b2 is None or b1 == b2))
         # §0undecies E1 FIX v147 — un même camion ne peut pas rouler 2 trajets
         # en même temps : un chevauchement temporel (début < fin de la ligne
         # précédente) est fusionné MÊME si le badge chauffeur diffère (le badge

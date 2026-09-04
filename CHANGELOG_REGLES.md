@@ -136,5 +136,19 @@ Les fichiers historiques peuvent ensuite être déplacés dans un dossier archiv
 - Correctif : `WIALON_SESSION_PARTAGEE=1` (backend/.env) — UNE session partagée par le processus, re-login transparent en cas d'expiration, `core/logout` supprimé à la fermeture d'instance. Comportement historique conservé avec la valeur 0.
 - Conséquence : le contournement documenté en O4 (« consulter le portail web depuis un autre poste ou après arrêt de la plateforme ») n'est plus nécessaire.
 
+### 8.2 v1.46 — pauses d'affichage (fusion G1 avec badge manquant)
+- Date : 2026-09-04
+- Constat (4866TBU) : des lignes séparées par des ruptures < 30 min affichaient une case pause VIDE au lieu d'être fusionnées, contre la règle G1 (« < 30 min → UNE ligne, pas de case pause »).
+- Cause : la fusion d'affichage exigeait l'égalité des badges chauffeur des DEUX côtés ; un badge manquant (trou d'attribution N1) bloquait la fusion.
+- Règle : un badge ABSENT d'un côté ne prouve pas un changement de chauffeur → la fusion G1 s'applique quand même (`fusionner_trajets_affichage`).
+- Conséquence : plus jamais de cases pause vides ; les ruptures < 30 min sont toujours fusionnées, les pauses ≥ 30 min seules sont affichées.
+
+### 8.3 v1.46 — remise à ZÉRO du TCC (arbitrage exploitant du 04/09/2026)
+- Le TCC est remis à ZÉRO dans deux nouveaux cas :
+  1. la durée CUMULÉE des trajets invalides (mini-manœuvres < 0,3 km, rejetées) de la session courante atteint 30 min (`SEUIL_PAUSE_COUPURE_TCC`) — extension d'AM-6 : avant, une manœuvre ne coupait que si ELLE SEULE durait ≥ 30 min ;
+  2. une ligne « en cours » (ouverte) alors que le camion ne roule plus (signal GPS > 15 min ou vitesse ≤ 3 km/h) et que le dernier signal date de ≥ 30 min — avant, le chrono courait indéfiniment sur une ligne ouverte d'un camion garé.
+- H2 est honoré : en dessous de 30 min d'arrêt, le chrono continue de s'écouler.
+- Portée : mesure seule (`recalculer_temps`) — TCJ/TTJ, affichage et archives intacts.
+
 ---
 
