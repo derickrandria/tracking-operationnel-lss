@@ -266,8 +266,8 @@ class SuiviJournalier(Base):
     date_jour: Mapped[date] = mapped_column(Date, index=True)
 
     # Partie A
-    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
+    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"), index=True)
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
     # §0septies B2 (20/08/2026) — origine de l'attribution chauffeur du jour :
     # None / « BADGE » (portail, fait foi) / « MANUEL » (saisie — jamais
     # écrasée par un badge, même valide)
@@ -347,7 +347,7 @@ class Trajet(Base):
     # CamtrackPro). None = non fourni (≠ 0 infraction : on n'invente pas §10).
     conducteur_badge: Mapped[str | None] = mapped_column(String(160), nullable=True)
     conducteur_badge_id: Mapped[str | None] = mapped_column(
-        ForeignKey("conducteurs.id"), nullable=True)
+        ForeignKey("conducteurs.id"), index=True, nullable=True)
     badge_ecarte: Mapped[str | None] = mapped_column(String(160), nullable=True)
     v_max: Mapped[float | None] = mapped_column(Float, nullable=True)
     ralenti_s: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -376,8 +376,8 @@ class Mission(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     code_mission: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     date_jour: Mapped[date] = mapped_column(Date, index=True)
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
-    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
+    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"), index=True)
     numero_mission_du_jour: Mapped[int] = mapped_column(Integer, default=1)
     statut: Mapped[StatutMission] = mapped_column(
         SAEnum(StatutMission, **SA_ENUM_KW), default=StatutMission.EN_COURS)
@@ -467,8 +467,8 @@ class Alerte(Base):
     date_heure: Mapped[datetime] = mapped_column(DateTime, index=True, default=now_local)
     type: Mapped[TypeAlerte] = mapped_column(SAEnum(TypeAlerte, **SA_ENUM_KW), index=True)
     gravite: Mapped[GraviteAlerte] = mapped_column(SAEnum(GraviteAlerte, **SA_ENUM_KW))
-    vehicule_id: Mapped[str | None] = mapped_column(ForeignKey("vehicules.id"), nullable=True)
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
+    vehicule_id: Mapped[str | None] = mapped_column(ForeignKey("vehicules.id"), index=True, nullable=True)
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
     message: Mapped[str] = mapped_column(Text)
     statut: Mapped[StatutAlerte] = mapped_column(
         SAEnum(StatutAlerte, **SA_ENUM_KW), default=StatutAlerte.NOUVELLE)
@@ -489,8 +489,8 @@ class HistoriqueJournalier(Base):
     date_jour: Mapped[date] = mapped_column(Date, index=True)
     annee: Mapped[int] = mapped_column(Integer, index=True)
     mois: Mapped[int] = mapped_column(Integer, index=True)
-    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
+    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"), index=True)
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
     donnees: Mapped[dict] = mapped_column(JSON)  # snapshot complet (suivi + trajets)
     nb_infractions: Mapped[int] = mapped_column(Integer, default=0)
     nb_alertes: Mapped[int] = mapped_column(Integer, default=0)
