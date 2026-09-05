@@ -1,5 +1,5 @@
 """Module 2 — Suivi Journalier (cœur du système) et Module 3 — Missions."""
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
@@ -8,12 +8,14 @@ from sqlalchemy.orm import Session, selectinload
 
 from ..config import now_local
 from ..database import get_db
-from ..engine import (appliquer_champs_suivi, ensure_suivi, ensure_suivis_du_jour,
-                      get_seuils, initialiser_ou_maj_mission, prefill_positions_gps)
-from ..models import (Conducteur, Infraction, Mission, StatutCamion,
-                      StatutMission, SuiviJournalier, Vehicule)
+from ..engine import (PUBLISH_ENABLED, _formater_code_mission, appliquer_champs_suivi,
+                      ensure_suivi, ensure_suivis_du_jour, get_seuils,
+                      initialiser_ou_maj_mission, prefill_positions_gps)
+from ..models import (Alerte, Conducteur, Infraction, Mission, StatutAlerte,
+                      StatutCamion, StatutMission, SuiviJournalier, TypeAlerte,
+                      Vehicule, uid)
 from ..security import ECRITURE, TOUS, audit, require_roles
-from ..serializers import s_mission, s_suivi
+from ..serializers import iso, s_alerte, s_mission, s_suivi
 
 router = APIRouter(prefix="/api", tags=["operations"])
 
@@ -233,7 +235,28 @@ class MissionPatch(BaseModel):
     est_deviee: bool | None = None
     motif_deviation: str | None = None
     statut: str | None = None  # EN_COURS, TERMINÉE, DÉVIÉE, RETARDÉE
-    statut_camion_actuel: str | None = None  # VIDE, CHARGÉ, LIBRE
+    statut_camion_actuel: str | None = None  # LIBRE, VIDE, CHARGÉ
+    validation_chargement: str | None = None
+    validation_dechargement: str | None = None
+    motif_invalidation: str | None = None
+
+
+class MissionValiderChargement(BaseModel):
+    horodatage: str | None = None
+
+
+class MissionValiderDechargement(BaseModel):
+    horodatage: str | None = None
+
+
+class MissionInvaliderDechargement(BaseModel):
+    motif: str
+    commentaire: str | None = None
+
+
+class MissionDeclarerDeviation(BaseModel):
+    nouveau_depot: str
+    motif: str | None = None
 
 
 def _calculer_stats_missions(missions: list[Mission], db: Session) -> dict:
@@ -470,6 +493,211 @@ def modifier_mission(mid: str, data: MissionPatch, db: Session = Depends(get_db)
             publish("mission.update", s_mission(m))
 
     return s_mission(m)
+
+
+@router.post("/missions/{mid}/valider-chargement")
+def valider_chargement_mission(mid: str, data: MissionValiderChargement | None = None,
+                               db: Session = Depends(get_db),
+                               user=Depends(require_roles(*ECRITURE))):
+    """Validation opérationnelle du chargement GRT."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    ts_val = None
+    if data and data.horodatage:
+        try:
+            ts_val = datetime.fromisoformat(data.horodatage)
+        except ValueError:
+            pass
+    if not ts_val:
+        for e in reversed(m.etapes or []):
+            if e.get("etat") in ("ENTREE_GRT", "CHARGEMENT_EFFECTUE") and e.get("ts"):
+                try:
+                    ts_val = datetime.fromisoformat(e["ts"])
+                    break
+                except Exception:
+                    pass
+    if not ts_val:
+        ts_val = m.heure_chargement or now_local()
+
+    m.validation_chargement = "VALIDÉ"
+    m.statut_camion_actuel = "CHARGE"
+    m.heure_chargement = ts_val
+
+    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+    if suivi:
+        suivi.statut_camion = StatutCamion.CHARGE
+
+    # Auto-résolution des alertes associées
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type.in_([TypeAlerte.VALIDATION_CHARGEMENT, TypeAlerte.MISSION_SANS_OT]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.validation_chargement", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "heure_chargement": iso(ts_val)
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/valider-dechargement")
+def valider_dechargement_mission(mid: str, data: MissionValiderDechargement | None = None,
+                                 db: Session = Depends(get_db),
+                                 user=Depends(require_roles(*ECRITURE))):
+    """Validation opérationnelle du déchargement -> Clôture mission et bascule en LIBRE."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    ts_val = None
+    if data and data.horodatage:
+        try:
+            ts_val = datetime.fromisoformat(data.horodatage)
+        except ValueError:
+            pass
+    if not ts_val:
+        for e in reversed(m.etapes or []):
+            if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DECHARGEMENT_EFFECTUE", "DEVIATION_DETECTEE") and e.get("ts"):
+                try:
+                    ts_val = datetime.fromisoformat(e["ts"])
+                    break
+                except Exception:
+                    pass
+    if not ts_val:
+        ts_val = m.heure_fin or now_local()
+
+    m.validation_dechargement = "VALIDÉ"
+    m.statut = StatutMission.TERMINEE
+    m.statut_camion_actuel = "LIBRE"
+    m.heure_fin = ts_val
+    if m.heure_debut:
+        m.duree_s = max(0, int((ts_val - m.heure_debut).total_seconds()))
+
+    if not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m.etapes or [])):
+        m.etapes = (m.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts_val),
+                                       "lieu": m.depot_effectif or m.depot_prevu or "Dépôt Récepteur",
+                                       "zone": "DEPOT"}]
+
+    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+    if suivi:
+        suivi.statut_camion = StatutCamion.LIBRE
+        suivi.mission_id = None
+
+    # Auto-résolution des alertes
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.validation_dechargement", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "heure_fin": iso(ts_val)
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/invalider-dechargement")
+def invalider_dechargement_mission(mid: str, data: MissionInvaliderDechargement,
+                                   db: Session = Depends(get_db),
+                                   user=Depends(require_roles(*ECRITURE))):
+    """Invalidation du déchargement (échantillonnage, repos parking) -> Conserve statut CHARGÉ et EN_COURS."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    m.validation_dechargement = "INVALIDÉ"
+    m.motif_invalidation = data.motif + (f" ({data.commentaire})" if data.commentaire else "")
+    m.statut = StatutMission.EN_COURS
+    m.statut_camion_actuel = "CHARGE"
+
+    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+    if suivi:
+        suivi.statut_camion = StatutCamion.CHARGE
+
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.invalidation_dechargement", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "motif": m.motif_invalidation
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/declarer-deviation")
+def declarer_deviation_mission(mid: str, data: MissionDeclarerDeviation,
+                               db: Session = Depends(get_db),
+                               user=Depends(require_roles(*ECRITURE))):
+    """Déclaration manuelle ou confirmation d'une déviation de dépôt."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    m.est_deviee = True
+    m.statut = StatutMission.DEVIEE
+    m.depot_effectif = data.nouveau_depot
+    m.motif_deviation = data.motif or f"Déviation vers {data.nouveau_depot} (prévu : {m.depot_prevu or '—'})"
+
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type == TypeAlerte.DEVIATION_DETECTEE,
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.deviation", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "nouveau_depot": data.nouveau_depot,
+        "motif": m.motif_deviation
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.get("/missions/alertes")
+def alertes_missions(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    """Récupère les alertes spécifiques au cycle des Missions."""
+    types_missions = [
+        TypeAlerte.MISSION_SANS_OT,
+        TypeAlerte.VALIDATION_CHARGEMENT,
+        TypeAlerte.VALIDATION_DECHARGEMENT,
+        TypeAlerte.DEVIATION_DETECTEE,
+        TypeAlerte.MISSION_RETARDEE
+    ]
+    alertes = list(db.scalars(
+        select(Alerte)
+        .where(
+            Alerte.type.in_(types_missions),
+            Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+        )
+        .order_by(Alerte.date_heure.desc())
+    ).all())
+
+    return {
+        "nb_alertes": len(alertes),
+        "items": [s_alerte(a) for a in alertes]
+    }
 
 
 @router.get("/missions/stats")

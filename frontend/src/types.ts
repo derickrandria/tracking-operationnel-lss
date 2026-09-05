@@ -148,6 +148,10 @@ export interface Mission {
   depot_effectif?: string | null;
   est_deviee?: boolean;
   motif_deviation?: string | null;
+  validation_chargement?: "EN_ATTENTE" | "VALIDÉ" | string;
+  validation_dechargement?: "EN_ATTENTE" | "VALIDÉ" | "INVALIDÉ" | string;
+  motif_invalidation?: string | null;
+  est_repositionnement?: boolean;
   distributeur: string | null;
   km_vide?: number;
   km_charge?: number;

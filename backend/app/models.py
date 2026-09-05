@@ -111,6 +111,11 @@ class TypeAlerte(str, enum.Enum):
     # ou se bloquer SILENCIEUSEMENT (base arrêtée à 12h19, portails sains) :
     # alerte dès que le dernier événement ingéré dépasse le seuil de retard.
     COLLECTE_RETARD = "COLLECTE_RETARD"
+    # Alertes spécifiques aux cycles logistiques et missions
+    MISSION_SANS_OT = "MISSION_SANS_OT"              # Camion à GRT ≥ 15 min sans OT renseigné
+    VALIDATION_CHARGEMENT = "VALIDATION_CHARGEMENT"    # Camion à GRT ≥ 30 min (validation requise)
+    VALIDATION_DECHARGEMENT = "VALIDATION_DECHARGEMENT" # Camion au dépôt ≥ 3h (validation requise)
+    DEVIATION_DETECTEE = "DEVIATION_DETECTEE"          # Déviation de dépôt détectée ou déclarée
 
 
 class TypeEvenement(str, enum.Enum):
@@ -393,6 +398,10 @@ class Mission(Base):
     depot_effectif: Mapped[str | None] = mapped_column(String(30), nullable=True)
     est_deviee: Mapped[bool] = mapped_column(Boolean, default=False)
     motif_deviation: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    validation_chargement: Mapped[str | None] = mapped_column(String(20), default="EN_ATTENTE", nullable=True)
+    validation_dechargement: Mapped[str | None] = mapped_column(String(20), default="EN_ATTENTE", nullable=True)
+    motif_invalidation: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    est_repositionnement: Mapped[bool] = mapped_column(Boolean, default=False)
     distributeur: Mapped[str | None] = mapped_column(String(30), nullable=True)
     km_vide: Mapped[float] = mapped_column(Float, default=0.0)
     km_charge: Mapped[float] = mapped_column(Float, default=0.0)

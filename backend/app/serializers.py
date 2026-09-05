@@ -5,7 +5,7 @@ from .chaines import (ETAT_OFFICIEL, LigneJournee, Segment,
                       construire_journee)
 from .config import jour_attribution, now_local
 from .models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
-                     Mission, StatutValidationTrajet, SuiviJournalier, Trajet,
+                     Mission, StatutMission, StatutValidationTrajet, SuiviJournalier, Trajet,
                      Vehicule)
 
 
@@ -402,6 +402,10 @@ def s_mission(m: Mission, nb_infractions: int | None = None):
     depot_prev = getattr(m, "depot_prevu", None) or m.depot
     depot_eff = getattr(m, "depot_effectif", None) or depot_prev
 
+    duree = m.duree_s or 0
+    if duree == 0 and m.heure_debut and not m.heure_fin and m.statut in (StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE):
+        duree = max(0, int((now_local() - m.heure_debut).total_seconds()))
+
     return {
         "id": m.id,
         "code_mission": code,
@@ -412,14 +416,14 @@ def s_mission(m: Mission, nb_infractions: int | None = None):
         "plaque": m.vehicule.plaque if m.vehicule else None,
         "numero_mission_du_jour": m.numero_mission_du_jour,
         "statut": m.statut.value if hasattr(m.statut, "value") else str(m.statut),
-        "statut_camion_actuel": getattr(m, "statut_camion_actuel", "VIDE") or "VIDE",
+        "statut_camion_actuel": getattr(m, "statut_camion_actuel", "LIBRE") or "LIBRE",
         "heure_debut": iso(m.heure_debut),
         "date_debut": iso(m.heure_debut),
         "heure_chargement": iso(getattr(m, "heure_chargement", None)),
         "date_chargement": iso(getattr(m, "heure_chargement", None)),
         "heure_fin": iso(m.heure_fin),
         "date_fin": iso(m.heure_fin),
-        "duree_s": m.duree_s or 0,
+        "duree_s": duree,
         "numero_ot": m.numero_ot,
         "produit": m.produit,
         "depot": depot_prev,
@@ -427,6 +431,10 @@ def s_mission(m: Mission, nb_infractions: int | None = None):
         "depot_effectif": depot_eff,
         "est_deviee": bool(getattr(m, "est_deviee", False)),
         "motif_deviation": getattr(m, "motif_deviation", None),
+        "validation_chargement": getattr(m, "validation_chargement", "EN_ATTENTE") or "EN_ATTENTE",
+        "validation_dechargement": getattr(m, "validation_dechargement", "EN_ATTENTE") or "EN_ATTENTE",
+        "motif_invalidation": getattr(m, "motif_invalidation", None),
+        "est_repositionnement": bool(getattr(m, "est_repositionnement", False)),
         "distributeur": m.distributeur,
         "km_vide": round(km_v, 1),
         "km_charge": round(km_c, 1),

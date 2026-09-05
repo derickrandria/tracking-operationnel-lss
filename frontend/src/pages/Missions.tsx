@@ -1,13 +1,14 @@
 /**
- * Module 3 — Missions : Reconstitution & Suivi Automatique des Cycles Logistiques Pétroliers (§6.3 / v2026.1).
+ * Module 3 — Missions : Reconstitution & Suivi Automatique des Cycles Logistiques Pétroliers (§6.3 / v2026.2).
  * Gestion des statuts LIBRE ➔ VIDE ➔ CHARGÉ ➔ LIBRE, Détection GRT & Déchargements,
- * Déviations d'itinéraires et Synchronisation Inter-onglets.
+ * Alertes opérationnelles (OT manquant, validation chargement/déchargement),
+ * Déviations d'itinéraires et Invalidation avec motifs explicatifs.
  */
 import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
 import Icon from "../components/icons";
 import { Badge, Btn, Card, Champ, inputCls, Modal, PageHeader, Spinner, Vide } from "../components/ui";
-import { Conducteur, Mission, Vehicule } from "../types";
+import { Alerte, Conducteur, Mission, Vehicule } from "../types";
 import {
   cls,
   COULEURS_STATUT_CAMION,
@@ -23,17 +24,19 @@ import {
 import { on } from "../ws";
 
 const ETAPE_LABELS: Record<string, { label: string; couleur: string }> = {
-  INITIALISATION_OT: { label: "Attribution OT & Départ à vide (VIDE)", couleur: "bg-sky-500" },
+  INITIALISATION_OT: { label: "Attribution OT (VIDE)", couleur: "bg-sky-500" },
+  PRESENCE_BASE: { label: "Présence Base Tana (BASETNR)", couleur: "bg-slate-500" },
+  DEPART_BASE: { label: "Départ physique Base Tana (Début réel)", couleur: "bg-blue-600" },
   TRANSIT_CHARGEMENT: { label: "Transit vers dépôt chargeur (VIDE)", couleur: "bg-sky-500" },
-  ENTREE_GRT: { label: "Arrivée Zone GRT Tamatave", couleur: "bg-indigo-500" },
-  CHARGEMENT_EFFECTUE: { label: "Chargement effectué (CHARGÉ)", couleur: "bg-amber-500" },
+  ENTREE_GRT: { label: "Arrivée Zone GRT Toamasina", couleur: "bg-indigo-500" },
+  CHARGEMENT_EFFECTUE: { label: "Chargement effectué — Sortie GRT (CHARGÉ)", couleur: "bg-amber-500" },
   CHARGEMENT_TERMINE: { label: "Chargement validé (CHARGÉ)", couleur: "bg-amber-500" },
   TRANSIT_LIVRAISON: { label: "Transit vers dépôt récepteur (CHARGÉ)", couleur: "bg-amber-500" },
   ARRIVEE_DEPOT_RECEPTEUR: { label: "Arrivée au dépôt récepteur", couleur: "bg-blue-600" },
-  DEVIATION_DETECTEE: { label: "Déviation d'itinéraire détectée", couleur: "bg-purple-600" },
-  DECHARGEMENT_EFFECTUE: { label: "Déchargement confirmé (LIBRE)", couleur: "bg-emerald-500" },
+  DEVIATION_DETECTEE: { label: "Déviation d'itinéraire constatée", couleur: "bg-purple-600" },
+  DECHARGEMENT_EFFECTUE: { label: "Déchargement confirmé — Fin mission (LIBRE)", couleur: "bg-emerald-500" },
   DECHARGEMENT_TERMINE: { label: "Déchargement terminé (LIBRE)", couleur: "bg-emerald-500" },
-  RETOUR_BASE: { label: "Retour Base Tana (LIBRE)", couleur: "bg-slate-500" },
+  REPOSITIONNEMENT_RETOUR: { label: "Trajet retour vers Base Tana (LIBRE)", couleur: "bg-slate-500" },
 };
 
 const DEPOTS_LISTE = [
@@ -46,8 +49,15 @@ const DEPOTS_LISTE = [
   { code: "DMKR", label: "Manakara (DMKR)" },
 ];
 
+const MOTIFS_INVALIDATION = [
+  "Échantillonnage de produit (simple passage)",
+  "Repos chauffeur sur parking du dépôt",
+  "Attente ouverture du dépôt / Congé",
+  "Autre motif opérationnel",
+];
+
 const DISTRIBUTEURS_LISTE = ["TOTAL", "GALANA", "VIVO", "JOVENA"];
-const PRODUITS_LISTE = ["Gasoil (GO)", "Super (SP95)", "Pétrole Lampant (PL)"];
+const PRODUITS_LISTE = ["Gasoil (GO)", "Super (SP95)", "Pétrole Lampant (PL)", "Fuel Oil (FO)"];
 
 interface StatsMissions {
   total: number;
@@ -72,12 +82,18 @@ export default function Missions() {
   const [recherche, setRecherche] = useState("");
 
   const [missions, setMissions] = useState<Mission[]>([]);
+  const [alertes, setAlertes] = useState<Alerte[]>([]);
   const [stats, setStats] = useState<StatsMissions | null>(null);
   const [chargement, setChargement] = useState(true);
   const [rattrapageEnCours, setRattrapageEnCours] = useState(false);
 
+  // Modals et actions
   const [missionSelectionnee, setMissionSelectionnee] = useState<Mission | null>(null);
   const [modalNouvelleMissionOuverte, setModalNouvelleMissionOuverte] = useState(false);
+  const [modalInvalidationMission, setModalInvalidationMission] = useState<Mission | null>(null);
+  const [modalDeviationMission, setModalDeviationMission] = useState<Mission | null>(null);
+  const [modalSaisieOtMission, setModalSaisieOtMission] = useState<Mission | null>(null);
+
   const [vehicules, setVehicules] = useState<Vehicule[]>([]);
   const [conducteurs, setConducteurs] = useState<Conducteur[]>([]);
 
@@ -98,6 +114,15 @@ export default function Missions() {
     }
   }
 
+  async function chargerAlertes() {
+    try {
+      const res = await api("/api/missions/alertes");
+      setAlertes(res.items || []);
+    } catch (e) {
+      console.error("Erreur chargement alertes missions:", e);
+    }
+  }
+
   async function chargerDonnees() {
     try {
       const params = new URLSearchParams({
@@ -109,9 +134,14 @@ export default function Missions() {
       if (distributeurFiltre) params.append("distributeur", distributeurFiltre);
       if (recherche.trim()) params.append("q", recherche.trim());
 
-      const res = await api(`/api/missions?${params.toString()}`);
-      setMissions(res.missions || []);
-      setStats(res.stats || null);
+      const [resMissions, resAlertes] = await Promise.all([
+        api(`/api/missions?${params.toString()}`),
+        api("/api/missions/alertes"),
+      ]);
+
+      setMissions(resMissions.missions || []);
+      setStats(resMissions.stats || null);
+      setAlertes(resAlertes.items || []);
     } catch (e) {
       console.error("Erreur chargement missions:", e);
     } finally {
@@ -135,6 +165,7 @@ export default function Missions() {
   // Chargement initial + Rattrapage automatique 7 jours
   useEffect(() => {
     chargerReferentiels();
+    chargerAlertes();
     lancerRattrapage7j(true);
   }, []);
 
@@ -145,9 +176,17 @@ export default function Missions() {
   useEffect(() => {
     const rafraichir = () => {
       window.clearTimeout(timer.current);
-      timer.current = window.setTimeout(chargerDonnees, 2000);
+      timer.current = window.setTimeout(chargerDonnees, 1500);
     };
-    const offs = ["mission.new", "mission.update", "suivi.update", "referentiels.changed", "data.refresh"].map((t) => on(t, rafraichir));
+    const offs = [
+      "mission.new",
+      "mission.update",
+      "alerte.new",
+      "alerte.update",
+      "suivi.update",
+      "referentiels.changed",
+      "data.refresh"
+    ].map((t) => on(t, rafraichir));
     return () => offs.forEach((f) => f());
   }, [dateDebut, dateFin, statutFiltre, depotFiltre, distributeurFiltre, recherche]);
 
@@ -174,6 +213,31 @@ export default function Missions() {
     if (recherche.trim()) params.append("q", recherche.trim());
     window.open(`/api/missions/export.pdf?${params.toString()}`, "_blank");
   };
+
+  // Actions de validation directes
+  async function actionValiderChargement(m: Mission) {
+    if (!confirm(`Confirmez-vous la validation du chargement à GRT pour le véhicule ${m.plaque} (Mission ${m.code_mission || m.numero_ot}) ?`)) {
+      return;
+    }
+    try {
+      await api(`/api/missions/${m.id}/valider-chargement`, { method: "POST" });
+      await chargerDonnees();
+    } catch (e: any) {
+      alert("Erreur lors de la validation du chargement : " + (e?.message || e));
+    }
+  }
+
+  async function actionValiderDechargement(m: Mission) {
+    if (!confirm(`Confirmez-vous la validation du déchargement pour le véhicule ${m.plaque} ? La mission passera à TERMINÉE et le statut du camion deviendra LIBRE.`)) {
+      return;
+    }
+    try {
+      await api(`/api/missions/${m.id}/valider-dechargement`, { method: "POST" });
+      await chargerDonnees();
+    } catch (e: any) {
+      alert("Erreur lors de la validation du déchargement : " + (e?.message || e));
+    }
+  }
 
   const setPeriode = (mode: "31j" | "7j" | "aujourdhui" | "mois" | "mois_prec") => {
     const now = new Date();
@@ -248,6 +312,113 @@ export default function Missions() {
           </div>
         }
       />
+
+      {/* Bandeau d'Alertes Logistiques Spécifiques (Règle 7 & 9) */}
+      {alertes && alertes.length > 0 && (
+        <Card className="!p-3 border border-amber-300 dark:border-amber-700 bg-amber-50/70 dark:bg-amber-950/40">
+          <div className="flex items-center justify-between pb-2 border-b border-amber-200 dark:border-amber-800">
+            <div className="flex items-center gap-2 text-[13px] font-bold text-amber-900 dark:text-amber-200 uppercase tracking-wide">
+              <Icon nom="alerte" className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+              <span>Alertes & Actions Opérationnelles Requises ({alertes.length})</span>
+            </div>
+            <span className="text-[11px] text-amber-700 dark:text-amber-300 italic">
+              Persistance active (conservées jusqu'à validation)
+            </span>
+          </div>
+
+          <div className="mt-2 space-y-2 max-h-48 overflow-y-auto">
+            {alertes.map((a) => {
+              const missionAssociee = missions.find(
+                (m) => m.plaque === a.plaque && (m.statut === "EN_COURS" || m.statut === "DÉVIÉE")
+              );
+              return (
+                <div
+                  key={a.id}
+                  className="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-white/90 dark:bg-slate-800/90 border border-amber-200/80 dark:border-amber-900/60 text-[12.5px]"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <span
+                      className={cls(
+                        "px-2 py-0.5 rounded text-[11px] font-bold uppercase",
+                        a.type === "MISSION_SANS_OT"
+                          ? "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300"
+                          : a.type === "VALIDATION_CHARGEMENT"
+                          ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+                          : a.type === "VALIDATION_DECHARGEMENT"
+                          ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
+                          : "bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300"
+                      )}
+                    >
+                      {a.type === "MISSION_SANS_OT"
+                        ? "OT Manquant (≥ 15 min)"
+                        : a.type === "VALIDATION_CHARGEMENT"
+                        ? "Validation Chargement (≥ 30 min)"
+                        : a.type === "VALIDATION_DECHARGEMENT"
+                        ? "Validation Déchargement (≥ 3h)"
+                        : "Déviation Constatée"}
+                    </span>
+                    <span className="font-bold text-slate-800 dark:text-slate-100 font-mono">{a.plaque}</span>
+                    <span className="text-slate-600 dark:text-slate-300">{a.message}</span>
+                    <span className="text-[11px] font-mono text-slate-400">({fmtDateHeure(a.date_heure)})</span>
+                  </div>
+
+                  {/* Actions contextuelles rapides depuis l'alerte */}
+                  <div className="flex items-center gap-1.5">
+                    {a.type === "MISSION_SANS_OT" && missionAssociee && (
+                      <button
+                        type="button"
+                        onClick={() => setModalSaisieOtMission(missionAssociee)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-sky-600 hover:bg-sky-700 text-white"
+                      >
+                        Saisir OT
+                      </button>
+                    )}
+
+                    {a.type === "VALIDATION_CHARGEMENT" && missionAssociee && (
+                      <button
+                        type="button"
+                        onClick={() => actionValiderChargement(missionAssociee)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-amber-600 hover:bg-amber-700 text-white"
+                      >
+                        ✓ Valider Chargement
+                      </button>
+                    )}
+
+                    {a.type === "VALIDATION_DECHARGEMENT" && missionAssociee && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => actionValiderDechargement(missionAssociee)}
+                          className="px-2.5 py-1 text-[11px] font-semibold rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+                        >
+                          ✓ Valider Déchargement
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setModalInvalidationMission(missionAssociee)}
+                          className="px-2.5 py-1 text-[11px] font-semibold rounded bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200"
+                        >
+                          ✗ Invalider
+                        </button>
+                      </>
+                    )}
+
+                    {a.type === "DEVIATION_DETECTEE" && missionAssociee && (
+                      <button
+                        type="button"
+                        onClick={() => setModalDeviationMission(missionAssociee)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-purple-600 hover:bg-purple-700 text-white"
+                      >
+                        ⇄ Changer Dépôt
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Card>
+      )}
 
       {/* Bandeau KPIs de synthèse */}
       {stats && (
@@ -462,15 +633,19 @@ export default function Missions() {
                   <th className="px-3 py-2.5 text-center whitespace-nowrap">Date Déchargement</th>
                   <th className="px-3 py-2.5 text-right whitespace-nowrap">Km Parcouru</th>
                   <th className="px-3 py-2.5 text-center whitespace-nowrap">Infractions</th>
-                  <th className="px-3.5 py-2.5 text-center whitespace-nowrap">Action</th>
+                  <th className="px-3.5 py-2.5 text-center whitespace-nowrap">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
                 {missions.map((m) => {
                   const estDeviee = m.statut === "DÉVIÉE" || m.est_deviee;
-                  const statutCamion = m.statut_camion_actuel || (m.statut === "TERMINÉE" ? "LIBRE" : "VIDE");
+                  const statutCamion = m.statut_camion_actuel || (m.statut === "TERMINÉE" ? "LIBRE" : (m.numero_ot ? "VIDE" : "LIBRE"));
                   const couleurCamion = COULEURS_STATUT_CAMION[statutCamion] || "bg-slate-500/10 text-slate-600";
                   const couleurMission = COULEURS_STATUT_MISSION[m.statut] || "bg-blue-500/10 text-blue-600";
+
+                  const aBesoinOt = statutCamion === "LIBRE" && !m.numero_ot && m.statut === "EN_COURS";
+                  const aChargementEnAttente = m.validation_chargement === "EN_ATTENTE" && m.statut === "EN_COURS";
+                  const aDechargementEnAttente = m.validation_dechargement === "EN_ATTENTE" && m.statut === "EN_COURS";
 
                   return (
                     <tr
@@ -513,7 +688,11 @@ export default function Missions() {
 
                       {/* N° OT */}
                       <td className="px-3 py-2.5 font-mono text-slate-600 dark:text-slate-300 whitespace-nowrap">
-                        {m.numero_ot || "—"}
+                        {m.numero_ot ? (
+                          <span className="font-semibold text-slate-800 dark:text-slate-100">{m.numero_ot}</span>
+                        ) : (
+                          <span className="text-amber-500 text-[11px] italic">Sans OT</span>
+                        )}
                       </td>
 
                       {/* Distributeur */}
@@ -578,6 +757,10 @@ export default function Missions() {
                           <span className="text-slate-700 dark:text-slate-200">
                             {fmtDateHeure(m.heure_chargement || m.date_chargement)}
                           </span>
+                        ) : aChargementEnAttente ? (
+                          <span className="text-amber-600 dark:text-amber-400 font-medium italic text-[11px] bg-amber-50 dark:bg-amber-950/40 px-1.5 py-0.5 rounded border border-amber-300">
+                            À valider (≥ 30 min)
+                          </span>
                         ) : (
                           <span className="text-slate-400 font-mono">—</span>
                         )}
@@ -588,6 +771,14 @@ export default function Missions() {
                         {m.statut === "TERMINÉE" && (m.heure_fin || m.date_fin) ? (
                           <span className="text-slate-700 dark:text-slate-200">
                             {fmtDateHeure(m.heure_fin || m.date_fin)}
+                          </span>
+                        ) : aDechargementEnAttente ? (
+                          <span className="text-blue-600 dark:text-blue-400 font-medium italic text-[11px] bg-blue-50 dark:bg-blue-950/40 px-1.5 py-0.5 rounded border border-blue-300">
+                            À valider (≥ 3h)
+                          </span>
+                        ) : m.motif_invalidation ? (
+                          <span className="text-slate-500 font-medium text-[11px] italic" title={m.motif_invalidation}>
+                            Invalidé ({m.motif_invalidation.slice(0, 15)}…)
                           </span>
                         ) : (
                           <span className="text-blue-600 dark:text-blue-400 font-medium italic text-[11.5px] bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 rounded border border-blue-200 dark:border-blue-900">
@@ -619,18 +810,71 @@ export default function Missions() {
                         )}
                       </td>
 
-                      {/* Action */}
-                      <td className="px-3.5 py-2.5 text-center whitespace-nowrap">
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setMissionSelectionnee(m);
-                          }}
-                          className="px-2 py-1 text-[11px] font-medium rounded bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300"
-                        >
-                          Détails
-                        </button>
+                      {/* Actions rapides contextuelles */}
+                      <td className="px-3.5 py-2.5 text-center whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center justify-center gap-1.5">
+                          {aBesoinOt && (
+                            <button
+                              type="button"
+                              onClick={() => setModalSaisieOtMission(m)}
+                              title="Saisir les informations d'OT reçues"
+                              className="px-2 py-1 text-[11px] font-bold rounded bg-sky-600 hover:bg-sky-700 text-white shadow-xs"
+                            >
+                              + OT
+                            </button>
+                          )}
+
+                          {m.statut === "EN_COURS" && (statutCamion === "VIDE" || aChargementEnAttente) && (
+                            <button
+                              type="button"
+                              onClick={() => actionValiderChargement(m)}
+                              title="Valider le chargement GRT"
+                              className="px-2 py-1 text-[11px] font-bold rounded bg-amber-600 hover:bg-amber-700 text-white shadow-xs"
+                            >
+                              ✓ Chargé
+                            </button>
+                          )}
+
+                          {m.statut === "EN_COURS" && statutCamion === "CHARGE" && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => actionValiderDechargement(m)}
+                                title="Valider le déchargement au dépôt récepteur"
+                                className="px-2 py-1 text-[11px] font-bold rounded bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs"
+                              >
+                                ✓ Livré
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setModalInvalidationMission(m)}
+                                title="Invalider le déchargement (échantillonnage, repos parking…)"
+                                className="px-1.5 py-1 text-[11px] font-bold rounded bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
+                              >
+                                ✗
+                              </button>
+                            </>
+                          )}
+
+                          {m.statut === "EN_COURS" && (
+                            <button
+                              type="button"
+                              onClick={() => setModalDeviationMission(m)}
+                              title="Déclarer une déviation d'itinéraire vers un autre dépôt"
+                              className="px-2 py-1 text-[11px] font-medium rounded bg-purple-100 hover:bg-purple-200 dark:bg-purple-950 dark:hover:bg-purple-900 text-purple-700 dark:text-purple-300 border border-purple-300 dark:border-purple-800"
+                            >
+                              ⇄ Déviation
+                            </button>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => setMissionSelectionnee(m)}
+                            className="px-2 py-1 text-[11px] font-medium rounded bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300"
+                          >
+                            Détails
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -650,6 +894,16 @@ export default function Missions() {
             chargerDonnees();
             setMissionSelectionnee(null);
           }}
+          onOuvrirDeviation={() => {
+            const m = missionSelectionnee;
+            setMissionSelectionnee(null);
+            setModalDeviationMission(m);
+          }}
+          onOuvrirInvalidation={() => {
+            const m = missionSelectionnee;
+            setMissionSelectionnee(null);
+            setModalInvalidationMission(m);
+          }}
         />
       )}
 
@@ -665,6 +919,42 @@ export default function Missions() {
           }}
         />
       )}
+
+      {/* Modal Saisie Rapide OT pour Mission Active */}
+      {modalSaisieOtMission && (
+        <ModalSaisieOT
+          mission={modalSaisieOtMission}
+          onFermer={() => setModalSaisieOtMission(null)}
+          onSucces={() => {
+            chargerDonnees();
+            setModalSaisieOtMission(null);
+          }}
+        />
+      )}
+
+      {/* Modal Invalidation Déchargement avec Motifs Prédéfinis (Règle 5) */}
+      {modalInvalidationMission && (
+        <ModalInvalidation
+          mission={modalInvalidationMission}
+          onFermer={() => setModalInvalidationMission(null)}
+          onSucces={() => {
+            chargerDonnees();
+            setModalInvalidationMission(null);
+          }}
+        />
+      )}
+
+      {/* Modal Déclaration de Déviation (Règle 6) */}
+      {modalDeviationMission && (
+        <ModalDeviation
+          mission={modalDeviationMission}
+          onFermer={() => setModalDeviationMission(null)}
+          onSucces={() => {
+            chargerDonnees();
+            setModalDeviationMission(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -676,13 +966,16 @@ function ModalDetailMission({
   mission,
   onFermer,
   onMissionModifiee,
+  onOuvrirDeviation,
+  onOuvrirInvalidation,
 }: {
   mission: Mission;
   onFermer: () => void;
   onMissionModifiee: () => void;
+  onOuvrirDeviation: () => void;
+  onOuvrirInvalidation: () => void;
 }) {
   const [enAction, setEnAction] = useState(false);
-  const [nouvelleDestination, setNouvelleDestination] = useState(mission.depot_effectif || mission.depot_prevu || "");
 
   async function cloreMissionManuellement() {
     if (!confirm(`Confirmez-vous la validation du déchargement et la clôture de la mission ${mission.code_mission || mission.numero_ot} ? Le camion repassera au statut LIBRE.`)) {
@@ -690,13 +983,8 @@ function ModalDetailMission({
     }
     setEnAction(true);
     try {
-      await api(`/api/missions/${mission.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          statut: "TERMINÉE",
-          statut_camion_actuel: "LIBRE",
-          depot_effectif: nouvelleDestination || mission.depot_prevu,
-        }),
+      await api(`/api/missions/${mission.id}/valider-dechargement`, {
+        method: "POST",
       });
       onMissionModifiee();
     } catch (e: any) {
@@ -706,23 +994,15 @@ function ModalDetailMission({
     }
   }
 
-  async function declarerDeviation() {
-    const dest = prompt("Veuillez saisir le nouveau dépôt / nouvelle destination :", nouvelleDestination);
-    if (!dest || dest.trim() === "") return;
+  async function validerChargementDirect() {
     setEnAction(true);
     try {
-      await api(`/api/missions/${mission.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          statut: "DÉVIÉE",
-          est_deviee: true,
-          depot_effectif: dest.trim(),
-          motif_deviation: `Déviation manuelle vers ${dest.trim()}`,
-        }),
+      await api(`/api/missions/${mission.id}/valider-chargement`, {
+        method: "POST",
       });
       onMissionModifiee();
     } catch (e: any) {
-      alert("Erreur lors de la mise à jour : " + (e?.message || e));
+      alert("Erreur validation chargement : " + (e?.message || e));
     } finally {
       setEnAction(false);
     }
@@ -747,13 +1027,13 @@ function ModalDetailMission({
               </span>
             </div>
             <div className="text-[12px] text-slate-400 mt-0.5">
-              N° OT : <b className="text-slate-600 dark:text-slate-300">{mission.numero_ot || "—"}</b> · Produit :{" "}
+              N° OT : <b className="text-slate-600 dark:text-slate-300">{mission.numero_ot || "Sans OT (LIBRE)"}</b> · Produit :{" "}
               <b>{mission.produit || "—"}</b> · Distributeur : <b>{mission.distributeur || "—"}</b>
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Badge couleur={COULEURS_STATUT_CAMION[mission.statut_camion_actuel || "VIDE"]}>
-              Camion {mission.statut_camion_actuel || "VIDE"}
+            <Badge couleur={COULEURS_STATUT_CAMION[mission.statut_camion_actuel || "LIBRE"]}>
+              Camion {mission.statut_camion_actuel || "LIBRE"}
             </Badge>
             <Badge couleur={COULEURS_STATUT_MISSION[mission.statut]}>{mission.statut}</Badge>
           </div>
@@ -784,7 +1064,7 @@ function ModalDetailMission({
           <div className="p-3 rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
             <div className="text-[11px] text-slate-400 uppercase">Durée de Mission</div>
             <div className="font-bold mt-1 text-slate-700 dark:text-slate-200 tabular-nums">
-              {mission.statut === "EN_COURS" ? "En cours…" : fmtDuree(mission.duree_s)}
+              {mission.statut === "EN_COURS" ? `${fmtDuree(mission.duree_s)} (en cours)` : fmtDuree(mission.duree_s)}
             </div>
           </div>
         </div>
@@ -834,6 +1114,14 @@ function ModalDetailMission({
           </div>
         </div>
 
+        {/* Motif d'invalidation affiché si présent */}
+        {mission.motif_invalidation && (
+          <div className="p-3 rounded-lg border border-slate-300 dark:border-slate-700 bg-slate-100/80 dark:bg-slate-800/80 text-[12.5px]">
+            <span className="font-bold text-slate-700 dark:text-slate-200">Motif d'invalidation précédent : </span>
+            <span className="text-slate-600 dark:text-slate-300 italic">{mission.motif_invalidation}</span>
+          </div>
+        )}
+
         {/* Frise Chronologique des Jalons Détectés */}
         <div>
           <h4 className="text-[12px] font-bold uppercase tracking-wider text-slate-400 mb-3">
@@ -869,11 +1157,22 @@ function ModalDetailMission({
             <div className="text-[12px] text-slate-400">
               Arrêt prolongé (&ge; 3h) au dépôt récepteur clôture automatiquement la mission.
             </div>
-            <div className="flex items-center gap-2">
-              <Btn variante="fantome" onClick={declarerDeviation} disabled={enAction}>
-                <span>Signaler une déviation</span>
+            <div className="flex flex-wrap items-center gap-2">
+              <Btn variante="secondaire" onClick={onOuvrirDeviation} disabled={enAction}>
+                <Icon nom="recherche" className="w-3.5 h-3.5 text-purple-500" />
+                <span>Déclarer Déviation</span>
               </Btn>
-              <Btn variante="primaire" onClick={cloreMissionManuellement} disabled={enAction} className="bg-emerald-600 hover:bg-emerald-700 text-white">
+              {mission.statut_camion_actuel !== "CHARGE" && (
+                <Btn variante="secondaire" onClick={validerChargementDirect} disabled={enAction} className="border-amber-400 text-amber-700 dark:text-amber-300">
+                  <span>Valider Chargement GRT</span>
+                </Btn>
+              )}
+              {mission.statut_camion_actuel === "CHARGE" && (
+                <Btn variante="secondaire" onClick={onOuvrirInvalidation} disabled={enAction}>
+                  <span>Invalider Déchargement</span>
+                </Btn>
+              )}
+              <Btn variante="primaire" onClick={cloreMissionManuellement} disabled={enAction} className="bg-emerald-600 hover:bg-emerald-700 text-white font-medium">
                 <Icon nom="verifier" className="w-4 h-4" />
                 <span>Valider Déchargement & Clôturer (LIBRE)</span>
               </Btn>
@@ -1041,6 +1340,285 @@ function ModalNouvelleMission({
           </Btn>
           <Btn type="submit" variante="primaire" disabled={envoi}>
             {envoi ? <Spinner /> : <span>Valider et Démarrer Mission</span>}
+          </Btn>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// =============================================================================
+// MODAL SAISIE OT RAPIDE SUR MISSION EN COURS
+// =============================================================================
+function ModalSaisieOT({
+  mission,
+  onFermer,
+  onSucces,
+}: {
+  mission: Mission;
+  onFermer: () => void;
+  onSucces: () => void;
+}) {
+  const [numeroOt, setNumeroOt] = useState(mission.numero_ot || "");
+  const [distributeur, setDistributeur] = useState(mission.distributeur || DISTRIBUTEURS_LISTE[0]);
+  const [produit, setProduit] = useState(mission.produit || PRODUITS_LISTE[0]);
+  const [depotPrevu, setDepotPrevu] = useState(mission.depot_prevu || DEPOTS_LISTE[0].code);
+  const [envoi, setEnvoi] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!numeroOt.trim()) return alert("Veuillez saisir le numéro de l'OT.");
+
+    setEnvoi(true);
+    try {
+      await api(`/api/missions/${mission.id}`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          numero_ot: numeroOt.trim(),
+          distributeur,
+          produit,
+          depot_prevu: depotPrevu,
+          depot_effectif: depotPrevu,
+          statut_camion_actuel: "VIDE",
+        }),
+      });
+      onSucces();
+    } catch (err: any) {
+      alert("Erreur lors de la mise à jour de l'OT : " + (err?.message || err));
+    } finally {
+      setEnvoi(false);
+    }
+  }
+
+  return (
+    <Modal ouvert={true} onFermer={onFermer} titre={`Saisir OT — ${mission.plaque}`}>
+      <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
+        <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-lg text-[12px] text-amber-800 dark:text-amber-300">
+          ⚠️ Le camion est actuellement en statut <b>LIBRE</b>. La saisie des informations de l'OT basculera automatiquement son statut en <b>VIDE</b> et résoudra l'alerte.
+        </div>
+
+        <Champ label="Numéro Ordre de Transport (OT)">
+          <input
+            type="text"
+            value={numeroOt}
+            onChange={(e) => setNumeroOt(e.target.value)}
+            placeholder="Ex: OT-99410"
+            className={inputCls}
+            required
+            autoFocus
+          />
+        </Champ>
+
+        <div className="grid grid-cols-2 gap-3">
+          <Champ label="Distributeur">
+            <select
+              value={distributeur}
+              onChange={(e) => setDistributeur(e.target.value)}
+              className={inputCls}
+            >
+              {DISTRIBUTEURS_LISTE.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))}
+            </select>
+          </Champ>
+
+          <Champ label="Nature du Produit">
+            <select
+              value={produit}
+              onChange={(e) => setProduit(e.target.value)}
+              className={inputCls}
+            >
+              {PRODUITS_LISTE.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          </Champ>
+        </div>
+
+        <Champ label="Dépôt Récepteur Prévu">
+          <select
+            value={depotPrevu}
+            onChange={(e) => setDepotPrevu(e.target.value)}
+            className={inputCls}
+          >
+            {DEPOTS_LISTE.map((d) => (
+              <option key={d.code} value={d.code}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </Champ>
+
+        <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+          <Btn variante="fantome" onClick={onFermer}>
+            Annuler
+          </Btn>
+          <Btn type="submit" variante="primaire" disabled={envoi}>
+            {envoi ? <Spinner /> : <span>Enregistrer OT (Statut ➔ VIDE)</span>}
+          </Btn>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// =============================================================================
+// MODAL INVALIDATION DE DÉCHARGEMENT AVEC MOTIFS PRÉDÉFINIS (RÈGLE 5)
+// =============================================================================
+function ModalInvalidation({
+  mission,
+  onFermer,
+  onSucces,
+}: {
+  mission: Mission;
+  onFermer: () => void;
+  onSucces: () => void;
+}) {
+  const [motif, setMotif] = useState(MOTIFS_INVALIDATION[0]);
+  const [commentaire, setCommentaire] = useState("");
+  const [envoi, setEnvoi] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setEnvoi(true);
+    try {
+      await api(`/api/missions/${mission.id}/invalider-dechargement`, {
+        method: "POST",
+        body: JSON.stringify({
+          motif,
+          commentaire: commentaire.trim() || undefined,
+        }),
+      });
+      onSucces();
+    } catch (err: any) {
+      alert("Erreur lors de l'invalidation : " + (err?.message || err));
+    } finally {
+      setEnvoi(false);
+    }
+  }
+
+  return (
+    <Modal ouvert={true} onFermer={onFermer} titre={`Invalider Déchargement — ${mission.plaque}`}>
+      <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
+        <div className="p-3 bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-lg text-[12px] text-slate-700 dark:text-slate-300">
+          ⓘ L'invalidation du déchargement maintient la mission <b>EN COURS</b> et conserve le statut du camion à <b>CHARGÉ</b> (ex: simple passage pour échantillon, repos de nuit).
+        </div>
+
+        <Champ label="Motif d'invalidation">
+          <select
+            value={motif}
+            onChange={(e) => setMotif(e.target.value)}
+            className={inputCls}
+            required
+          >
+            {MOTIFS_INVALIDATION.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </Champ>
+
+        <Champ label="Remarque / Commentaire complémentaire (facultatif)">
+          <textarea
+            value={commentaire}
+            onChange={(e) => setCommentaire(e.target.value)}
+            placeholder="Détails complémentaires sur la situation..."
+            rows={3}
+            className={inputCls}
+          />
+        </Champ>
+
+        <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+          <Btn variante="fantome" onClick={onFermer}>
+            Annuler
+          </Btn>
+          <Btn type="submit" variante="primaire" disabled={envoi} className="bg-slate-700 hover:bg-slate-800 text-white">
+            {envoi ? <Spinner /> : <span>Confirmer Invalidation (Reste CHARGÉ)</span>}
+          </Btn>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// =============================================================================
+// MODAL DÉCLARATION DE DÉVIATION DE DÉPÔT (RÈGLE 6)
+// =============================================================================
+function ModalDeviation({
+  mission,
+  onFermer,
+  onSucces,
+}: {
+  mission: Mission;
+  onFermer: () => void;
+  onSucces: () => void;
+}) {
+  const [nouveauDepot, setNouveauDepot] = useState(mission.depot_effectif || DEPOTS_LISTE[0].label);
+  const [motif, setMotif] = useState("");
+  const [envoi, setEnvoi] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setEnvoi(true);
+    try {
+      await api(`/api/missions/${mission.id}/declarer-deviation`, {
+        method: "POST",
+        body: JSON.stringify({
+          nouveau_depot: nouveauDepot,
+          motif: motif.trim() || undefined,
+        }),
+      });
+      onSucces();
+    } catch (err: any) {
+      alert("Erreur lors de la déclaration de déviation : " + (err?.message || err));
+    } finally {
+      setEnvoi(false);
+    }
+  }
+
+  return (
+    <Modal ouvert={true} onFermer={onFermer} titre={`Déclarer Déviation — ${mission.plaque}`}>
+      <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
+        <div className="p-3 bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800 rounded-lg text-[12px] text-purple-800 dark:text-purple-300">
+          ⓘ Dépôt initialement prévu : <b>{mission.depot_prevu || mission.depot || "Non renseigné"}</b>. La déclaration d'une déviation basculera le statut de la mission en <b>DÉVIÉE</b>.
+        </div>
+
+        <Champ label="Nouveau Dépôt Récepteur">
+          <select
+            value={nouveauDepot}
+            onChange={(e) => setNouveauDepot(e.target.value)}
+            className={inputCls}
+            required
+          >
+            {DEPOTS_LISTE.map((d) => (
+              <option key={d.code} value={d.label}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </Champ>
+
+        <Champ label="Motif ou instruction du distributeur">
+          <input
+            type="text"
+            value={motif}
+            onChange={(e) => setMotif(e.target.value)}
+            placeholder="Ex: Réorientation demandée par Total suite à rupture de stock..."
+            className={inputCls}
+          />
+        </Champ>
+
+        <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+          <Btn variante="fantome" onClick={onFermer}>
+            Annuler
+          </Btn>
+          <Btn type="submit" variante="primaire" disabled={envoi} className="bg-purple-600 hover:bg-purple-700 text-white">
+            {envoi ? <Spinner /> : <span>Confirmer Déviation</span>}
           </Btn>
         </div>
       </form>
