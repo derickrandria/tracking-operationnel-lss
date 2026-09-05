@@ -79,7 +79,7 @@ async def _boucle_collecteur_reel():
         log.warning("SIMULATEUR et COLLECTEUR %s actifs ensemble — "
                     "mettez SIM_ENABLE=0 pour la production réelle", source)
     log.info("Collecteur réel %s activé (période %ss)",
-             source, os.getenv("COLLECTOR_PERIODE_S", "60"))
+             source, os.getenv("COLLECTOR_PERIODE_S", "10"))
     await asyncio.to_thread(boucle_collecte)
 
 

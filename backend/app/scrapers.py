@@ -1997,7 +1997,7 @@ def boucle_collecte():
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
     borne §5 : pas de flux temps réel fiable côté Camtrack)."""
     source = os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper()
-    periode = _env_int("COLLECTOR_PERIODE_S", 420)
+    periode = _env_int("COLLECTOR_PERIODE_S", 10)
     noms = SOURCES_NIVEAU1_MIXTE if source == "MIXTE" else [source]
     classes = [(nom, SOURCES.get(nom)) for nom in noms]
     classes = [(nom, c) for nom, c in classes if c is not None]
@@ -2043,7 +2043,7 @@ def boucle_collecte():
         # §0sexies A4 (arbitrage 20/08/2026) — N1 CamtrackPro via l'API Wialon
         # à la même cadence (dernier message par unité ; échec → cycle reporté,
         # aucun flux écran fiable §5)
-        if jeton_configure():
+        if source != "CAMTRACKPRO" and jeton_configure():
             n_ctp = _collecter_camtrackpro_n1()
             if n_ctp:
                 log.info("Collecte CAMTRACKPRO (API) : %d points insérés",

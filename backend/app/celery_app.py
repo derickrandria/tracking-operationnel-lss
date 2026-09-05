@@ -21,7 +21,7 @@ celery.conf.timezone = "Indian/Antananarivo"
 
 @celery.task
 def collecte_gps():
-    """Scraping MZoneX/CamtrackPro (§10) — planifié toutes les 5–10 min."""
+    """Collecte API MZoneX/CamtrackPro (§10) — planifiée toutes les 10 s."""
     from .scrapers import SOURCES
     source = os.getenv("COLLECTOR_SOURCE", "MZONEX")
     return SOURCES[source]().run()
@@ -44,7 +44,7 @@ def cycle_minuit():
 
 
 celery.conf.beat_schedule = {
-    "collecte-gps": {"task": "app.celery_app.collecte_gps", "schedule": 420.0},
+    "collecte-gps": {"task": "app.celery_app.collecte_gps", "schedule": 10.0},
     "chien-de-garde": {"task": "app.celery_app.chien_de_garde", "schedule": 60.0},
     "cycle-minuit": {"task": "app.celery_app.cycle_minuit",
                      "schedule": crontab(hour=0, minute=0)},
