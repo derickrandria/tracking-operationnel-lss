@@ -1919,46 +1919,73 @@ RELECTURE_N1_PERIODE_S = int(os.getenv("RELECTURE_N1_PERIODE_S", "3600"))
 _relecture_n1_memo: dict = {"mono": 0.0}
 
 
+def _fenetres_manquantes_mzonex(db, jours: int, maintenant: datetime) -> list[tuple]:
+    """Détecte les TROUS de la base MZoneX : fenêtres locales [debut, fin]
+    (bornées 04h00 → 23h30, hors nuit — le serveur est éteint le soir, §8)
+    sans aucun événement pendant > FENETRE_MAX_S. Ciblé : on ne relit
+    QUE ce qui manque, jamais des journées complètes déjà en base (leçon du
+    04/09 : la relecture intégrale de 8 jours ~200 000 points sature le GIL
+    et fige le serveur). Une journée ENTIÈREMENT vide (ex. 30/08/2026) donne
+    une seule fenêtre couvrant le jour → rattrapée elle aussi."""
+    from .api_mzonex import FENETRE_MAX_S
+    fenetres: list[tuple[datetime, datetime]] = []
+    for k in range(jours, -1, -1):
+        jour = maintenant.date() - timedelta(days=k)
+        debut_j = max(datetime.combine(jour, datetime.min.time()).replace(hour=4),
+                      datetime.combine(jour, datetime.min.time()))
+        fin_j = min(datetime.combine(jour, datetime.min.time()).replace(hour=23, minute=30),
+                    maintenant)
+        if fin_j <= debut_j:
+            continue
+        hords = db.scalars(select(EvenementGPS.horodatage).where(
+            EvenementGPS.source == SourceEvenement.MZONEX,
+            EvenementGPS.horodatage >= debut_j,
+            EvenementGPS.horodatage < fin_j).order_by(
+                EvenementGPS.horodatage)).all()
+        prev = debut_j
+        for h in hords:
+            if (h - prev).total_seconds() > FENETRE_MAX_S:
+                fenetres.append((prev, h))
+            prev = max(prev, h)
+        # trou de queue : jour passé clos à 23h30 → la fenêtre 23h30→minuit
+        # n'est pas chassée ; jour courant → rattrape jusqu'à maintenant
+        if (fin_j - prev).total_seconds() > FENETRE_MAX_S:
+            fin_t = fin_j if k == 0 else min(fin_j, prev + timedelta(days=1))
+            fenetres.append((prev, fin_t))
+    return fenetres
+
+
 def relecture_n1_mzonex(jours: int | None = None) -> int:
-    """Rejoue les Événements MZoneX des J derniers jours (J-7 → J-1 jours
-    complets + partie du jour courant ANTÉRIEURE à la fenêtre incrémentale 3 h)
-    et les insère par le MÊME pipeline. Retourne le nombre de points insérés.
-    Toute exception est journalisée, jamais propagée (§10)."""
+    """Rattrape les TROUS de la base en rejouant les Événements MZoneX des
+    fenêtres manquantes uniquement (J-7 → J, découpage horaire v1.46) et les
+    insère par le MÊME pipeline. Idempotent (anti-rejeu : zéro doublon).
+    Retourne le nombre de points insérés. Jamais d'exception propagée (§10)."""
     if not RELECTURE_N1_ACTIVE or not _mzonex_api_active():
         return 0
     jours = RELECTURE_N1_JOURS if jours is None else max(0, jours)
     maintenant = now_local()
+    db = SessionLocal()
+    try:
+        fenetres = _fenetres_manquantes_mzonex(db, jours, maintenant)
+    finally:
+        db.close()
+    if not fenetres:
+        return 0
     coll = MZoneXApiCollector()
     total = 0
     try:
-        # Jours passés : journée locale complète [00:00 → 24:00]
-        for k in range(jours, 0, -1):
-            jour = maintenant.date() - timedelta(days=k)
-            debut_local = datetime.combine(jour, datetime.min.time())
-            fin_local = debut_local + timedelta(days=1)
+        for debut_local, fin_local in fenetres:
             brut = coll.api.evenements(coll.api._utc_naive(debut_local),
                                        coll.api._utc_naive(fin_local))
             points = coll.normaliser(brut)
+            n = 0
             if points:
                 n = coll.inserer(points)
                 total += n
-                log.info("Relecture N1 MZoneX %s : %d point(s) inséré(s)",
-                         jour.isoformat(), n)
-        # Jour courant : uniquement ce qui PRÉCÈDE la fenêtre incrémentale
-        from .api_mzonex import FENETRE_MAX_S
-        plancher = maintenant - timedelta(seconds=FENETRE_MAX_S)
-        debut_jour = datetime.combine(maintenant.date(), datetime.min.time())
-        if plancher > debut_jour:
-            brut = coll.api.evenements(coll.api._utc_naive(debut_jour),
-                                       coll.api._utc_naive(plancher))
-            points = coll.normaliser(brut)
-            if points:
-                n = coll.inserer(points)
-                total += n
-                log.info("Relecture N1 MZoneX (jour courant, %s → %s) : "
-                         "%d point(s) inséré(s)",
-                         debut_jour.strftime("%H:%M"),
-                         plancher.strftime("%H:%M"), n)
+            log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
+                     "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
+                     fin_local.strftime("%H:%M"), len(brut), n)
+            time.sleep(0.5)   # laisser respirer la boucle d'événements (GIL)
     except Exception:
         log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
                       "passage)")
