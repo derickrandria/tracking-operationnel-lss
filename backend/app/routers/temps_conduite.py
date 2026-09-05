@@ -764,8 +764,8 @@ def export_temps_conduite_xlsx(du: str | None = None, au: str | None = None,
 
     row_num = 4
     for l in lignes:
-        # Col 1: Chauffeur
-        nom_complet = f"{l['prenom_usuel']} ({l['nom_prenom']})" if l['prenom_usuel'] else l['nom_prenom']
+        # Col 1: Chauffeur (Nom et Prénom uniquement, sans prénom usuel)
+        nom_complet = l['nom_prenom'] or l['prenom_usuel'] or "—"
         c_nom = ws.cell(row=row_num, column=1, value=nom_complet)
         c_nom.font = Font(bold=True)
         c_nom.alignment = Alignment(horizontal="left", vertical="center")
@@ -898,7 +898,7 @@ def export_temps_conduite_pdf(du: str | None = None, au: str | None = None,
     table_data = [headers]
     for l in lignes[:60]:
         row = [
-            l["prenom_usuel"] or l["nom_prenom"][:18],
+            l["nom_prenom"] or l["prenom_usuel"] or "—",
             l["matricule"],
             fmt_hms(l["tch_cumul_s"]) or "00:00",
             fmt_hms(l["tch_restant_s"]) or "56:00",

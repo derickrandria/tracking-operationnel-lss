@@ -774,7 +774,7 @@ def export_missions_pdf(titre_periode: str, missions: list[dict],
     data = [headers]
     for m in missions:
         cond = m.get("conducteur") or {}
-        chauffeur_nom = cond.get("prenom_usuel") or (cond.get("nom_prenom", "")[:16]) or "—"
+        chauffeur_nom = cond.get("nom_prenom") or cond.get("prenom_usuel") or "—"
         depot_eff = m.get("depot_effectif") or m.get("depot_prevu") or "—"
         if m.get("est_deviee"):
             depot_eff = f"{depot_eff}*"
