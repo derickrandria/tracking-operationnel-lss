@@ -215,17 +215,19 @@ FRONTEND_DIST = os.getenv("FRONTEND_DIST", str(ROOT_DIR.parent / "frontend" / "d
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 
 # ---------------------------------------------------------------- géographie
-# Points logistiques (coordonnées approximatives, Madagascar).
+# Points logistiques officiels (Madagascar).
+# Chargement : GRT (GALANA RAFINERIE TERMINALE) unique.
+# Déchargement : 7 dépôts officiels stricts (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE).
 GEO = {
     "BASE_TANA": (-18.8792, 47.5079, "Base LSS — Antananarivo"),
-    "DEPOT_DABI": (-18.8100, 47.4450, "Dépôt DABI — Ambohibao, Tana"),
-    "RAFF_TMT": (-18.1492, 49.4023, "Raffinerie TMT — Toamasina"),
-    "DMMG": (-18.9489, 48.2257, "Dépôt DMMG — Moramanga"),
-    "DABE": (-19.8659, 47.0333, "Dépôt DABE — Antsirabe"),
-    "DFIA": (-21.4536, 47.0857, "Dépôt DFIA — Fianarantsoa"),
-    "DSNR": (-12.2787, 49.2917, "Dépôt DSNR — Antsiranana"),
-    "DMKR": (-22.1486, 48.0106, "Dépôt DMKR — Manakara"),
-    "DMDV": (-15.7167, 46.3167, "Dépôt DMDV — Mahajanga"),
+    "GRT": (-18.1492, 49.4023, "GRT (GALANA RAFINERIE TERMINALE)"),
+    "DSNR": (-18.9300, 47.5200, "Depot Soanierana (DSNR)"),
+    "DABI": (-18.8100, 47.4450, "Depot Alarobia (DABI)"),
+    "DMMG": (-18.9489, 48.2257, "Depot Moramanga (DMMG)"),
+    "DFIA": (-21.4536, 47.0857, "Depot Fianarantsoa (DFIA)"),
+    "DMDV": (-20.2833, 44.2833, "Depot Morondava (DMDV)"),
+    "DMKR": (-22.1486, 48.0106, "Depot Manakara (DMKR)"),
+    "DABE": (-19.8659, 47.0333, "Depot Antsirabe (DABE)"),
 }
 
 # Corridors logistiques (polylignes simplifiées) utilisés pour l'alerte
@@ -251,32 +253,47 @@ ROUTES = {
         ("Ambohimangakely", -18.8650, 47.5900),
         ("Manjakandriana", -18.9167, 47.8000),
         ("Ambanidia", -18.9350, 48.0100),
-        ("Moramanga", -18.9489, 48.2257),
+        ("Depot Moramanga (DMMG)", -18.9489, 48.2257),
     ],
     "MMG_TMT": [
-        ("Moramanga", -18.9489, 48.2257),
+        ("Depot Moramanga (DMMG)", -18.9489, 48.2257),
         ("Andasibe", -18.8741, 48.4521),
         ("Beforona", -18.7270, 48.7240),
         ("Brickaville", -18.4445, 49.0880),
         ("Ranomainty", -18.1820, 49.2680),
-        ("Toamasina (TMT)", -18.1492, 49.4023),
+        ("GRT (GALANA RAFINERIE TERMINALE)", -18.1492, 49.4023),
     ],
     "TANA_ABE": [
-        ("Antananarivo", -18.8792, 47.5079),
+        ("Base LSS — Antananarivo", -18.8792, 47.5079),
         ("Ambatolampy", -19.3833, 47.4333),
-        ("Antsirabe", -19.8659, 47.0333),
+        ("Depot Antsirabe (DABE)", -19.8659, 47.0333),
     ],
     "ABE_FNR": [
-        ("Antsirabe", -19.8659, 47.0333),
+        ("Depot Antsirabe (DABE)", -19.8659, 47.0333),
         ("Ambositra", -20.5303, 47.2434),
-        ("Fianarantsoa", -21.4536, 47.0857),
+        ("Depot Fianarantsoa (DFIA)", -21.4536, 47.0857),
     ],
     "TANA_DABI": [
         ("Base LSS — Antananarivo", -18.8792, 47.5079),
-        ("Ambohibao (DABI)", -18.8100, 47.4450),
+        ("Depot Alarobia (DABI)", -18.8100, 47.4450),
     ],
 }
 
-DEPOTS = ["DABI", "DMMG", "DSNR", "DFIA", "DABE", "DMKR", "DMDV"]
+DEPOTS_OFFICIELS_DECHARGEMENT = {
+    "DSNR": "Depot Soanierana (DSNR)",
+    "DABI": "Depot Alarobia (DABI)",
+    "DMMG": "Depot Moramanga (DMMG)",
+    "DFIA": "Depot Fianarantsoa (DFIA)",
+    "DMDV": "Depot Morondava (DMDV)",
+    "DMKR": "Depot Manakara (DMKR)",
+    "DABE": "Depot Antsirabe (DABE)",
+}
+
+DEPOT_OFFICIEL_CHARGEMENT = {
+    "code": "GRT",
+    "nom": "GRT (GALANA RAFINERIE TERMINALE)",
+}
+
+DEPOTS = ["DSNR", "DABI", "DMMG", "DFIA", "DMDV", "DMKR", "DABE"]
 DISTRIBUTEURS = ["GALANA", "VIVO", "JOVENA", "TOTAL"]
 PRODUITS = ["SP95", "GO", "PL"]

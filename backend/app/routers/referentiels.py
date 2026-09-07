@@ -10,8 +10,10 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from ..config import (DEPOTS, DISTRIBUTEURS, PRODUITS, calculer_tokens_set,
-                      normaliser_libelle, normaliser_saisie, now_local)
+from ..config import (DEPOTS, DEPOT_OFFICIEL_CHARGEMENT,
+                      DEPOTS_OFFICIELS_DECHARGEMENT, DISTRIBUTEURS, PRODUITS,
+                      calculer_tokens_set, normaliser_libelle,
+                      normaliser_saisie, now_local)
 from ..database import get_db
 from ..engine import ensure_suivi, get_seuils
 from ..event_bus import publish
@@ -34,6 +36,10 @@ def referentiels(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS)))
         "situations": [s.libelle for s in situations],
         "statuts_camion": [s.value for s in StatutCamion],
         "depots": DEPOTS,
+        "depots_officiels_dechargement": [
+            {"code": k, "label": v} for k, v in DEPOTS_OFFICIELS_DECHARGEMENT.items()
+        ],
+        "depot_officiel_chargement": DEPOT_OFFICIEL_CHARGEMENT,
         "distributeurs": DISTRIBUTEURS,
         "produits": PRODUITS,
         "statuts_vehicule": [s.value for s in StatutVehicule],

@@ -274,15 +274,58 @@ def test_missions_cycle_complet():
     print("\n[RÈGLE 6b] Test API Déclaration Déviation manuelle")
     declarer_deviation_mission(
         "m-test-inval-02",
-        MissionDeclarerDeviation(nouveau_depot="Soanierana (DSNR)", motif="Changement de commande Total"),
+        MissionDeclarerDeviation(nouveau_depot="Depot Soanierana (DSNR)", motif="Changement de commande Total"),
         db=db,
         user=cond
     )
     db.refresh(m2)
     assert m2.est_deviee is True
     assert m2.statut == StatutMission.DEVIEE
-    assert m2.depot_effectif == "Soanierana (DSNR)"
+    assert m2.depot_effectif == "Depot Soanierana (DSNR)"
     print(f"  ✅ Déviation manuelle enregistrée : {m2.depot_effectif}")
+
+    # -------------------------------------------------------------------------
+    # RÈGLE DÉPÔTS STRICTS : Dépôt officiel unique GRT + 7 dépôts déchargement stricts
+    # -------------------------------------------------------------------------
+    print("\n[RÈGLE DÉPÔTS STRICTS] Test Dépôts officiels stricts (GRT unique & 7 déchargement)")
+    from backend.app.geozones import (
+        DEPOT_OFFICIEL_CHARGEMENT, DEPOTS_DECHARGEMENT_CODES,
+        DEPOTS_OFFICIELS_DECHARGEMENT, detecter_zone_logistique,
+        nom_officiel_depot, normaliser_code_depot)
+
+    # Vérification de l'exhaustivité des 7 dépôts de déchargement
+    depots_attendus = {"DSNR", "DABI", "DMMG", "DFIA", "DMDV", "DMKR", "DABE"}
+    assert DEPOTS_DECHARGEMENT_CODES == depots_attendus
+    assert len(DEPOTS_OFFICIELS_DECHARGEMENT) == 7
+    assert DEPOT_OFFICIEL_CHARGEMENT["code"] == "GRT"
+    assert "GALANA" in DEPOT_OFFICIEL_CHARGEMENT["nom"]
+
+    # Vérification détection GRT stricte
+    z_grt = detecter_zone_logistique(-18.1492, 49.4023)
+    assert z_grt["type"] == "GRT"
+    assert z_grt["code"] == "GRT"
+    assert z_grt["nom"] == "GRT (GALANA RAFINERIE TERMINALE)"
+
+    # Vérification qu'un lieu inventé ou non officiel n'est JAMAIS détecté comme dépôt
+    z_faux1 = detecter_zone_logistique(-18.5000, 48.5000, "Dépôt Privé Brickaville")
+    assert z_faux1["type"] != "DEPOT_RECEPTEUR"
+    assert z_faux1["type"] != "GRT"
+    assert z_faux1["code"] == "AUTRE"
+
+    z_faux2 = detecter_zone_logistique(None, None, "Parking Total Mahajanga")
+    assert z_faux2["type"] != "DEPOT_RECEPTEUR"
+    assert z_faux2["type"] != "GRT"
+    assert z_faux2["code"] == "AUTRE"
+
+    # Vérification des 7 dépôts officiels de déchargement
+    for code, nom_complet in DEPOTS_OFFICIELS_DECHARGEMENT.items():
+        assert normaliser_code_depot(code) == code
+        assert nom_officiel_depot(code) == nom_complet
+        z_dep = detecter_zone_logistique(None, None, nom_complet)
+        assert z_dep["type"] == "DEPOT_RECEPTEUR"
+        assert z_dep["code"] == code
+
+    print("  ✅ Vérification stricte validée : Seul GRT pour chargement et les 7 dépôts officiels pour déchargement.")
 
     # -------------------------------------------------------------------------
     # RÈGLE 9 : Persistance des Alertes en Week-end / Jour Férié

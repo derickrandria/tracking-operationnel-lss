@@ -53,13 +53,13 @@ const ETAPE_LABELS: Record<string, { label: string; couleur: string }> = {
 };
 
 const DEPOTS_LISTE = [
-  { code: "DMMG", label: "Moramanga (DMMG)" },
-  { code: "DABI", label: "Alarobia / Ambohibao (DABI)" },
-  { code: "DSNR", label: "Soanierana (DSNR)" },
-  { code: "DABE", label: "Antsirabe (DABE)" },
-  { code: "DFIA", label: "Fianarantsoa (DFIA)" },
-  { code: "DMDV", label: "Morondava (DMDV)" },
-  { code: "DMKR", label: "Manakara (DMKR)" },
+  { code: "DSNR", label: "Depot Soanierana (DSNR)" },
+  { code: "DABI", label: "Depot Alarobia (DABI)" },
+  { code: "DMMG", label: "Depot Moramanga (DMMG)" },
+  { code: "DFIA", label: "Depot Fianarantsoa (DFIA)" },
+  { code: "DMDV", label: "Depot Morondava (DMDV)" },
+  { code: "DMKR", label: "Depot Manakara (DMKR)" },
+  { code: "DABE", label: "Depot Antsirabe (DABE)" },
 ];
 
 const MOTIFS_INVALIDATION = [
