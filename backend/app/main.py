@@ -526,6 +526,17 @@ async def lifespan(app: FastAPI):
         reparation.reparer_historique_conducteurs_passes()
     except Exception:
         log.exception("Réparation initiale historique / missions en échec")
+    
+    # Réconciliation et persistance des alertes missions non traitées des jours passés
+    try:
+        db_a = SessionLocal()
+        try:
+            engine.reconcilier_alertes_missions_en_attente(db_a)
+        finally:
+            db_a.close()
+    except Exception:
+        log.exception("Réconciliation des alertes missions au démarrage en échec")
+
     daily.rattraper_au_demarrage()
     event_bus.attacher_boucle(asyncio.get_running_loop())
 

@@ -15,6 +15,7 @@ from datetime import date, datetime, time, timedelta
 from threading import RLock
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
 from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, calculer_tokens_set,
                      est_libelle_service_ou_garage, jour_attribution, mots_ignores_badge,
@@ -1432,8 +1433,6 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         datetime.fromisoformat(t_last["heure_fin"]) if isinstance(t_last.get("heure_fin"), str) else None)
                     if t_last_fin:
                         ts_dechargement = t_last_fin
-                if not ts_dechargement:
-                    ts_dechargement = ts_sortie_grt + timedelta(hours=8)
 
             # Calcul des kilométrages
             if s_j:
@@ -1512,9 +1511,9 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         stats["mises_a_jour"] += 1
                 else:
                     code = _formater_code_mission(numero_ot, j, 1)
-                    est_term = bool(ts_dechargement or (j < maintenant.date() and ts_sortie_grt))
+                    est_term = bool(ts_dechargement)
                     statut_m = StatutMission.TERMINEE if est_term else StatutMission.EN_COURS
-                    statut_c = "LIBRE" if est_term else ("CHARGE" if ts_sortie_grt else "VIDE")
+                    statut_c = "LIBRE" if est_term else ("CHARGE" if ts_sortie_grt else (StatutCamion.VIDE.value if numero_ot else StatutCamion.LIBRE.value))
                     
                     etapes = []
                     if ts_depart_base:
@@ -1557,8 +1556,161 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                     stats["creees"] += 1
 
     db.commit()
+    # Réconciliation et persistance des alertes non traitées des jours passés
+    reconcilier_alertes_missions_en_attente(db)
     log.info("Rattrapage missions 7 jours terminé : %s", stats)
     return stats
+
+
+def reconcilier_alertes_missions_en_attente(db: Session) -> int:
+    """Restaure et persiste toutes les alertes non traitées des jours passés
+    (week-ends, jours fériés, missions non validées) pour les afficher dès le démarrage."""
+    nb_creees = 0
+    now = now_local()
+
+    # 1. Nettoyage préventif des alertes obsolètes de type MISSION_RETARDEE
+    db.query(Alerte).filter(
+        Alerte.type == TypeAlerte.MISSION_RETARDEE,
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    # 2. Récupération des missions actives des 30 derniers jours
+    debut_recherche = now.date() - timedelta(days=30)
+    missions_actives = list(db.scalars(
+        select(Mission).where(
+            Mission.date_jour >= debut_recherche,
+            Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE])
+        ).order_by(Mission.date_jour.asc(), Mission.heure_debut.asc())
+    ).all())
+
+    for m in missions_actives:
+        v = db.get(Vehicule, m.vehicule_id)
+        if not v:
+            continue
+
+        etapes = m.etapes or []
+
+        # Alerte 1 : MISSION_SANS_OT (camion à GRT sans OT)
+        a_entree_grt = any(e.get("etat") == "ENTREE_GRT" for e in etapes)
+        if a_entree_grt and (not m.numero_ot or m.statut_camion_actuel == "LIBRE"):
+            ts_grt = None
+            for e in etapes:
+                if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
+                    try:
+                        ts_grt = datetime.fromisoformat(e["ts"])
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = (ts_grt + timedelta(minutes=15)) if ts_grt else (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.MISSION_SANS_OT,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.MISSION_SANS_OT, GraviteAlerte.MOYENNE,
+                    f"OT manquant — Le camion {v.plaque} est à GRT Toamasina sans Ordre de Transport enregistré",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+        # Alerte 2 : VALIDATION_CHARGEMENT (camion à GRT ≥ 30 min ou en attente)
+        if m.validation_chargement == "EN_ATTENTE" or (a_entree_grt and not m.heure_chargement and m.validation_chargement != "VALIDÉ"):
+            ts_grt = None
+            for e in etapes:
+                if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
+                    try:
+                        ts_grt = datetime.fromisoformat(e["ts"])
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = (ts_grt + timedelta(minutes=30)) if ts_grt else (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.VALIDATION_CHARGEMENT,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.VALIDATION_CHARGEMENT, GraviteAlerte.INFORMATION,
+                    f"Validation requise : Chargement GRT Toamasina pour {v.plaque}",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+        # Alerte 3 : VALIDATION_DECHARGEMENT (camion au dépôt récepteur ≥ 3h ou en attente)
+        a_arrivee_depot = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") for e in etapes)
+        if (m.validation_dechargement == "EN_ATTENTE" or a_arrivee_depot) and m.validation_dechargement not in ("VALIDÉ", "INVALIDÉ"):
+            ts_depot = None
+            lieu_depot = m.depot_effectif or m.depot_prevu or "dépôt"
+            for e in reversed(etapes):
+                if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("ts"):
+                    try:
+                        ts_depot = datetime.fromisoformat(e["ts"])
+                        if e.get("lieu"):
+                            lieu_depot = e["lieu"]
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = (ts_depot + timedelta(hours=3)) if ts_depot else (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
+                    f"Validation requise : Déchargement au dépôt {lieu_depot} pour {v.plaque} (durée arrêt ≥ 3h)",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+        # Alerte 4 : DEVIATION_DETECTEE
+        if m.est_deviee or m.statut == StatutMission.DEVIEE:
+            ts_dev = None
+            for e in reversed(etapes):
+                if e.get("etat") == "DEVIATION_DETECTEE" and e.get("ts"):
+                    try:
+                        ts_dev = datetime.fromisoformat(e["ts"])
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = ts_dev or m.heure_debut or now
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.DEVIATION_DETECTEE,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
+                    f"Déviation détectée pour {v.plaque} : nouveau dépôt {m.depot_effectif or '—'} (prévu : {m.depot_prevu or '—'})",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+    if nb_creees > 0:
+        db.commit()
+        log.info("Réconciliation des alertes missions des jours passés : %d alerte(s) persistante(s) restaurée(s)", nb_creees)
+    return nb_creees
 
 
 CHAMPS_A = {"conducteur_id"}

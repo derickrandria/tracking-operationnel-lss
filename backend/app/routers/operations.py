@@ -10,7 +10,8 @@ from ..config import now_local
 from ..database import get_db
 from ..engine import (PUBLISH_ENABLED, _formater_code_mission, appliquer_champs_suivi,
                       ensure_suivi, ensure_suivis_du_jour, get_seuils,
-                      initialiser_ou_maj_mission, prefill_positions_gps)
+                      initialiser_ou_maj_mission, prefill_positions_gps,
+                      reconcilier_alertes_missions_en_attente)
 from ..models import (Alerte, Conducteur, Infraction, Mission, StatutAlerte,
                       StatutCamion, StatutMission, SuiviJournalier, TypeAlerte,
                       Vehicule, uid)
@@ -819,12 +820,8 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
 @router.get("/missions/alertes")
 def alertes_missions(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
     """Récupère les alertes spécifiques au cycle des Missions (GRT, chargement, déchargement, déviation)."""
-    # Nettoyage automatique des alertes obsolètes de type MISSION_RETARDEE
-    db.query(Alerte).filter(
-        Alerte.type == TypeAlerte.MISSION_RETARDEE,
-        Alerte.statut != StatutAlerte.TRAITEE
-    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
-    db.commit()
+    # Réconciliation automatique des alertes en attente des jours passés
+    reconcilier_alertes_missions_en_attente(db)
 
     types_missions = [
         TypeAlerte.MISSION_SANS_OT,
