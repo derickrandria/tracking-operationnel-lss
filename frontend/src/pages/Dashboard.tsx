@@ -29,55 +29,82 @@ function CarteFlotte({ positions, suivre }: { positions: any[]; suivre: Map<stri
   const theme = useTheme();
 
   useEffect(() => {
-    if (!el.current || mapRef.current) return;
-    const map = L.map(el.current, { zoomControl: true, attributionControl: true })
-      .setView([-18.9, 47.9], 8);
-    mapRef.current = map;
-    return () => { map.remove(); mapRef.current = null; marqueurs.current.clear(); };
+    if (!el.current) return;
+    if (mapRef.current) {
+      try { mapRef.current.remove(); } catch {}
+      mapRef.current = null;
+    }
+    if ((el.current as any)._leaflet_id) {
+      delete (el.current as any)._leaflet_id;
+    }
+    try {
+      const map = L.map(el.current, { zoomControl: true, attributionControl: true })
+        .setView([-18.9, 47.9], 8);
+      mapRef.current = map;
+    } catch (err) {
+      console.warn("Erreur init Leaflet:", err);
+    }
+    return () => {
+      if (mapRef.current) {
+        try { mapRef.current.remove(); } catch {}
+        mapRef.current = null;
+      }
+      marqueurs.current.clear();
+    };
   }, []);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    map.eachLayer((l) => { if (l instanceof L.TileLayer) map.removeLayer(l); });
-    const sombre = theme === "dark";
-    L.tileLayer(
-      sombre
-        ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-        : "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-      { attribution: "© OpenStreetMap · © CARTO", maxZoom: 18 },
-    ).addTo(map);
-    setTimeout(() => map.invalidateSize(), 100);
+    try {
+      map.eachLayer((l) => { if (l instanceof L.TileLayer) map.removeLayer(l); });
+      const sombre = theme === "dark";
+      L.tileLayer(
+        sombre
+          ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+          : "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        { attribution: "© OpenStreetMap · © CARTO", maxZoom: 18 },
+      ).addTo(map);
+      setTimeout(() => {
+        try { map.invalidateSize(); } catch {}
+      }, 100);
+    } catch (err) {
+      console.warn("Erreur mise à jour tuiles Leaflet:", err);
+    }
   }, [theme]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    const presents = new Set<string>();
-    (positions || []).forEach((p) => {
-      if (p.lat == null || p.lng == null) return;
-      presents.add(p.vehicule_id);
-      const html = `<b>${p.plaque}</b> — ${p.conducteur || "sans chauffeur"}<br/>` +
-        `${p.adresse || "position inconnue"}<br/>` +
-        `Vitesse : ${Math.round(p.vitesse || 0)} km/h · ${p.statut_camion || "—"}<br/>` +
-        `<span style="color:#94a3b8">MAJ ${p.maj ? p.maj.slice(11, 16) : "—"}</span>`;
-      let m = marqueurs.current.get(p.vehicule_id);
-      if (!m) {
-        m = L.marker([p.lat, p.lng], { icon: iconeCamion(p.statut_camion) }).addTo(map);
-        marqueurs.current.set(p.vehicule_id, m);
-      } else {
-        m.setLatLng([p.lat, p.lng]);
-        m.setIcon(iconeCamion(p.statut_camion));
+    try {
+      const presents = new Set<string>();
+      (positions || []).forEach((p) => {
+        if (p.lat == null || p.lng == null) return;
+        presents.add(p.vehicule_id);
+        const html = `<b>${p.plaque}</b> — ${p.conducteur || "sans chauffeur"}<br/>` +
+          `${p.adresse || "position inconnue"}<br/>` +
+          `Vitesse : ${Math.round(p.vitesse || 0)} km/h · ${p.statut_camion || "—"}<br/>` +
+          `<span style="color:#94a3b8">MAJ ${p.maj ? p.maj.slice(11, 16) : "—"}</span>`;
+        let m = marqueurs.current.get(p.vehicule_id);
+        if (!m) {
+          m = L.marker([p.lat, p.lng], { icon: iconeCamion(p.statut_camion) }).addTo(map);
+          marqueurs.current.set(p.vehicule_id, m);
+        } else {
+          m.setLatLng([p.lat, p.lng]);
+          m.setIcon(iconeCamion(p.statut_camion));
+        }
+        m.bindPopup(html);
+      });
+      marqueurs.current.forEach((m, id) => {
+        if (!presents.has(id)) { m.remove(); marqueurs.current.delete(id); }
+      });
+      if (!cadre.current && presents.size > 2) {
+        const groupe = L.featureGroup([...marqueurs.current.values()]);
+        map.fitBounds(groupe.getBounds().pad(0.25));
+        cadre.current = true;
       }
-      m.bindPopup(html);
-    });
-    marqueurs.current.forEach((m, id) => {
-      if (!presents.has(id)) { m.remove(); marqueurs.current.delete(id); }
-    });
-    if (!cadre.current && presents.size > 2) {
-      const groupe = L.featureGroup([...marqueurs.current.values()]);
-      map.fitBounds(groupe.getBounds().pad(0.25));
-      cadre.current = true;
+    } catch (err) {
+      console.warn("Erreur mise à jour marqueurs Leaflet:", err);
     }
   }, [positions]);
 

@@ -37,8 +37,16 @@ export default function Vehicules() {
       setItems([]);
     }
   }
-  useEffect(() => { const t = setTimeout(charger, 200); return () => clearTimeout(t); }, [q, statut]);
-  useEffect(() => on("referentiels.changed", () => charger()), [q, statut]);
+  useEffect(() => {
+    charger();
+  }, []);
+
+  useEffect(() => {
+    const t = setTimeout(charger, 250);
+    return () => clearTimeout(t);
+  }, [q, statut]);
+
+  useEffect(() => on("referentiels.changed", () => charger()), []);
   useEffect(() => { api("/api/conducteurs?statut=ACTIF").then(setConducteurs).catch(() => {}); }, []);
 
   async function sauvegarder(e: FormEvent) {

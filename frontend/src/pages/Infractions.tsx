@@ -83,7 +83,7 @@ export default function Infractions() {
       timer.current = window.setTimeout(charger, 1200);
     });
     return off;
-  });
+  }, []);
 
   async function decider(i: Infraction, decision: "VALIDE" | "INVALIDE", obs?: string) {
     setEnCours(true);

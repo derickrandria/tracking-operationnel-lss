@@ -148,14 +148,9 @@ export default function Missions() {
       if (distributeurFiltre) params.append("distributeur", distributeurFiltre);
       if (recherche.trim()) params.append("q", recherche.trim());
 
-      const [resMissions, resAlertes] = await Promise.all([
-        api(`/api/missions?${params.toString()}`),
-        api("/api/missions/alertes"),
-      ]);
-
+      const resMissions = await api(`/api/missions?${params.toString()}`);
       setMissions(resMissions.missions || []);
       setStats(resMissions.stats || null);
-      setAlertes(resAlertes.items || []);
     } catch (e) {
       console.error("Erreur chargement missions:", e);
     } finally {
