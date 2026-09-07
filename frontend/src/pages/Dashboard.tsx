@@ -97,6 +97,7 @@ function Kpi({ label, valeur, sous, accent }: { label: string; valeur: any; sous
 
 export default function Dashboard() {
   const [data, setData] = useState<any | null>(null);
+  const [erreur, setErreur] = useState<string | null>(null);
   const [maj, setMaj] = useState("");
   const theme = useTheme();
   const timer = useRef<number>();
@@ -105,8 +106,12 @@ export default function Dashboard() {
     try {
       const d = await api("/api/dashboard");
       setData(d);
+      setErreur(null);
       setMaj(new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
-    } catch { /* géré globalement */ }
+    } catch (e: any) {
+      console.error("Erreur chargement dashboard:", e);
+      setErreur(e?.message || "Erreur de chargement des données");
+    }
   }
 
   useEffect(() => {
@@ -121,6 +126,21 @@ export default function Dashboard() {
       .map((t) => on(t, rafraichir));
     return () => offs.forEach((f) => f());
   }, []);
+
+  if (erreur && !data) {
+    return (
+      <div className="flex h-64 flex-col items-center justify-center gap-3 text-slate-500">
+        <p className="text-red-500 font-medium">{erreur}</p>
+        <button
+          type="button"
+          onClick={() => charger()}
+          className="px-3 py-1.5 text-xs font-semibold rounded bg-blue-600 hover:bg-blue-700 text-white"
+        >
+          Réessayer
+        </button>
+      </div>
+    );
+  }
 
   if (!data) return <div className="flex h-64 items-center justify-center gap-2 text-slate-400"><Spinner /> Chargement du dashboard…</div>;
 

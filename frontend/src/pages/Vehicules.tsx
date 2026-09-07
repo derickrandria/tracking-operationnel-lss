@@ -29,7 +29,13 @@ export default function Vehicules() {
     const p = new URLSearchParams();
     if (q) p.set("q", q);
     if (statut) p.set("statut", statut);
-    setItems(await api(`/api/vehicules?${p}`));
+    try {
+      const res = await api(`/api/vehicules?${p}`);
+      setItems(res || []);
+    } catch (e) {
+      console.error("Erreur chargement véhicules:", e);
+      setItems([]);
+    }
   }
   useEffect(() => { const t = setTimeout(charger, 200); return () => clearTimeout(t); }, [q, statut]);
   useEffect(() => on("referentiels.changed", () => charger()), [q, statut]);
