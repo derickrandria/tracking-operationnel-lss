@@ -1164,9 +1164,36 @@ def nettoyer_alertes_missions_invalides(db=None) -> dict:
     if db is None:
         db = SessionLocal()
         propre = True
-    resultat = {"succes": True}
+    resultat = {"succes": True, "missions_corrigees": 0}
     try:
+        from .models import Mission, Alerte, StatutMission, StatutAlerte, TypeAlerte
+        from .geozones import normaliser_code_depot, nom_officiel_depot
         from .engine import reconcilier_alertes_missions_en_attente
+
+        # 1. Correction des déviations fantômes vers Moramanga dues au transit RN2
+        missions = db.query(Mission).all()
+        for m in missions:
+            code_prev = normaliser_code_depot(m.depot_prevu)
+            code_eff = normaliser_code_depot(m.depot_effectif)
+            if m.est_deviee and code_eff == "DMMG" and code_prev in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"):
+                m.est_deviee = False
+                m.depot_effectif = nom_officiel_depot(m.depot_prevu) or m.depot_prevu
+                m.motif_deviation = None
+                if m.statut == StatutMission.DEVIEE:
+                    m.statut = StatutMission.TERMINEE if m.heure_fin else StatutMission.EN_COURS
+                if m.etapes:
+                    m.etapes = [e for e in m.etapes if e.get("etat") != "DEVIATION_DETECTEE" or e.get("zone") != "DMMG"]
+                resultat["missions_corrigees"] += 1
+
+        db.query(Alerte).filter(
+            Alerte.type.in_([TypeAlerte.DEVIATION_DETECTEE, TypeAlerte.VALIDATION_DECHARGEMENT]),
+            Alerte.message.like("%Depot Moramanga (DMMG)%prévu : Depot Alarobia%"),
+            Alerte.statut != StatutAlerte.TRAITEE
+        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+        db.commit()
+
+        # 2. Réconciliation stricte
         nb = reconcilier_alertes_missions_en_attente(db)
         resultat["nb_restaurees"] = nb
         log.info("Nettoyage et réconciliation des alertes missions terminé.")

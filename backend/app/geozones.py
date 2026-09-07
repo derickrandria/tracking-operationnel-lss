@@ -333,7 +333,7 @@ ZONES_CANONIQUES = {
         "code": "DMMG",
         "nom": "Depot Moramanga (DMMG)",
         "mots_cles": ["depot moramanga", "dépôt moramanga", "moramanga", "dmmg"],
-        "coords": [(-18.9489, 48.2257, 3500)],
+        "coords": [(-18.9489, 48.2257, 1500)],
         "est_depot_sud": False,
     },
     "DFIA": {

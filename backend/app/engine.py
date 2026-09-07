@@ -1057,87 +1057,132 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                     pass
                 elif z_type == "DEPOT_RECEPTEUR" and z_code in DEPOTS_DECHARGEMENT_CODES:
                     nom_depot_officiel = nom_officiel_depot(z_code) or z_nom
-                    if z_code == code_prevu or not code_prevu:
-                        if not any(e.get("etat") == "ARRIVEE_DEPOT_RECEPTEUR" for e in (m_actuelle.etapes or [])):
+                    
+                    if z_code == code_prevu or not code_prevu or m_actuelle.est_deviee:
+                        # 3.1 Camion dans son dépôt récepteur prévu (ou déviation déjà confirmée)
+                        if not any(e.get("etat") == "ARRIVEE_DEPOT_RECEPTEUR" and e.get("zone") == z_code for e in (m_actuelle.etapes or [])):
                             m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ARRIVEE_DEPOT_RECEPTEUR", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
                             if PUBLISH_ENABLED["on"]:
                                 publish("mission.update", s_mission(m_actuelle))
                     else:
-                        # Présence dans un AUTRE dépôt officiel récepteur -> Détection de déviation
-                        if not m_actuelle.est_deviee:
-                            m_actuelle.est_deviee = True
-                            m_actuelle.statut = StatutMission.DEVIEE
-                            m_actuelle.depot_effectif = nom_depot_officiel
-                            m_actuelle.motif_deviation = f"Déviation constatée : réorienté vers {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})"
-                            m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEVIATION_DETECTEE", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
-                            if not _alerte_recente(db, TypeAlerte.DEVIATION_DETECTEE, vehicule.id, 60):
-                                a = creer_alerte(
-                                    db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
-                                    f"Déviation détectée pour {vehicule.plaque} : nouveau dépôt {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})",
-                                    ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
-                                    lien_module="/missions")
+                        # 3.2 Camion dans un AUTRE dépôt officiel récepteur
+                        # Corridor RN2 : Moramanga est sur l'axe obligatoire GRT <-> Tana/Sud.
+                        # Un camion à destination de Tana ou du Sud qui traverse Moramanga est en TRANSIT (Règle 4).
+                        est_transit_rn2_moramanga = (z_code == "DMMG" and code_prevu in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"))
+
+                        if est_transit_rn2_moramanga:
+                            # En transit RN2 Moramanga : déviation uniquement si arrêt avéré >= 2h (7200s)
+                            if not roule and (vitesse is None or vitesse <= 3):
+                                ts_presence_autre = None
+                                for e in reversed(m_actuelle.etapes or []):
+                                    if e.get("etat") == "PRESENCE_AUTRE_DEPOT" and e.get("zone") == z_code and e.get("ts"):
+                                        try:
+                                            ts_presence_autre = datetime.fromisoformat(e["ts"])
+                                            break
+                                        except Exception:
+                                            pass
+                                if not ts_presence_autre:
+                                    ts_presence_autre = ts
+                                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "PRESENCE_AUTRE_DEPOT", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+
+                                duree_autre_s = (ts - ts_presence_autre).total_seconds()
+                                if duree_autre_s >= 7200 and not m_actuelle.est_deviee:
+                                    m_actuelle.est_deviee = True
+                                    m_actuelle.statut = StatutMission.DEVIEE
+                                    m_actuelle.depot_effectif = nom_depot_officiel
+                                    m_actuelle.motif_deviation = f"Déviation constatée : arrêt ≥ 2h à {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})"
+                                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEVIATION_DETECTEE", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+                                    if not _alerte_recente(db, TypeAlerte.DEVIATION_DETECTEE, vehicule.id, 60):
+                                        a = creer_alerte(
+                                            db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
+                                            f"Déviation détectée pour {vehicule.plaque} : nouveau dépôt {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})",
+                                            ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                                            lien_module="/missions")
+                                        if PUBLISH_ENABLED["on"]:
+                                            publish("alerte.new", s_alerte(a))
+                                    if PUBLISH_ENABLED["on"]:
+                                        publish("mission.update", s_mission(m_actuelle))
+                        else:
+                            # Autre dépôt terminal (ex. Fianarantsoa au lieu d'Antsirabe) -> Déviation constatée
+                            if not m_actuelle.est_deviee:
+                                m_actuelle.est_deviee = True
+                                m_actuelle.statut = StatutMission.DEVIEE
+                                m_actuelle.depot_effectif = nom_depot_officiel
+                                m_actuelle.motif_deviation = f"Déviation constatée : réorienté vers {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})"
+                                m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEVIATION_DETECTEE", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+                                if not _alerte_recente(db, TypeAlerte.DEVIATION_DETECTEE, vehicule.id, 60):
+                                    a = creer_alerte(
+                                        db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
+                                        f"Déviation détectée pour {vehicule.plaque} : nouveau dépôt {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})",
+                                        ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                                        lien_module="/missions")
+                                    if PUBLISH_ENABLED["on"]:
+                                        publish("alerte.new", s_alerte(a))
                                 if PUBLISH_ENABLED["on"]:
-                                    publish("alerte.new", s_alerte(a))
-                            if PUBLISH_ENABLED["on"]:
-                                publish("mission.update", s_mission(m_actuelle))
+                                    publish("mission.update", s_mission(m_actuelle))
 
                 # Contrôle de déchargement : arrêt >= 3h (10800 s) STRICTEMENT dans un des 7 dépôts récepteurs officiels
                 est_dans_depot_officiel = (z_type == "DEPOT_RECEPTEUR" and z_code in DEPOTS_DECHARGEMENT_CODES)
                 a_arrivee_depot_officiel = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in (m_actuelle.etapes or []))
 
+                # Si le camion est en transit RN2 Moramanga sans être dévié, pas de déchargement Moramanga
                 if est_dans_depot_officiel or a_arrivee_depot_officiel:
-                    arret_depot_s = 0
-                    if not roule and trajets and trajets[-1].heure_fin is not None:
-                        arret_depot_s = (ts - trajets[-1].heure_fin).total_seconds()
+                    code_actuel_dep = normaliser_code_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_code)
+                    if code_actuel_dep == "DMMG" and code_prevu in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR") and not m_actuelle.est_deviee:
+                        pass
                     else:
-                        for e in reversed(m_actuelle.etapes or []):
-                            if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("ts"):
-                                try:
-                                    arret_depot_s = (ts - datetime.fromisoformat(e["ts"])).total_seconds()
-                                    break
-                                except Exception:
-                                    pass
+                        arret_depot_s = 0
+                        if not roule and trajets and trajets[-1].heure_fin is not None:
+                            arret_depot_s = (ts - trajets[-1].heure_fin).total_seconds()
+                        else:
+                            for e in reversed(m_actuelle.etapes or []):
+                                if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("ts"):
+                                    try:
+                                        arret_depot_s = (ts - datetime.fromisoformat(e["ts"])).total_seconds()
+                                        break
+                                    except Exception:
+                                        pass
 
-                    nom_depot_alerte = nom_officiel_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_nom) or (z_nom if z_code in DEPOTS_DECHARGEMENT_CODES else None)
+                        nom_depot_alerte = nom_officiel_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_nom) or (z_nom if z_code in DEPOTS_DECHARGEMENT_CODES else None)
 
-                    # Alerte validation de déchargement si arrêt >= 3h dans un dépôt officiel
-                    if arret_depot_s >= 10800 and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
-                        m_actuelle.validation_dechargement = "EN_ATTENTE"
-                        if not _alerte_recente(db, TypeAlerte.VALIDATION_DECHARGEMENT, vehicule.id, 120):
-                            a = creer_alerte(
-                                db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
-                                f"Validation requise : Déchargement au {nom_depot_alerte} pour {vehicule.plaque} (durée arrêt ≥ 3h)",
-                                ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
-                                lien_module="/missions")
+                        # Alerte validation de déchargement si arrêt >= 3h dans un dépôt officiel
+                        if arret_depot_s >= 10800 and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
+                            m_actuelle.validation_dechargement = "EN_ATTENTE"
+                            if not _alerte_recente(db, TypeAlerte.VALIDATION_DECHARGEMENT, vehicule.id, 120):
+                                a = creer_alerte(
+                                    db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
+                                    f"Validation requise : Déchargement au {nom_depot_alerte} pour {vehicule.plaque} (durée arrêt ≥ 3h)",
+                                    ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                                    lien_module="/missions")
+                                if PUBLISH_ENABLED["on"]:
+                                    publish("alerte.new", s_alerte(a))
+
+                        # Si arrêt >= 3h et déchargement non invalidé : validation et clôture de mission
+                        if arret_depot_s >= 10800 and m_actuelle.validation_dechargement != "INVALIDÉ" and not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])) and nom_depot_alerte:
+                            m_actuelle.statut = StatutMission.TERMINEE
+                            m_actuelle.statut_camion_actuel = "LIBRE"
+                            m_actuelle.validation_dechargement = "VALIDÉ"
+                            m_actuelle.heure_fin = ts
+                            if m_actuelle.heure_debut:
+                                m_actuelle.duree_s = int((ts - m_actuelle.heure_debut).total_seconds())
+                            if not m_actuelle.depot_effectif:
+                                m_actuelle.depot_effectif = nom_depot_alerte
+                            code_zone_fin = normaliser_code_depot(m_actuelle.depot_effectif) or z_code
+                            m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": m_actuelle.depot_effectif, "zone": code_zone_fin}]
+                            suivi.statut_camion = StatutCamion.LIBRE
+                            suivi.mission_id = None  # Verrouillage absolu : la mission est terminée et détachée
+                            
+                            # Auto-résolution alertes de déchargement
+                            db.query(Alerte).filter(
+                                Alerte.vehicule_id == vehicule.id,
+                                Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+                                Alerte.statut != StatutAlerte.TRAITEE
+                            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+                            log.info("Déchargement validé après arrêt >= 3h au %s pour %s (Mission %s) -> LIBRE / TERMINÉE",
+                                     m_actuelle.depot_effectif, vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
                             if PUBLISH_ENABLED["on"]:
-                                publish("alerte.new", s_alerte(a))
-
-                    # Si arrêt >= 3h et déchargement non invalidé : validation et clôture de mission
-                    if arret_depot_s >= 10800 and m_actuelle.validation_dechargement != "INVALIDÉ" and not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])) and nom_depot_alerte:
-                        m_actuelle.statut = StatutMission.TERMINEE
-                        m_actuelle.statut_camion_actuel = "LIBRE"
-                        m_actuelle.validation_dechargement = "VALIDÉ"
-                        m_actuelle.heure_fin = ts
-                        if m_actuelle.heure_debut:
-                            m_actuelle.duree_s = int((ts - m_actuelle.heure_debut).total_seconds())
-                        if not m_actuelle.depot_effectif:
-                            m_actuelle.depot_effectif = nom_depot_alerte
-                        code_zone_fin = normaliser_code_depot(m_actuelle.depot_effectif) or z_code
-                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": m_actuelle.depot_effectif, "zone": code_zone_fin}]
-                        suivi.statut_camion = StatutCamion.LIBRE
-                        suivi.mission_id = None  # Verrouillage absolu : la mission est terminée et détachée
-                        
-                        # Auto-résolution alertes de déchargement
-                        db.query(Alerte).filter(
-                            Alerte.vehicule_id == vehicule.id,
-                            Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
-                            Alerte.statut != StatutAlerte.TRAITEE
-                        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
-
-                        log.info("Déchargement validé après arrêt >= 3h au %s pour %s (Mission %s) -> LIBRE / TERMINÉE",
-                                 m_actuelle.depot_effectif, vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
-                        if PUBLISH_ENABLED["on"]:
-                            publish("mission.update", s_mission(m_actuelle))
+                                publish("mission.update", s_mission(m_actuelle))
 
     db.commit()
 
@@ -1372,11 +1417,16 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
             h_j = next((h for h in historiques if h.date_jour == j), None)
             donnees_h = h_j.donnees if (h_j and h_j.donnees) else {}
 
-            numero_ot = (s_j.numero_ot if s_j else None) or donnees_h.get("numero_ot")
-            produit = (s_j.produit if s_j else None) or donnees_h.get("produit")
-            distributeur = (s_j.distributeur if s_j else None) or donnees_h.get("distributeur")
-            depot_prev = (s_j.depot_recepteur if s_j else None) or donnees_h.get("depot_recepteur")
-            cond_id = (s_j.conducteur_id if s_j else None) or (h_j.conducteur_id if h_j else None) or vehicule.conducteur_actuel_id
+            missions_j = list(db.scalars(select(Mission).where(
+                Mission.vehicule_id == vehicule.id,
+                Mission.date_jour == j
+            )).all())
+
+            numero_ot = (s_j.numero_ot if s_j else None) or donnees_h.get("numero_ot") or (missions_j[0].numero_ot if missions_j else None)
+            produit = (s_j.produit if s_j else None) or donnees_h.get("produit") or (missions_j[0].produit if missions_j else None)
+            distributeur = (s_j.distributeur if s_j else None) or donnees_h.get("distributeur") or (missions_j[0].distributeur if missions_j else None)
+            depot_prev = (s_j.depot_recepteur if s_j else None) or donnees_h.get("depot_recepteur") or (missions_j[0].depot_prevu if missions_j else None)
+            cond_id = (s_j.conducteur_id if s_j else None) or (h_j.conducteur_id if h_j else None) or (missions_j[0].conducteur_id if missions_j else None) or vehicule.conducteur_actuel_id
 
             evs_j = [e for e in evs if e.horodatage.date() == j]
 
@@ -1405,7 +1455,7 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                             ts_depart_base = ev.horodatage
                             dans_base = False
                     
-                    if z_t == "GRT" and z_c == "GRT":
+                    if (z_t == "GRT" and z_c == "GRT") or "sortie grt" in adr_l or "chargement grt" in adr_l:
                         dans_grt = True
                         ts_sortie_grt = ev.horodatage
                     elif dans_grt and z_t != "GRT":
@@ -1413,9 +1463,14 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         dans_grt = False
                     
                     if z_t == "DEPOT_RECEPTEUR" and z_c in DEPOTS_DECHARGEMENT_CODES:
-                        depot_detecte = nom_officiel_depot(z_c)
-                        if ev.type_evenement == TypeEvenement.ARRET or ev.vitesse < 3:
-                            ts_dechargement = ev.horodatage
+                        code_p = normaliser_code_depot(depot_prev)
+                        # Moramanga traversé en transit RN2 vers Tana n'est pas un déchargement terminal
+                        if z_c == "DMMG" and code_p in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"):
+                            pass
+                        else:
+                            depot_detecte = nom_officiel_depot(z_c)
+                            if ev.type_evenement == TypeEvenement.ARRET or ev.vitesse < 3:
+                                ts_dechargement = ev.horodatage
 
             # 2. Complément depuis les trajets
             if not ts_depart_base and trajets_j:
