@@ -1,23 +1,44 @@
 """Tests exhaustifs du cycle logistique des Missions v2026 (Règles 1 à 9)."""
 import os
 import sys
+import tempfile
 from datetime import date, datetime, timedelta
+
+# Configuration universelle UTF-8 pour Windows PowerShell / Linux
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # Fixe le chemin d'import
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from fastapi.testclient import TestClient
 from sqlalchemy import delete, func, select
 
-from backend.app.config import now_local
-from backend.app.database import Base, engine, get_db
-from backend.app.engine import (appliquer_champs_suivi, ensure_suivi,
-                                ingest_event, initialiser_ou_maj_mission)
-from backend.app.main import app
-from backend.app.models import (Alerte, Conducteur, EvenementGPS, GraviteAlerte,
-                                Infraction, Mission, StatutAlerte, StatutCamion,
-                                StatutMission, SuiviJournalier, Trajet,
-                                TypeAlerte, Vehicule)
+try:
+    from app.config import now_local
+    from app.database import Base, engine, get_db
+    from app.engine import (appliquer_champs_suivi, ensure_suivi,
+                            ingest_event, initialiser_ou_maj_mission)
+    from app.main import app
+    from app.models import (Alerte, Conducteur, EvenementGPS, GraviteAlerte,
+                            Infraction, Mission, StatutAlerte, StatutCamion,
+                            StatutMission, SuiviJournalier, Trajet,
+                            TypeAlerte, Vehicule)
+except ImportError:
+    from backend.app.config import now_local
+    from backend.app.database import Base, engine, get_db
+    from backend.app.engine import (appliquer_champs_suivi, ensure_suivi,
+                                    ingest_event, initialiser_ou_maj_mission)
+    from backend.app.main import app
+    from backend.app.models import (Alerte, Conducteur, EvenementGPS, GraviteAlerte,
+                                    Infraction, Mission, StatutAlerte, StatutCamion,
+                                    StatutMission, SuiviJournalier, Trajet,
+                                    TypeAlerte, Vehicule)
 
 
 def test_missions_cycle_complet():

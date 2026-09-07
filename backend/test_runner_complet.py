@@ -2,11 +2,21 @@
 Test Runner Unifié — Validation Globale de Non-Régression LSS Tracking.
 Exécute l'ensemble des suites de tests critiques (Missions, Temps de Conduite, Dédoublonnage, etc.)
 et produit un rapport synthétique d'intégrité opérationnelle.
+Compatible Windows (PowerShell / CMD), Linux et macOS (encodage UTF-8 universel).
 """
 import os
 import sys
 import time
+import tempfile
 import subprocess
+
+# Configuration universelle de l'encodage UTF-8
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 SUITES_CRITIQUES = [
     ("Missions & Cycles Logistiques (v2026.1)", "backend/test_missions_v2026.py"),
@@ -19,13 +29,39 @@ SUITES_CRITIQUES = [
 def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     t0 = time.perf_counter()
     env = os.environ.copy()
-    env["PYTHONPATH"] = "backend"
-    env["DATABASE_URL"] = f"sqlite:////tmp/test_runner_{int(time.time()*1000)}.db"
+    
+    # Préservation de sys.path (site-packages, venv, user base) + ajout de backend
+    cur_pypath = env.get("PYTHONPATH", "")
+    pypaths = ["backend"]
+    if cur_pypath:
+        pypaths.append(cur_pypath)
+    env["PYTHONPATH"] = os.pathsep.join(pypaths)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    
+    # Chemin DB temporaire portable Windows / Linux
+    db_file = os.path.join(tempfile.gettempdir(), f"test_runner_{int(time.time()*1000)}.db").replace("\\", "/")
+    env["DATABASE_URL"] = f"sqlite:///{db_file}"
     
     cmd = [sys.executable, fichier]
-    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace"
+    )
     duree = time.perf_counter() - t0
     
+    # Nettoyage DB temporaire
+    try:
+        if os.path.exists(db_file):
+            os.remove(db_file)
+    except Exception:
+        pass
+        
     succes = (proc.returncode == 0)
     output = proc.stdout + "\n" + proc.stderr
     return succes, duree, output

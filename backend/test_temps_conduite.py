@@ -12,8 +12,18 @@ Exécution :
   DATABASE_URL="sqlite:////tmp/test_tch.db" python3 test_temps_conduite.py
 """
 import os
-os.environ.setdefault("SIM_ENABLE", "0")
 import sys
+import tempfile
+os.environ.setdefault("SIM_ENABLE", "0")
+
+# Configuration universelle UTF-8 pour Windows PowerShell / Linux
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, select
@@ -30,7 +40,7 @@ from app.routers.temps_conduite import (SEUIL_TCH_ALERTE_S, SEUIL_TCH_MAX_S,
                                        extraire_donnees_chauffeurs)
 from app.security import hash_password
 
-DB_PATH = "/tmp/test_tch.db"
+DB_PATH = os.path.join(tempfile.gettempdir(), "test_tch.db")
 if os.path.exists(DB_PATH):
     try:
         os.remove(DB_PATH)

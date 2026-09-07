@@ -1,9 +1,18 @@
 # -*- coding: utf-8 -*-
 """Test suite — Déduplication avancée, driverKeyCode MZoneX, CamtrackPro et Fusion de chauffeurs."""
 import os
+import sys
 os.environ.setdefault("SIM_ENABLE", "0")
 os.environ["YMANE_ACTIVE"] = "0"
-import sys
+
+# Configuration universelle UTF-8 pour Windows PowerShell / Linux
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import delete, func, select

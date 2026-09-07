@@ -14,13 +14,23 @@ Vérifie :
 """
 import os
 import sys
+import tempfile
 from datetime import date, datetime, time, timedelta
 
-if "DATABASE_URL" not in os.environ:
-    os.environ["DATABASE_URL"] = "sqlite:////tmp/test_missions_lss.db"
+# Configuration universelle UTF-8 pour Windows PowerShell / Linux
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
-if not os.environ.get("DATABASE_URL", "").startswith("sqlite:////tmp/"):
-    print("⛔ Sécurité : base de test uniquement (DATABASE_URL /tmp).")
+if "DATABASE_URL" not in os.environ:
+    tmp_db = os.path.join(tempfile.gettempdir(), "test_missions_lss.db").replace("\\", "/")
+    os.environ["DATABASE_URL"] = f"sqlite:///{tmp_db}"
+
+if "sqlite" not in os.environ.get("DATABASE_URL", ""):
+    print("⛔ Sécurité : base de test uniquement (SQLite).")
     sys.exit(2)
 
 from fastapi.testclient import TestClient
