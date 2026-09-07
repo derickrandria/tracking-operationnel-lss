@@ -1719,23 +1719,10 @@ def boucle_surveillance():
             except Exception:
                 log.exception("Contrôle de retard de collecte en échec")
 
-        # Missions retardées (durée réelle > durée prévisionnelle paramétrée)
-        missions = db.scalars(select(Mission).where(
-            Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE]),
-            Mission.date_jour == jour)).all()
-        for m in missions:
-            if m.heure_debut and (now - m.heure_debut).total_seconds() > seuils["DUREE_MISSION_PREVUE"]:
-                m.statut = StatutMission.RETARDEE
-                v = db.get(Vehicule, m.vehicule_id)
-                a = creer_alerte(
-                    db, TypeAlerte.MISSION_RETARDEE, GraviteAlerte.MOYENNE,
-                    f"Mission retardée — {v.plaque if v else '?'} mission n°{m.numero_mission_du_jour} "
-                    f"(début {m.heure_debut:%H:%M}) au-delà de la durée prévue",
-                    vehicule_id=m.vehicule_id, conducteur_id=m.conducteur_id,
-                    lien_module="/missions")
-                if PUBLISH_ENABLED["on"]:
-                    publish("mission.update", s_mission(m))
-                    publish("alerte.new", s_alerte(a))
+        # Note opérationnelle (Madagascar) : aucune durée standard rigide n'est imposée sur
+        # les missions en cours en raison de l'état des axes routiers (RN2, RN7), des temps
+        # d'attente variables aux dépôts et des repos hebdomadaires (≥ 24h/45h) pris en cours de route.
+        # Les missions restent actives (EN_COURS ou DEVIEE) jusqu'à confirmation physique du déchargement.
         db.commit()
     finally:
         db.close()
