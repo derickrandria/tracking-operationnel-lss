@@ -139,6 +139,35 @@ def migrer_schema():
         if "position_22h" not in cols_s:
             cx.execute(text("ALTER TABLE suivi_journalier ADD COLUMN position_22h VARCHAR(200)"))
             log.info("Migration v1.44 : suivi_journalier.position_22h ajouté (§0vicies decies N2)")
+
+        # Migration automatique et exhaustive de la table missions
+        if "missions" in tables:
+            cols_m = {c["name"] for c in insp.get_columns("missions")}
+            cols_missions_ajouts = [
+                ("code_mission", "VARCHAR(50)"),
+                ("statut_camion_actuel", "VARCHAR(20) DEFAULT 'VIDE'"),
+                ("heure_chargement", "DATETIME"),
+                ("depot_prevu", "VARCHAR(50)"),
+                ("depot_effectif", "VARCHAR(50)"),
+                ("est_deviee", "BOOLEAN DEFAULT 0"),
+                ("motif_deviation", "VARCHAR(200)"),
+                ("validation_chargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+                ("validation_dechargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+                ("motif_invalidation", "VARCHAR(200)"),
+                ("est_repositionnement", "BOOLEAN DEFAULT 0"),
+                ("distributeur", "VARCHAR(30)"),
+                ("km_vide", "FLOAT DEFAULT 0.0"),
+                ("km_charge", "FLOAT DEFAULT 0.0"),
+                ("kilometrage_total", "FLOAT DEFAULT 0.0"),
+                ("origine", "VARCHAR(200)"),
+                ("etapes", "TEXT"),
+                ("created_at", "DATETIME"),
+                ("updated_at", "DATETIME"),
+            ]
+            for col, typ in cols_missions_ajouts:
+                if col not in cols_m:
+                    cx.execute(text(f"ALTER TABLE missions ADD COLUMN {col} {typ}"))
+                    log.info("Migration table missions : colonne %s ajoutée", col)
         # v3 AM-5 / C3 (22/08/2026) : vitre Infractions = lecture externe seule
         cols_i = {c["name"] for c in insp.get_columns("infractions")}
         if "exterieure" not in cols_i:

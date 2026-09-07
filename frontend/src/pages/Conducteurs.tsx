@@ -43,8 +43,17 @@ export default function Conducteurs() {
     const p = new URLSearchParams();
     if (q) p.set("q", q);
     if (statut) p.set("statut", statut);
-    setItems(await api(`/api/conducteurs?${p}`));
+    try {
+      const res = await api(`/api/conducteurs?${p}`);
+      setItems(res || []);
+    } catch (err) {
+      console.error("Erreur chargement conducteurs:", err);
+      setItems([]);
+    }
   }
+  useEffect(() => {
+    charger();
+  }, []);
   useEffect(() => { const t = setTimeout(charger, 200); return () => clearTimeout(t); }, [q, statut]);
   useEffect(() => on("referentiels.changed", () => charger()), [q, statut]);
 

@@ -66,12 +66,10 @@ export default function Parametres() {
   const [formUser, setFormUser] = useState<any | null>(null);
 
   async function charger() {
-    try {
-      setParams(await api("/api/parametres"));
-      setSituations(await api("/api/situations"));
-      setUsers(await api("/api/utilisateurs"));
-      setAudit(await api("/api/audit?limite=60"));
-    } catch { /* RBAC géré par route */ }
+    api("/api/parametres").then(setParams).catch(() => setParams([]));
+    api("/api/situations").then(setSituations).catch(() => setSituations([]));
+    api("/api/utilisateurs").then(setUsers).catch(() => setUsers([]));
+    api("/api/audit?limite=60").then(setAudit).catch(() => setAudit([]));
   }
   useEffect(() => { charger(); }, []);
 

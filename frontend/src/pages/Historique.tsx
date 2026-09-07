@@ -105,8 +105,18 @@ export default function Historique() {
   useEffect(() => {
     if (onglet !== "suivi" || !du || !au || au < du) return;
     setData(null);
-    api(`/api/historique/suivi?du=${du}&au=${au}&q=${encodeURIComponent(q)}`).then(setData);
-    api(`/api/historique/stats?du=${du}&au=${au}`).then(setStats);
+    api(`/api/historique/suivi?du=${du}&au=${au}&q=${encodeURIComponent(q)}`)
+      .then(setData)
+      .catch((e) => {
+        console.error("Erreur historique suivi:", e);
+        setData({ total: 0, items: [] });
+      });
+    api(`/api/historique/stats?du=${du}&au=${au}`)
+      .then(setStats)
+      .catch((e) => {
+        console.error("Erreur historique stats:", e);
+        setStats(null);
+      });
   }, [onglet, du, au, q]);
 
   /** Charge la grille complète (snapshot archivé, trajets compris) de la journée. */

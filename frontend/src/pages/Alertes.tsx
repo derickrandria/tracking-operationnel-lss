@@ -38,9 +38,14 @@ export default function Alertes() {
   }
 
   async function charger() {
-    const d = await api(`/api/alertes?${query()}`);
-    setData(d);
-    setTypes(d.types || {});
+    try {
+      const d = await api(`/api/alertes?${query()}`);
+      setData(d || { items: [] });
+      setTypes(d?.types || {});
+    } catch (e) {
+      console.error("Erreur chargement alertes:", e);
+      setData({ items: [] });
+    }
   }
 
   useEffect(() => { charger(); }, [gravite, statut, type]);

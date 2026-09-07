@@ -1013,7 +1013,7 @@ def reparer_historique_conducteurs_passes(db=None) -> dict:
 
 
 def migrer_schema_missions(db=None) -> dict:
-    """Vérifie et ajoute les colonnes manquantes dans la table `missions` (idempotent, SQLite/PostgreSQL)."""
+    """Vérifie et ajoute TOUTES les colonnes manquantes dans la table `missions` (idempotent, SQLite/PostgreSQL)."""
     propre = False
     if db is None:
         db = SessionLocal()
@@ -1028,14 +1028,23 @@ def migrer_schema_missions(db=None) -> dict:
         ajouts = [
             ("code_mission", "VARCHAR(50)"),
             ("statut_camion_actuel", "VARCHAR(20) DEFAULT 'VIDE'"),
+            ("heure_chargement", "DATETIME"),
             ("depot_prevu", "VARCHAR(50)"),
             ("depot_effectif", "VARCHAR(50)"),
             ("est_deviee", "BOOLEAN DEFAULT 0"),
             ("motif_deviation", "VARCHAR(200)"),
-            ("heure_chargement", "DATETIME"),
+            ("validation_chargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+            ("validation_dechargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+            ("motif_invalidation", "VARCHAR(200)"),
+            ("est_repositionnement", "BOOLEAN DEFAULT 0"),
+            ("distributeur", "VARCHAR(30)"),
             ("km_vide", "FLOAT DEFAULT 0.0"),
             ("km_charge", "FLOAT DEFAULT 0.0"),
             ("kilometrage_total", "FLOAT DEFAULT 0.0"),
+            ("origine", "VARCHAR(200)"),
+            ("etapes", "TEXT"),
+            ("created_at", "DATETIME"),
+            ("updated_at", "DATETIME"),
         ]
         for nom_col, type_col in ajouts:
             if nom_col not in colonnes_existantes:

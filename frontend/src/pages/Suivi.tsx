@@ -136,12 +136,12 @@ export default function Suivi() {
         restaureRef.current = true;
         try {
           const brouillon: PendingMap = JSON.parse(localStorage.getItem(CLE_BROUILLON) || "{}");
-          const ids = new Set(d.lignes.map((l: SuiviLigne) => l.id));
+          const ids = new Set((d.lignes || []).map((l: SuiviLigne) => l.id));
           const recuperes = Object.entries(brouillon).filter(([id, c]) => ids.has(id) && Object.keys(c).length);
           if (recuperes.length) {
             pendingRef.current = Object.fromEntries(recuperes);
             persisterBrouillon();
-            d.lignes = d.lignes.map((l: SuiviLigne) =>
+            d.lignes = (d.lignes || []).map((l: SuiviLigne) =>
               pendingRef.current[l.id] ? { ...l, ...pendingRef.current[l.id] } : l);
             setSave({ etat: "attente", nb: nbEnAttente() });
             timersRef.current.push(window.setTimeout(() => vider(), 800));
@@ -153,6 +153,9 @@ export default function Suivi() {
         } catch { /* brouillon illisible : on l'ignore */ }
       }
       setData(d);
+    } catch (e) {
+      console.error("Erreur chargement suivi:", e);
+      setData({ lignes: [], seuils: {} });
     } finally {
       setChargement(false);
     }

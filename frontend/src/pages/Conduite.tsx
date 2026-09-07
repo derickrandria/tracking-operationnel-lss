@@ -46,12 +46,18 @@ export default function Conduite() {
     if (du) p.set("du", du);
     if (au) p.set("au", au);
     const q = p.toString() ? `?${p}` : "";
-    const [c, t] = await Promise.all([
-      api(`/api/conduite/chauffeurs${q}`),
-      api(`/api/conduite/trajets${q}`),
-    ]);
-    setChauffeurs(c.chauffeurs);
-    setTrajets(t.trajets);
+    try {
+      const [c, t] = await Promise.all([
+        api(`/api/conduite/chauffeurs${q}`),
+        api(`/api/conduite/trajets${q}`),
+      ]);
+      setChauffeurs(c.chauffeurs || []);
+      setTrajets(t.trajets || []);
+    } catch (e) {
+      console.error("Erreur chargement conduite:", e);
+      setChauffeurs([]);
+      setTrajets([]);
+    }
   }
 
   useEffect(() => { charger(); }, [du, au]);

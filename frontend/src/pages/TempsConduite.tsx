@@ -102,9 +102,10 @@ export default function TempsConduite() {
       if (filtreAlerte) p.set("alerte", filtreAlerte);
 
       const d = await api(`/api/temps-conduite?${p}`);
-      setData(d);
+      setData(d || { dates: [], lignes: [], stats: { nb_chauffeurs_actifs: 0, nb_proche_limite: 0, nb_limite_atteinte: 0, tch_moyen_s: 0 } });
     } catch (e: any) {
       addToast({ type: "erreur", titre: "Erreur de chargement", message: e.message });
+      setData({ dates: [], lignes: [], stats: { nb_chauffeurs_actifs: 0, nb_proche_limite: 0, nb_limite_atteinte: 0, tch_moyen_s: 0 } });
     } finally {
       setChargement(false);
     }
