@@ -1156,3 +1156,24 @@ def reparer_fins_incoherentes(db=None) -> dict:
         if propre:
             db.close()
     return stats
+
+
+def nettoyer_alertes_missions_invalides(db=None) -> dict:
+    """Purge / clôture toutes les fausses alertes de déchargement/chargement ou alertes sur lieux non officiels."""
+    propre = False
+    if db is None:
+        db = SessionLocal()
+        propre = True
+    resultat = {"succes": True}
+    try:
+        from .engine import reconcilier_alertes_missions_en_attente
+        nb = reconcilier_alertes_missions_en_attente(db)
+        resultat["nb_restaurees"] = nb
+        log.info("Nettoyage et réconciliation des alertes missions terminé.")
+    except Exception as e:
+        log.warning("nettoyer_alertes_missions_invalides : %s", e)
+        resultat["succes"] = False
+    finally:
+        if propre:
+            db.close()
+    return resultat

@@ -1574,18 +1574,67 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
 
 
 def reconcilier_alertes_missions_en_attente(db: Session) -> int:
-    """Restaure et persiste toutes les alertes non traitées des jours passés
-    (week-ends, jours fériés, missions non validées) pour les afficher dès le démarrage."""
+    """Restaure et persiste les alertes LÉGITIMES non traitées des missions réelles.
+    RÈGLE ABSOLUE D'INTÉGRITÉ :
+      - Seule une présence physique AVÉRÉE dans GRT peut générer MISSION_SANS_OT ou VALIDATION_CHARGEMENT.
+      - Seule une arrivée physique AVÉRÉE dans l'un des 7 dépôts officiels (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE)
+        avec arrêt ≥ 3h peut générer VALIDATION_DECHARGEMENT.
+      - Tout camion resté à la Base Tana ou en transit ne doit JAMAIS recevoir d'alerte de déchargement.
+      - Toutes les alertes orphelines, fictives ou basées sur des lieux inventés sont automatiquement purgées.
+    """
     nb_creees = 0
     now = now_local()
 
-    # 1. Nettoyage préventif des alertes obsolètes de type MISSION_RETARDEE
+    # 1. Nettoyage préventif des alertes obsolètes et fictives
     db.query(Alerte).filter(
         Alerte.type == TypeAlerte.MISSION_RETARDEE,
         Alerte.statut != StatutAlerte.TRAITEE
     ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
 
-    # 2. Récupération des missions actives des 30 derniers jours
+    # Purge / Clôture des alertes de déchargement/chargement fictives existantes
+    alertes_existantes = db.query(Alerte).filter(
+        Alerte.type.in_([
+            TypeAlerte.MISSION_SANS_OT,
+            TypeAlerte.VALIDATION_CHARGEMENT,
+            TypeAlerte.VALIDATION_DECHARGEMENT,
+            TypeAlerte.DEVIATION_DETECTEE,
+        ]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).all()
+
+    for a in alertes_existantes:
+        m = db.query(Mission).filter(Mission.vehicule_id == a.vehicule_id).order_by(Mission.date_jour.desc()).first() if a.vehicule_id else None
+        etapes = m.etapes if m else []
+        est_valide = False
+
+        if a.type == TypeAlerte.VALIDATION_DECHARGEMENT:
+            # Doit avoir une étape d'arrivée physique dans l'un des 7 dépôts officiels
+            a_arrivee_depot = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in etapes)
+            if a_arrivee_depot and m and m.validation_dechargement != "VALIDÉ" and m.statut != StatutMission.TERMINEE:
+                est_valide = True
+
+        elif a.type == TypeAlerte.VALIDATION_CHARGEMENT:
+            # Doit être entré à GRT et ne pas en être encore sorti (pas de CHARGEMENT_EFFECTUE)
+            a_entree_grt = any(e.get("etat") == "ENTREE_GRT" for e in etapes)
+            a_sortie_grt = any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in etapes)
+            if a_entree_grt and not a_sortie_grt and m and m.validation_chargement != "VALIDÉ":
+                est_valide = True
+
+        elif a.type == TypeAlerte.MISSION_SANS_OT:
+            a_entree_grt = any(e.get("etat") == "ENTREE_GRT" for e in etapes)
+            a_sortie_grt = any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in etapes)
+            if a_entree_grt and not a_sortie_grt and m and (not m.numero_ot or m.statut_camion_actuel == "LIBRE"):
+                est_valide = True
+
+        elif a.type == TypeAlerte.DEVIATION_DETECTEE:
+            a_dev = any(e.get("etat") == "DEVIATION_DETECTEE" and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in etapes)
+            if a_dev and m and m.est_deviee:
+                est_valide = True
+
+        if not est_valide:
+            a.statut = StatutAlerte.TRAITEE
+
+    # 2. Réconciliation stricte sur les missions réellement actives
     debut_recherche = now.date() - timedelta(days=30)
     missions_actives = list(db.scalars(
         select(Mission).where(
@@ -1601,9 +1650,10 @@ def reconcilier_alertes_missions_en_attente(db: Session) -> int:
 
         etapes = m.etapes or []
 
-        # Alerte 1 : MISSION_SANS_OT (camion à GRT sans OT)
+        # Alerte 1 : MISSION_SANS_OT (camion réellement à GRT sans OT)
         a_entree_grt = any(e.get("etat") == "ENTREE_GRT" for e in etapes)
-        if a_entree_grt and (not m.numero_ot or m.statut_camion_actuel == "LIBRE"):
+        a_sortie_grt = any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in etapes)
+        if a_entree_grt and not a_sortie_grt and (not m.numero_ot or m.statut_camion_actuel == "LIBRE"):
             ts_grt = None
             for e in etapes:
                 if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
@@ -1630,8 +1680,8 @@ def reconcilier_alertes_missions_en_attente(db: Session) -> int:
                 )
                 nb_creees += 1
 
-        # Alerte 2 : VALIDATION_CHARGEMENT (camion à GRT ≥ 30 min ou en attente)
-        if m.validation_chargement == "EN_ATTENTE" or (a_entree_grt and not m.heure_chargement and m.validation_chargement != "VALIDÉ"):
+        # Alerte 2 : VALIDATION_CHARGEMENT (camion réellement à GRT ≥ 30 min)
+        if a_entree_grt and not a_sortie_grt and not m.heure_chargement and m.validation_chargement != "VALIDÉ":
             ts_grt = None
             for e in etapes:
                 if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
@@ -1658,9 +1708,9 @@ def reconcilier_alertes_missions_en_attente(db: Session) -> int:
                 )
                 nb_creees += 1
 
-        # Alerte 3 : VALIDATION_DECHARGEMENT (camion au dépôt récepteur officiel ≥ 3h ou en attente)
+        # Alerte 3 : VALIDATION_DECHARGEMENT (camion réellement arrivé au dépôt récepteur officiel ≥ 3h)
         a_arrivee_depot = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in etapes)
-        if (m.validation_dechargement == "EN_ATTENTE" or a_arrivee_depot) and m.validation_dechargement not in ("VALIDÉ", "INVALIDÉ"):
+        if a_arrivee_depot and m.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and m.statut != StatutMission.TERMINEE:
             ts_depot = None
             lieu_depot = nom_officiel_depot(m.depot_effectif or m.depot_prevu) or "Depot Soanierana (DSNR)"
             for e in reversed(etapes):
@@ -1694,13 +1744,13 @@ def reconcilier_alertes_missions_en_attente(db: Session) -> int:
         if m.est_deviee or m.statut == StatutMission.DEVIEE:
             ts_dev = None
             for e in reversed(etapes):
-                if e.get("etat") == "DEVIATION_DETECTEE" and e.get("ts"):
+                if e.get("etat") == "DEVIATION_DETECTEE" and e.get("ts") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES:
                     try:
                         ts_dev = datetime.fromisoformat(e["ts"])
                         break
                     except Exception:
                         pass
-            ts_alerte = ts_dev or m.heure_debut or now
+            ts_alerte = ts_dev or (m.heure_debut or now)
 
             existe = db.scalar(
                 select(Alerte).where(
@@ -1712,14 +1762,14 @@ def reconcilier_alertes_missions_en_attente(db: Session) -> int:
             if not existe:
                 creer_alerte(
                     db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
-                    f"Déviation détectée pour {v.plaque} : nouveau dépôt {m.depot_effectif or '—'} (prévu : {m.depot_prevu or '—'})",
+                    f"Déviation détectée pour {v.plaque} : nouveau dépôt {nom_officiel_depot(m.depot_effectif) or m.depot_effectif or '—'} (prévu : {nom_officiel_depot(m.depot_prevu) or m.depot_prevu or '—'})",
                     ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
                     lien_module="/missions"
                 )
                 nb_creees += 1
 
+    db.commit()
     if nb_creees > 0:
-        db.commit()
         log.info("Réconciliation des alertes missions des jours passés : %d alerte(s) persistante(s) restaurée(s)", nb_creees)
     return nb_creees
 
