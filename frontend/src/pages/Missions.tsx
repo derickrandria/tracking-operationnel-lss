@@ -87,7 +87,7 @@ interface StatsMissions {
 }
 
 export default function Missions() {
-  const [dateDebut, setDateDebut] = useState(daysAgoISO(30)); // 31 jours glissants par défaut
+  const [dateDebut, setDateDebut] = useState(todayISO()); // Aujourd'hui par défaut
   const [dateFin, setDateFin] = useState(todayISO());
   const [statutFiltre, setStatutFiltre] = useState("TOUTES");
   const [depotFiltre, setDepotFiltre] = useState("");
@@ -337,7 +337,7 @@ export default function Missions() {
               className="bg-blue-600 hover:bg-blue-700 text-white font-medium"
             >
               <Icon nom="plus" className="w-4 h-4" />
-              <span>+ Assigner OT / Nouvelle Mission</span>
+              <span>Assigner OT / Nouvelle Mission</span>
             </Btn>
             <Btn
               variante="secondaire"
@@ -585,6 +585,30 @@ export default function Missions() {
             <div className="flex flex-wrap items-center gap-1">
               <button
                 type="button"
+                onClick={() => setPeriode("aujourdhui")}
+                className={cls(
+                  "px-2.5 py-1 text-[12px] font-medium rounded-md border transition-colors",
+                  dateDebut === todayISO() && dateFin === todayISO()
+                    ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold"
+                    : "border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-400"
+                )}
+              >
+                Aujourd'hui
+              </button>
+              <button
+                type="button"
+                onClick={() => setPeriode("7j")}
+                className={cls(
+                  "px-2.5 py-1 text-[12px] font-medium rounded-md border transition-colors",
+                  dateDebut === daysAgoISO(6) && dateFin === todayISO()
+                    ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold"
+                    : "border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-400"
+                )}
+              >
+                7 derniers jours
+              </button>
+              <button
+                type="button"
                 onClick={() => setPeriode("31j")}
                 className={cls(
                   "px-2.5 py-1 text-[12px] font-medium rounded-md border transition-colors",
@@ -597,22 +621,13 @@ export default function Missions() {
               </button>
               <button
                 type="button"
-                onClick={() => setPeriode("7j")}
-                className="px-2.5 py-1 text-[12px] font-medium rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:border-slate-400"
-              >
-                7 derniers jours
-              </button>
-              <button
-                type="button"
-                onClick={() => setPeriode("aujourdhui")}
-                className="px-2.5 py-1 text-[12px] font-medium rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:border-slate-400"
-              >
-                Aujourd'hui
-              </button>
-              <button
-                type="button"
                 onClick={() => setPeriode("mois")}
-                className="px-2.5 py-1 text-[12px] font-medium rounded-md bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:border-slate-400"
+                className={cls(
+                  "px-2.5 py-1 text-[12px] font-medium rounded-md border transition-colors",
+                  dateDebut === firstDayOfMonthISO() && dateFin === todayISO()
+                    ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold"
+                    : "border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-400"
+                )}
               >
                 Ce mois-ci
               </button>
