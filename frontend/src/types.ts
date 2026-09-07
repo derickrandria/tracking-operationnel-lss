@@ -209,7 +209,9 @@ export interface Alerte {
   date_heure: string;
   type: string;
   gravite: "CRITIQUE" | "MOYENNE" | "INFORMATION";
+  vehicule_id?: string | null;
   plaque: string | null;
+  conducteur_id?: string | null;
   conducteur: Conducteur | null;
   message: string;
   statut: "NOUVELLE" | "VUE" | "TRAITEE";

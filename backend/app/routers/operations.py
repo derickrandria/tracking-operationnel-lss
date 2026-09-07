@@ -259,6 +259,20 @@ class MissionDeclarerDeviation(BaseModel):
     motif: str | None = None
 
 
+class ActionMissionRapideIn(BaseModel):
+    action: str  # VALIDER_CHARGEMENT, VALIDER_DECHARGEMENT, INVALIDER_DECHARGEMENT, DECLARER_DEVIATION, TRAITER_ALERTE
+    alerte_id: str | None = None
+    plaque: str | None = None
+    vehicule_id: str | None = None
+    mission_id: str | None = None
+    motif: str | None = None
+    commentaire: str | None = None
+    nouveau_depot: str | None = None
+    numero_ot: str | None = None
+    distributeur: str | None = None
+    produit: str | None = None
+
+
 def _calculer_stats_missions(missions: list[Mission], db: Session) -> dict:
     total = len(missions)
     en_cours = [m for m in missions if m.statut == StatutMission.EN_COURS]
@@ -673,6 +687,133 @@ def declarer_deviation_mission(mid: str, data: MissionDeclarerDeviation,
         from ..event_bus import publish
         publish("mission.update", s_mission(m))
     return s_mission(m)
+
+
+@router.post("/missions/action-rapide")
+def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = Depends(get_db),
+                                   user=Depends(require_roles(*ECRITURE))):
+    """Exécute une action directe depuis les alertes ou boutons de l'onglet Missions."""
+    v = None
+    if data.vehicule_id:
+        v = db.get(Vehicule, data.vehicule_id)
+    elif data.plaque:
+        v = db.scalar(select(Vehicule).where(Vehicule.plaque == data.plaque.strip()))
+
+    m = None
+    if data.mission_id:
+        m = db.get(Mission, data.mission_id)
+    elif v:
+        # Recherche mission active pour ce véhicule
+        m = db.scalar(select(Mission).where(
+            Mission.vehicule_id == v.id,
+            Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE])
+        ).order_by(Mission.date_jour.desc(), Mission.numero_mission_du_jour.desc()))
+        if not m:
+            m = db.scalar(select(Mission).where(Mission.vehicule_id == v.id).order_by(Mission.date_jour.desc()))
+
+    if data.action == "VALIDER_CHARGEMENT":
+        if not m and v:
+            suivi = ensure_suivi(db, v, now_local().date())
+            m = initialiser_ou_maj_mission(db, suivi, v, data.numero_ot, data.distributeur, data.produit, data.nouveau_depot or "DABI")
+        if m:
+            m.validation_chargement = "VALIDÉ"
+            m.statut_camion_actuel = "CHARGE"
+            m.heure_chargement = m.heure_chargement or now_local()
+            suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+            if suivi:
+                suivi.statut_camion = StatutCamion.CHARGE
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type.in_([TypeAlerte.VALIDATION_CHARGEMENT, TypeAlerte.MISSION_SANS_OT]),
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "VALIDER_DECHARGEMENT":
+        if m:
+            m.validation_dechargement = "VALIDÉ"
+            m.statut = StatutMission.TERMINEE
+            m.statut_camion_actuel = "LIBRE"
+            m.heure_fin = m.heure_fin or now_local()
+            if m.heure_debut:
+                m.duree_s = max(0, int((m.heure_fin - m.heure_debut).total_seconds()))
+            suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+            if suivi:
+                suivi.statut_camion = StatutCamion.LIBRE
+                suivi.mission_id = None
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE, TypeAlerte.MISSION_RETARDEE]),
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "INVALIDER_DECHARGEMENT":
+        if m:
+            m.validation_dechargement = "INVALIDÉ"
+            m.motif_invalidation = data.motif or "Invalidation déchargement"
+            if data.commentaire:
+                m.motif_invalidation += f" ({data.commentaire})"
+            m.statut = StatutMission.EN_COURS
+            m.statut_camion_actuel = "CHARGE"
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "DECLARER_DEVIATION":
+        if m:
+            m.est_deviee = True
+            m.statut = StatutMission.DEVIEE
+            m.depot_effectif = data.nouveau_depot or m.depot_effectif
+            m.motif_deviation = data.motif or f"Déviation vers {data.nouveau_depot}"
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type == TypeAlerte.DEVIATION_DETECTEE,
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "SAISIR_OT":
+        if not m and v:
+            suivi = ensure_suivi(db, v, now_local().date())
+            m = initialiser_ou_maj_mission(db, suivi, v, data.numero_ot, data.distributeur, data.produit, data.nouveau_depot or "DABI")
+        elif m:
+            if data.numero_ot:
+                m.numero_ot = data.numero_ot
+            if data.distributeur:
+                m.distributeur = data.distributeur
+            if data.produit:
+                m.produit = data.produit
+            if data.nouveau_depot:
+                m.depot_prevu = data.nouveau_depot
+            if m.statut_camion_actuel == "LIBRE":
+                m.statut_camion_actuel = "VIDE"
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type == TypeAlerte.MISSION_SANS_OT,
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "TRAITER_ALERTE":
+        if data.alerte_id:
+            a = db.get(Alerte, data.alerte_id)
+            if a:
+                a.statut = StatutAlerte.TRAITEE
+
+    if data.alerte_id:
+        a = db.get(Alerte, data.alerte_id)
+        if a:
+            a.statut = StatutAlerte.TRAITEE
+
+    db.commit()
+    if m and PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return {"statut": "OK", "action": data.action, "mission": s_mission(m) if m else None}
 
 
 @router.get("/missions/alertes")

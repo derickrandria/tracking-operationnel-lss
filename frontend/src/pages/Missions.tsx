@@ -23,6 +23,19 @@ import {
 } from "../utils";
 import { on } from "../ws";
 
+export interface CibleActionMission {
+  id?: string;
+  mission_id?: string;
+  alerte_id?: string;
+  plaque: string;
+  numero_ot?: string | null;
+  distributeur?: string | null;
+  produit?: string | null;
+  depot_prevu?: string | null;
+  depot_effectif?: string | null;
+  depot?: string | null;
+}
+
 const ETAPE_LABELS: Record<string, { label: string; couleur: string }> = {
   INITIALISATION_OT: { label: "Attribution OT (VIDE)", couleur: "bg-sky-500" },
   PRESENCE_BASE: { label: "Présence Base Tana (BASETNR)", couleur: "bg-slate-500" },
@@ -90,9 +103,9 @@ export default function Missions() {
   // Modals et actions
   const [missionSelectionnee, setMissionSelectionnee] = useState<Mission | null>(null);
   const [modalNouvelleMissionOuverte, setModalNouvelleMissionOuverte] = useState(false);
-  const [modalInvalidationMission, setModalInvalidationMission] = useState<Mission | null>(null);
-  const [modalDeviationMission, setModalDeviationMission] = useState<Mission | null>(null);
-  const [modalSaisieOtMission, setModalSaisieOtMission] = useState<Mission | null>(null);
+  const [cibleInvalidation, setCibleInvalidation] = useState<CibleActionMission | null>(null);
+  const [cibleDeviation, setCibleDeviation] = useState<CibleActionMission | null>(null);
+  const [cibleSaisieOt, setCibleSaisieOt] = useState<CibleActionMission | null>(null);
 
   const [vehicules, setVehicules] = useState<Vehicule[]>([]);
   const [conducteurs, setConducteurs] = useState<Conducteur[]>([]);
@@ -105,6 +118,7 @@ export default function Missions() {
     try {
       await api("/api/missions/rattrapage", { method: "POST" });
       await chargerDonnees();
+      await chargerAlertes();
     } catch (e) {
       if (!silencieux) {
         console.error("Erreur lors du rattrapage des missions sur 7 jours:", e);
@@ -162,9 +176,10 @@ export default function Missions() {
     }
   }
 
-  // Chargement initial + Rattrapage automatique 7 jours
+  // Chargement initial immédiat + Rattrapage automatique 7 jours en tâche de fond
   useEffect(() => {
     chargerReferentiels();
+    chargerDonnees();
     chargerAlertes();
     lancerRattrapage7j(true);
   }, []);
@@ -176,7 +191,10 @@ export default function Missions() {
   useEffect(() => {
     const rafraichir = () => {
       window.clearTimeout(timer.current);
-      timer.current = window.setTimeout(chargerDonnees, 1500);
+      timer.current = window.setTimeout(() => {
+        chargerDonnees();
+        chargerAlertes();
+      }, 1500);
     };
     const offs = [
       "mission.new",
@@ -214,28 +232,62 @@ export default function Missions() {
     window.open(`/api/missions/export.pdf?${params.toString()}`, "_blank");
   };
 
-  // Actions de validation directes
-  async function actionValiderChargement(m: Mission) {
-    if (!confirm(`Confirmez-vous la validation du chargement à GRT pour le véhicule ${m.plaque} (Mission ${m.code_mission || m.numero_ot}) ?`)) {
+  // Actions rapides résilientes (fonctionnent avec mission existante ou via plaque / alerte_id)
+  async function actionValiderChargementRapide(cible: CibleActionMission) {
+    if (!confirm(`Confirmez-vous la validation du chargement à GRT pour le véhicule ${cible.plaque} ?`)) {
       return;
     }
     try {
-      await api(`/api/missions/${m.id}/valider-chargement`, { method: "POST" });
+      await api("/api/missions/action-rapide", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "VALIDER_CHARGEMENT",
+          mission_id: cible.mission_id || cible.id,
+          alerte_id: cible.alerte_id,
+          plaque: cible.plaque,
+        }),
+      });
       await chargerDonnees();
+      await chargerAlertes();
     } catch (e: any) {
       alert("Erreur lors de la validation du chargement : " + (e?.message || e));
     }
   }
 
-  async function actionValiderDechargement(m: Mission) {
-    if (!confirm(`Confirmez-vous la validation du déchargement pour le véhicule ${m.plaque} ? La mission passera à TERMINÉE et le statut du camion deviendra LIBRE.`)) {
+  async function actionValiderDechargementRapide(cible: CibleActionMission) {
+    if (!confirm(`Confirmez-vous la validation du déchargement pour le véhicule ${cible.plaque} ? La mission passera à TERMINÉE et le statut du camion deviendra LIBRE.`)) {
       return;
     }
     try {
-      await api(`/api/missions/${m.id}/valider-dechargement`, { method: "POST" });
+      await api("/api/missions/action-rapide", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "VALIDER_DECHARGEMENT",
+          mission_id: cible.mission_id || cible.id,
+          alerte_id: cible.alerte_id,
+          plaque: cible.plaque,
+        }),
+      });
       await chargerDonnees();
+      await chargerAlertes();
     } catch (e: any) {
       alert("Erreur lors de la validation du déchargement : " + (e?.message || e));
+    }
+  }
+
+  async function actionTraiterAlerteRapide(alerteId: string) {
+    try {
+      await api("/api/missions/action-rapide", {
+        method: "POST",
+        body: JSON.stringify({
+          action: "TRAITER_ALERTE",
+          alerte_id: alerteId,
+        }),
+      });
+      await chargerAlertes();
+      await chargerDonnees();
+    } catch (e: any) {
+      alert("Erreur lors du traitement de l'alerte : " + (e?.message || e));
     }
   }
 
@@ -326,92 +378,142 @@ export default function Missions() {
             </span>
           </div>
 
-          <div className="mt-2 space-y-2 max-h-48 overflow-y-auto">
+          <div className="mt-2 space-y-2 max-h-56 overflow-y-auto">
             {alertes.map((a) => {
               const missionAssociee = missions.find(
                 (m) => m.plaque === a.plaque && (m.statut === "EN_COURS" || m.statut === "DÉVIÉE")
               );
+              const cibleAlerte: CibleActionMission = {
+                id: missionAssociee?.id,
+                mission_id: missionAssociee?.id,
+                alerte_id: a.id,
+                plaque: a.plaque || "",
+                numero_ot: missionAssociee?.numero_ot,
+                distributeur: missionAssociee?.distributeur,
+                produit: missionAssociee?.produit,
+                depot_prevu: missionAssociee?.depot_prevu,
+                depot_effectif: missionAssociee?.depot_effectif,
+              };
+
+              const badgeLabel =
+                a.type === "MISSION_SANS_OT"
+                  ? "OT Manquant (≥ 15 min)"
+                  : a.type === "VALIDATION_CHARGEMENT"
+                  ? "Validation Chargement (≥ 30 min)"
+                  : a.type === "VALIDATION_DECHARGEMENT"
+                  ? "Validation Déchargement (≥ 3h)"
+                  : a.type === "MISSION_RETARDEE"
+                  ? "Mission Retardée"
+                  : a.type === "DEVIATION_DETECTEE"
+                  ? "Déviation Constatée"
+                  : a.type;
+
+              const badgeColor =
+                a.type === "MISSION_SANS_OT"
+                  ? "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300 border-red-300 dark:border-red-800"
+                  : a.type === "VALIDATION_CHARGEMENT"
+                  ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300 border-amber-300 dark:border-amber-800"
+                  : a.type === "VALIDATION_DECHARGEMENT"
+                  ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300 border-blue-300 dark:border-blue-800"
+                  : a.type === "MISSION_RETARDEE"
+                  ? "bg-orange-100 text-orange-700 dark:bg-orange-950 dark:text-orange-300 border-orange-300 dark:border-orange-800"
+                  : "bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300 border-purple-300 dark:border-purple-800";
+
               return (
                 <div
                   key={a.id}
-                  className="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-white/90 dark:bg-slate-800/90 border border-amber-200/80 dark:border-amber-900/60 text-[12.5px]"
+                  className="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-white/95 dark:bg-slate-800/95 border border-amber-200/80 dark:border-amber-900/60 text-[12.5px] shadow-xs hover:border-amber-400 transition-colors"
                 >
-                  <div className="flex items-center gap-2.5">
-                    <span
-                      className={cls(
-                        "px-2 py-0.5 rounded text-[11px] font-bold uppercase",
-                        a.type === "MISSION_SANS_OT"
-                          ? "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300"
-                          : a.type === "VALIDATION_CHARGEMENT"
-                          ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
-                          : a.type === "VALIDATION_DECHARGEMENT"
-                          ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
-                          : "bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300"
-                      )}
-                    >
-                      {a.type === "MISSION_SANS_OT"
-                        ? "OT Manquant (≥ 15 min)"
-                        : a.type === "VALIDATION_CHARGEMENT"
-                        ? "Validation Chargement (≥ 30 min)"
-                        : a.type === "VALIDATION_DECHARGEMENT"
-                        ? "Validation Déchargement (≥ 3h)"
-                        : "Déviation Constatée"}
+                  <div
+                    className="flex items-center gap-2.5 flex-1 min-w-[280px] cursor-pointer"
+                    onClick={() => {
+                      if (missionAssociee) {
+                        setMissionSelectionnee(missionAssociee);
+                      } else if (a.plaque) {
+                        setRecherche(a.plaque);
+                      }
+                    }}
+                    title="Cliquer pour afficher la mission correspondante"
+                  >
+                    <span className={cls("px-2 py-0.5 rounded text-[11px] font-bold uppercase border", badgeColor)}>
+                      {badgeLabel}
                     </span>
-                    <span className="font-bold text-slate-800 dark:text-slate-100 font-mono">{a.plaque}</span>
+                    <span className="font-bold text-slate-800 dark:text-slate-100 font-mono underline decoration-dotted">
+                      {a.plaque || "Véhicule inconnu"}
+                    </span>
                     <span className="text-slate-600 dark:text-slate-300">{a.message}</span>
                     <span className="text-[11px] font-mono text-slate-400">({fmtDateHeure(a.date_heure)})</span>
                   </div>
 
-                  {/* Actions contextuelles rapides depuis l'alerte */}
-                  <div className="flex items-center gap-1.5">
-                    {a.type === "MISSION_SANS_OT" && missionAssociee && (
+                  {/* Actions contextuelles résilientes sur l'alerte */}
+                  <div className="flex items-center gap-1.5 shrink-0" onClick={(e) => e.stopPropagation()}>
+                    {a.type === "MISSION_SANS_OT" && (
                       <button
                         type="button"
-                        onClick={() => setModalSaisieOtMission(missionAssociee)}
-                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-sky-600 hover:bg-sky-700 text-white"
+                        onClick={() => setCibleSaisieOt(cibleAlerte)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-sky-600 hover:bg-sky-700 text-white shadow-xs"
                       >
                         Saisir OT
                       </button>
                     )}
 
-                    {a.type === "VALIDATION_CHARGEMENT" && missionAssociee && (
+                    {a.type === "VALIDATION_CHARGEMENT" && (
                       <button
                         type="button"
-                        onClick={() => actionValiderChargement(missionAssociee)}
-                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-amber-600 hover:bg-amber-700 text-white"
+                        onClick={() => actionValiderChargementRapide(cibleAlerte)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-amber-600 hover:bg-amber-700 text-white shadow-xs"
                       >
                         ✓ Valider Chargement
                       </button>
                     )}
 
-                    {a.type === "VALIDATION_DECHARGEMENT" && missionAssociee && (
+                    {a.type === "VALIDATION_DECHARGEMENT" && (
                       <>
                         <button
                           type="button"
-                          onClick={() => actionValiderDechargement(missionAssociee)}
-                          className="px-2.5 py-1 text-[11px] font-semibold rounded bg-emerald-600 hover:bg-emerald-700 text-white"
+                          onClick={() => actionValiderDechargementRapide(cibleAlerte)}
+                          className="px-2.5 py-1 text-[11px] font-semibold rounded bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs"
                         >
                           ✓ Valider Déchargement
                         </button>
                         <button
                           type="button"
-                          onClick={() => setModalInvalidationMission(missionAssociee)}
-                          className="px-2.5 py-1 text-[11px] font-semibold rounded bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200"
+                          onClick={() => setCibleInvalidation(cibleAlerte)}
+                          className="px-2 py-1 text-[11px] font-semibold rounded bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200"
                         >
                           ✗ Invalider
                         </button>
                       </>
                     )}
 
-                    {a.type === "DEVIATION_DETECTEE" && missionAssociee && (
+                    {a.type === "DEVIATION_DETECTEE" && (
                       <button
                         type="button"
-                        onClick={() => setModalDeviationMission(missionAssociee)}
-                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-purple-600 hover:bg-purple-700 text-white"
+                        onClick={() => setCibleDeviation(cibleAlerte)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-purple-600 hover:bg-purple-700 text-white shadow-xs"
                       >
                         ⇄ Changer Dépôt
                       </button>
                     )}
+
+                    {a.type === "MISSION_RETARDEE" && (
+                      <button
+                        type="button"
+                        onClick={() => actionTraiterAlerteRapide(a.id)}
+                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-orange-600 hover:bg-orange-700 text-white shadow-xs"
+                      >
+                        ✓ Marquer Traitée
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => actionTraiterAlerteRapide(a.id)}
+                      title="Marquer cette alerte comme traitée et la masquer"
+                      className="px-2 py-1 text-[11px] font-medium rounded text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-700"
+                    >
+                      ✓ Traiter
+                    </button>
                   </div>
                 </div>
               );
@@ -816,7 +918,7 @@ export default function Missions() {
                           {aBesoinOt && (
                             <button
                               type="button"
-                              onClick={() => setModalSaisieOtMission(m)}
+                              onClick={() => setCibleSaisieOt(m)}
                               title="Saisir les informations d'OT reçues"
                               className="px-2 py-1 text-[11px] font-bold rounded bg-sky-600 hover:bg-sky-700 text-white shadow-xs"
                             >
@@ -827,7 +929,7 @@ export default function Missions() {
                           {m.statut === "EN_COURS" && (statutCamion === "VIDE" || aChargementEnAttente) && (
                             <button
                               type="button"
-                              onClick={() => actionValiderChargement(m)}
+                              onClick={() => actionValiderChargementRapide(m)}
                               title="Valider le chargement GRT"
                               className="px-2 py-1 text-[11px] font-bold rounded bg-amber-600 hover:bg-amber-700 text-white shadow-xs"
                             >
@@ -839,7 +941,7 @@ export default function Missions() {
                             <>
                               <button
                                 type="button"
-                                onClick={() => actionValiderDechargement(m)}
+                                onClick={() => actionValiderDechargementRapide(m)}
                                 title="Valider le déchargement au dépôt récepteur"
                                 className="px-2 py-1 text-[11px] font-bold rounded bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs"
                               >
@@ -847,7 +949,7 @@ export default function Missions() {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => setModalInvalidationMission(m)}
+                                onClick={() => setCibleInvalidation(m)}
                                 title="Invalider le déchargement (échantillonnage, repos parking…)"
                                 className="px-1.5 py-1 text-[11px] font-bold rounded bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 text-slate-700 dark:text-slate-200"
                               >
@@ -859,7 +961,7 @@ export default function Missions() {
                           {m.statut === "EN_COURS" && (
                             <button
                               type="button"
-                              onClick={() => setModalDeviationMission(m)}
+                              onClick={() => setCibleDeviation(m)}
                               title="Déclarer une déviation d'itinéraire vers un autre dépôt"
                               className="px-2 py-1 text-[11px] font-medium rounded bg-purple-100 hover:bg-purple-200 dark:bg-purple-950 dark:hover:bg-purple-900 text-purple-700 dark:text-purple-300 border border-purple-300 dark:border-purple-800"
                             >
@@ -892,17 +994,18 @@ export default function Missions() {
           onFermer={() => setMissionSelectionnee(null)}
           onMissionModifiee={() => {
             chargerDonnees();
+            chargerAlertes();
             setMissionSelectionnee(null);
           }}
           onOuvrirDeviation={() => {
             const m = missionSelectionnee;
             setMissionSelectionnee(null);
-            setModalDeviationMission(m);
+            setCibleDeviation(m);
           }}
           onOuvrirInvalidation={() => {
             const m = missionSelectionnee;
             setMissionSelectionnee(null);
-            setModalInvalidationMission(m);
+            setCibleInvalidation(m);
           }}
         />
       )}
@@ -915,43 +1018,47 @@ export default function Missions() {
           onFermer={() => setModalNouvelleMissionOuverte(false)}
           onSucces={() => {
             chargerDonnees();
+            chargerAlertes();
             setModalNouvelleMissionOuverte(false);
           }}
         />
       )}
 
-      {/* Modal Saisie Rapide OT pour Mission Active */}
-      {modalSaisieOtMission && (
+      {/* Modal Saisie Rapide OT pour Mission ou Alerte */}
+      {cibleSaisieOt && (
         <ModalSaisieOT
-          mission={modalSaisieOtMission}
-          onFermer={() => setModalSaisieOtMission(null)}
+          cible={cibleSaisieOt}
+          onFermer={() => setCibleSaisieOt(null)}
           onSucces={() => {
             chargerDonnees();
-            setModalSaisieOtMission(null);
+            chargerAlertes();
+            setCibleSaisieOt(null);
           }}
         />
       )}
 
       {/* Modal Invalidation Déchargement avec Motifs Prédéfinis (Règle 5) */}
-      {modalInvalidationMission && (
+      {cibleInvalidation && (
         <ModalInvalidation
-          mission={modalInvalidationMission}
-          onFermer={() => setModalInvalidationMission(null)}
+          cible={cibleInvalidation}
+          onFermer={() => setCibleInvalidation(null)}
           onSucces={() => {
             chargerDonnees();
-            setModalInvalidationMission(null);
+            chargerAlertes();
+            setCibleInvalidation(null);
           }}
         />
       )}
 
       {/* Modal Déclaration de Déviation (Règle 6) */}
-      {modalDeviationMission && (
+      {cibleDeviation && (
         <ModalDeviation
-          mission={modalDeviationMission}
-          onFermer={() => setModalDeviationMission(null)}
+          cible={cibleDeviation}
+          onFermer={() => setCibleDeviation(null)}
           onSucces={() => {
             chargerDonnees();
-            setModalDeviationMission(null);
+            chargerAlertes();
+            setCibleDeviation(null);
           }}
         />
       )}
@@ -983,8 +1090,13 @@ function ModalDetailMission({
     }
     setEnAction(true);
     try {
-      await api(`/api/missions/${mission.id}/valider-dechargement`, {
+      await api("/api/missions/action-rapide", {
         method: "POST",
+        body: JSON.stringify({
+          action: "VALIDER_DECHARGEMENT",
+          mission_id: mission.id,
+          plaque: mission.plaque,
+        }),
       });
       onMissionModifiee();
     } catch (e: any) {
@@ -997,8 +1109,13 @@ function ModalDetailMission({
   async function validerChargementDirect() {
     setEnAction(true);
     try {
-      await api(`/api/missions/${mission.id}/valider-chargement`, {
+      await api("/api/missions/action-rapide", {
         method: "POST",
+        body: JSON.stringify({
+          action: "VALIDER_CHARGEMENT",
+          mission_id: mission.id,
+          plaque: mission.plaque,
+        }),
       });
       onMissionModifiee();
     } catch (e: any) {
@@ -1199,24 +1316,17 @@ function ModalNouvelleMission({
   onSucces: () => void;
 }) {
   const [vehiculeId, setVehiculeId] = useState(vehicules[0]?.id || "");
-  const [conducteurId, setConducteurId] = useState("");
+  const [conducteurId, setConducteurId] = useState(conducteurs[0]?.id || "");
   const [numeroOt, setNumeroOt] = useState("");
   const [distributeur, setDistributeur] = useState(DISTRIBUTEURS_LISTE[0]);
   const [produit, setProduit] = useState(PRODUITS_LISTE[0]);
   const [depotPrevu, setDepotPrevu] = useState(DEPOTS_LISTE[0].code);
   const [envoi, setEnvoi] = useState(false);
 
-  // Mise à jour automatique du chauffeur titulaire du véhicule
-  useEffect(() => {
-    const v = vehicules.find((x) => x.id === vehiculeId);
-    if (v?.conducteur_actuel_id) {
-      setConducteurId(v.conducteur_actuel_id);
-    }
-  }, [vehiculeId, vehicules]);
-
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!vehiculeId) return alert("Veuillez sélectionner un véhicule.");
+    if (!numeroOt.trim()) return alert("Veuillez saisir le numéro de l'OT.");
 
     setEnvoi(true);
     try {
@@ -1225,11 +1335,11 @@ function ModalNouvelleMission({
         body: JSON.stringify({
           vehicule_id: vehiculeId,
           conducteur_id: conducteurId || undefined,
-          numero_ot: numeroOt.trim() || undefined,
+          numero_ot: numeroOt.trim(),
           distributeur,
           produit,
+          depot: depotPrevu,
           depot_prevu: depotPrevu,
-          date_jour: todayISO(),
         }),
       });
       onSucces();
@@ -1241,9 +1351,13 @@ function ModalNouvelleMission({
   }
 
   return (
-    <Modal ouvert={true} onFermer={onFermer} titre="Assigner un Ordre de Transport (OT) / Nouvelle Mission">
+    <Modal ouvert={true} onFermer={onFermer} titre="Attribuer un OT / Initialiser Mission">
       <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
-        <Champ label="Véhicule (Camion)">
+        <div className="p-3 bg-blue-50 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-lg text-[12px] text-blue-800 dark:text-blue-300">
+          ⓘ L'attribution préalable de l'OT bascule immédiatement le camion au statut <b>VIDE</b> et initialise le corridor Toamasina / GRT.
+        </div>
+
+        <Champ label="Véhicule (Citerne)">
           <select
             value={vehiculeId}
             onChange={(e) => setVehiculeId(e.target.value)}
@@ -1252,39 +1366,39 @@ function ModalNouvelleMission({
           >
             {vehicules.map((v) => (
               <option key={v.id} value={v.id}>
-                {v.plaque} {v.description ? `— ${v.description}` : ""}
+                {v.plaque} {v.modele ? `(${v.modele})` : ""}
               </option>
             ))}
           </select>
         </Champ>
 
-        <Champ label="Chauffeur affecté">
+        <Champ label="Conducteur Affecté (facultatif)">
           <select
             value={conducteurId}
             onChange={(e) => setConducteurId(e.target.value)}
             className={inputCls}
           >
-            <option value="">-- Chauffeur titulaire ou détection auto --</option>
+            <option value="">-- Aucun / Chauffeur habituel --</option>
             {conducteurs.map((c) => (
               <option key={c.id} value={c.id}>
-                {c.nom_prenom} ({c.prenom_usuel}) {c.matricule ? `[${c.matricule}]` : ""}
+                {c.prenom_usuel || c.nom_prenom} {c.matricule ? `[${c.matricule}]` : ""}
               </option>
             ))}
           </select>
         </Champ>
 
-        <div className="grid grid-cols-2 gap-3">
-          <Champ label="Numéro Ordre de Transport (OT)">
-            <input
-              type="text"
-              value={numeroOt}
-              onChange={(e) => setNumeroOt(e.target.value)}
-              placeholder="Ex: OT-44821"
-              className={inputCls}
-              required
-            />
-          </Champ>
+        <Champ label="Numéro Ordre de Transport (OT)">
+          <input
+            type="text"
+            value={numeroOt}
+            onChange={(e) => setNumeroOt(e.target.value)}
+            placeholder="Ex: OT-98745"
+            className={inputCls}
+            required
+          />
+        </Champ>
 
+        <div className="grid grid-cols-2 gap-3">
           <Champ label="Distributeur">
             <select
               value={distributeur}
@@ -1298,9 +1412,7 @@ function ModalNouvelleMission({
               ))}
             </select>
           </Champ>
-        </div>
 
-        <div className="grid grid-cols-2 gap-3">
           <Champ label="Nature du Produit">
             <select
               value={produit}
@@ -1314,25 +1426,21 @@ function ModalNouvelleMission({
               ))}
             </select>
           </Champ>
-
-          <Champ label="Dépôt Récepteur Prévu">
-            <select
-              value={depotPrevu}
-              onChange={(e) => setDepotPrevu(e.target.value)}
-              className={inputCls}
-            >
-              {DEPOTS_LISTE.map((d) => (
-                <option key={d.code} value={d.code}>
-                  {d.label}
-                </option>
-              ))}
-            </select>
-          </Champ>
         </div>
 
-        <div className="p-3 bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 rounded-lg text-[12px] text-sky-800 dark:text-sky-300">
-          ⓘ L'attribution de l'OT génère un <b>Mission_ID</b> unique et bascule automatiquement le camion au statut <b>VIDE</b> (transit vers chargement à Tamatave).
-        </div>
+        <Champ label="Dépôt Récepteur Prévu">
+          <select
+            value={depotPrevu}
+            onChange={(e) => setDepotPrevu(e.target.value)}
+            className={inputCls}
+          >
+            {DEPOTS_LISTE.map((d) => (
+              <option key={d.code} value={d.code}>
+                {d.label}
+              </option>
+            ))}
+          </select>
+        </Champ>
 
         <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
           <Btn variante="fantome" onClick={onFermer}>
@@ -1348,21 +1456,21 @@ function ModalNouvelleMission({
 }
 
 // =============================================================================
-// MODAL SAISIE OT RAPIDE SUR MISSION EN COURS
+// MODAL SAISIE OT RAPIDE SUR MISSION EN COURS OU ALERTE
 // =============================================================================
 function ModalSaisieOT({
-  mission,
+  cible,
   onFermer,
   onSucces,
 }: {
-  mission: Mission;
+  cible: CibleActionMission;
   onFermer: () => void;
   onSucces: () => void;
 }) {
-  const [numeroOt, setNumeroOt] = useState(mission.numero_ot || "");
-  const [distributeur, setDistributeur] = useState(mission.distributeur || DISTRIBUTEURS_LISTE[0]);
-  const [produit, setProduit] = useState(mission.produit || PRODUITS_LISTE[0]);
-  const [depotPrevu, setDepotPrevu] = useState(mission.depot_prevu || DEPOTS_LISTE[0].code);
+  const [numeroOt, setNumeroOt] = useState(cible.numero_ot || "");
+  const [distributeur, setDistributeur] = useState(cible.distributeur || DISTRIBUTEURS_LISTE[0]);
+  const [produit, setProduit] = useState(cible.produit || PRODUITS_LISTE[0]);
+  const [depotPrevu, setDepotPrevu] = useState(cible.depot_prevu || DEPOTS_LISTE[0].code);
   const [envoi, setEnvoi] = useState(false);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -1371,15 +1479,17 @@ function ModalSaisieOT({
 
     setEnvoi(true);
     try {
-      await api(`/api/missions/${mission.id}`, {
-        method: "PATCH",
+      await api("/api/missions/action-rapide", {
+        method: "POST",
         body: JSON.stringify({
+          action: "SAISIR_OT",
+          plaque: cible.plaque,
+          mission_id: cible.mission_id || cible.id,
+          alerte_id: cible.alerte_id,
           numero_ot: numeroOt.trim(),
           distributeur,
           produit,
-          depot_prevu: depotPrevu,
-          depot_effectif: depotPrevu,
-          statut_camion_actuel: "VIDE",
+          nouveau_depot: depotPrevu,
         }),
       });
       onSucces();
@@ -1391,7 +1501,7 @@ function ModalSaisieOT({
   }
 
   return (
-    <Modal ouvert={true} onFermer={onFermer} titre={`Saisir OT — ${mission.plaque}`}>
+    <Modal ouvert={true} onFermer={onFermer} titre={`Saisir OT — ${cible.plaque}`}>
       <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
         <div className="p-3 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-lg text-[12px] text-amber-800 dark:text-amber-300">
           ⚠️ Le camion est actuellement en statut <b>LIBRE</b>. La saisie des informations de l'OT basculera automatiquement son statut en <b>VIDE</b> et résoudra l'alerte.
@@ -1470,11 +1580,11 @@ function ModalSaisieOT({
 // MODAL INVALIDATION DE DÉCHARGEMENT AVEC MOTIFS PRÉDÉFINIS (RÈGLE 5)
 // =============================================================================
 function ModalInvalidation({
-  mission,
+  cible,
   onFermer,
   onSucces,
 }: {
-  mission: Mission;
+  cible: CibleActionMission;
   onFermer: () => void;
   onSucces: () => void;
 }) {
@@ -1486,9 +1596,13 @@ function ModalInvalidation({
     e.preventDefault();
     setEnvoi(true);
     try {
-      await api(`/api/missions/${mission.id}/invalider-dechargement`, {
+      await api("/api/missions/action-rapide", {
         method: "POST",
         body: JSON.stringify({
+          action: "INVALIDER_DECHARGEMENT",
+          mission_id: cible.mission_id || cible.id,
+          alerte_id: cible.alerte_id,
+          plaque: cible.plaque,
           motif,
           commentaire: commentaire.trim() || undefined,
         }),
@@ -1502,7 +1616,7 @@ function ModalInvalidation({
   }
 
   return (
-    <Modal ouvert={true} onFermer={onFermer} titre={`Invalider Déchargement — ${mission.plaque}`}>
+    <Modal ouvert={true} onFermer={onFermer} titre={`Invalider Déchargement — ${cible.plaque}`}>
       <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
         <div className="p-3 bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-lg text-[12px] text-slate-700 dark:text-slate-300">
           ⓘ L'invalidation du déchargement maintient la mission <b>EN COURS</b> et conserve le statut du camion à <b>CHARGÉ</b> (ex: simple passage pour échantillon, repos de nuit).
@@ -1550,15 +1664,15 @@ function ModalInvalidation({
 // MODAL DÉCLARATION DE DÉVIATION DE DÉPÔT (RÈGLE 6)
 // =============================================================================
 function ModalDeviation({
-  mission,
+  cible,
   onFermer,
   onSucces,
 }: {
-  mission: Mission;
+  cible: CibleActionMission;
   onFermer: () => void;
   onSucces: () => void;
 }) {
-  const [nouveauDepot, setNouveauDepot] = useState(mission.depot_effectif || DEPOTS_LISTE[0].label);
+  const [nouveauDepot, setNouveauDepot] = useState(cible.depot_effectif || DEPOTS_LISTE[0].label);
   const [motif, setMotif] = useState("");
   const [envoi, setEnvoi] = useState(false);
 
@@ -1566,9 +1680,13 @@ function ModalDeviation({
     e.preventDefault();
     setEnvoi(true);
     try {
-      await api(`/api/missions/${mission.id}/declarer-deviation`, {
+      await api("/api/missions/action-rapide", {
         method: "POST",
         body: JSON.stringify({
+          action: "DECLARER_DEVIATION",
+          mission_id: cible.mission_id || cible.id,
+          alerte_id: cible.alerte_id,
+          plaque: cible.plaque,
           nouveau_depot: nouveauDepot,
           motif: motif.trim() || undefined,
         }),
@@ -1582,10 +1700,10 @@ function ModalDeviation({
   }
 
   return (
-    <Modal ouvert={true} onFermer={onFermer} titre={`Déclarer Déviation — ${mission.plaque}`}>
+    <Modal ouvert={true} onFermer={onFermer} titre={`Déclarer Déviation — ${cible.plaque}`}>
       <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
         <div className="p-3 bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800 rounded-lg text-[12px] text-purple-800 dark:text-purple-300">
-          ⓘ Dépôt initialement prévu : <b>{mission.depot_prevu || mission.depot || "Non renseigné"}</b>. La déclaration d'une déviation basculera le statut de la mission en <b>DÉVIÉE</b>.
+          ⓘ Dépôt initialement prévu : <b>{cible.depot_prevu || cible.depot || "Non renseigné"}</b>. La déclaration d'une déviation basculera le statut de la mission en <b>DÉVIÉE</b>.
         </div>
 
         <Champ label="Nouveau Dépôt Récepteur">
