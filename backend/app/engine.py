@@ -1325,15 +1325,16 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
     stats = {"creees": 0, "mises_a_jour": 0, "total_traites": 0}
 
     # 1. Optionnel : interrogation des API télématiques portails si actives
-    try:
-        from .scrapers import ApiMZoneX, _mzonex_api_active
-        if _mzonex_api_active():
-            api_m = ApiMZoneX()
-            ev_m = api_m.evenements(debut_7j_dt, maintenant)
-            if ev_m:
-                log.info("Rattrapage 7j MZoneX : %d événements télématiques récupérés", len(ev_m))
-    except Exception as e:
-        log.debug("Collecteur API non disponible lors du rattrapage 7j : %s", e)
+    if os.getenv("TESTING") != "1" and os.getenv("COLLECTOR_SOURCE", "AUCUN").upper() not in ("AUCUN", "TEST") and os.getenv("MZONEX_API_ENABLE", "1") == "1":
+        try:
+            from .scrapers import ApiMZoneX, _mzonex_api_active
+            if _mzonex_api_active():
+                api_m = ApiMZoneX()
+                ev_m = api_m.evenements(debut_7j_dt, maintenant)
+                if ev_m:
+                    log.info("Rattrapage 7j MZoneX : %d événements télématiques récupérés", len(ev_m))
+        except Exception as e:
+            log.debug("Collecteur API non disponible lors du rattrapage 7j : %s", e)
 
     vehicules = db.scalars(select(Vehicule)).all()
     if not vehicules:

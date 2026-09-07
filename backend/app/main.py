@@ -498,6 +498,13 @@ def _rattrapage_j1():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("TESTING") == "1":
+        # Mode Test : initialisation base minimale, sans boucles réseau d'arrière-plan
+        seed.seed_si_vide()
+        migrer_schema()
+        yield
+        return
+
     log.info("Démarrage — initialisation base + seed")
     seed.seed_si_vide()
     migrer_schema()

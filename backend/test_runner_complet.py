@@ -38,6 +38,12 @@ def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     env["PYTHONPATH"] = os.pathsep.join(pypaths)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    env["TESTING"] = "1"
+    env["SIM_ENABLE"] = "0"
+    env["COLLECTOR_SOURCE"] = "AUCUN"
+    env["MZONEX_API_ENABLE"] = "0"
+    env["WIALON_ENABLE"] = "0"
+    env["YMANE_ACTIVE"] = "0"
     
     # Chemin DB temporaire portable Windows / Linux
     db_file = os.path.join(tempfile.gettempdir(), f"test_runner_{int(time.time()*1000)}.db").replace("\\", "/")

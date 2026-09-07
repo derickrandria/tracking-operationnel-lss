@@ -17,6 +17,13 @@ import sys
 import tempfile
 from datetime import date, datetime, time, timedelta
 
+os.environ["TESTING"] = "1"
+os.environ["SIM_ENABLE"] = "0"
+os.environ["COLLECTOR_SOURCE"] = "AUCUN"
+os.environ["MZONEX_API_ENABLE"] = "0"
+os.environ["WIALON_ENABLE"] = "0"
+os.environ["YMANE_ACTIVE"] = "0"
+
 # Configuration universelle UTF-8 pour Windows PowerShell / Linux
 if hasattr(sys.stdout, "reconfigure"):
     try:
