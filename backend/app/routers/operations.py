@@ -818,13 +818,19 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
 
 @router.get("/missions/alertes")
 def alertes_missions(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
-    """Récupère les alertes spécifiques au cycle des Missions."""
+    """Récupère les alertes spécifiques au cycle des Missions (GRT, chargement, déchargement, déviation)."""
+    # Nettoyage automatique des alertes obsolètes de type MISSION_RETARDEE
+    db.query(Alerte).filter(
+        Alerte.type == TypeAlerte.MISSION_RETARDEE,
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+    db.commit()
+
     types_missions = [
         TypeAlerte.MISSION_SANS_OT,
         TypeAlerte.VALIDATION_CHARGEMENT,
         TypeAlerte.VALIDATION_DECHARGEMENT,
         TypeAlerte.DEVIATION_DETECTEE,
-        TypeAlerte.MISSION_RETARDEE
     ]
     alertes = list(db.scalars(
         select(Alerte)

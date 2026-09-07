@@ -402,8 +402,6 @@ export default function Missions() {
                   ? "Validation Chargement (≥ 30 min)"
                   : a.type === "VALIDATION_DECHARGEMENT"
                   ? "Validation Déchargement (≥ 3h)"
-                  : a.type === "MISSION_RETARDEE"
-                  ? "Mission Retardée"
                   : a.type === "DEVIATION_DETECTEE"
                   ? "Déviation Constatée"
                   : a.type;
@@ -415,8 +413,6 @@ export default function Missions() {
                   ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300 border-amber-300 dark:border-amber-800"
                   : a.type === "VALIDATION_DECHARGEMENT"
                   ? "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-300 border-blue-300 dark:border-blue-800"
-                  : a.type === "MISSION_RETARDEE"
-                  ? "bg-orange-100 text-orange-700 dark:bg-orange-950 dark:text-orange-300 border-orange-300 dark:border-orange-800"
                   : "bg-purple-100 text-purple-700 dark:bg-purple-950 dark:text-purple-300 border-purple-300 dark:border-purple-800";
 
               return (
@@ -493,16 +489,6 @@ export default function Missions() {
                         className="px-2.5 py-1 text-[11px] font-semibold rounded bg-purple-600 hover:bg-purple-700 text-white shadow-xs"
                       >
                         ⇄ Changer Dépôt
-                      </button>
-                    )}
-
-                    {a.type === "MISSION_RETARDEE" && (
-                      <button
-                        type="button"
-                        onClick={() => actionTraiterAlerteRapide(a.id)}
-                        className="px-2.5 py-1 text-[11px] font-semibold rounded bg-orange-600 hover:bg-orange-700 text-white shadow-xs"
-                      >
-                        ✓ Marquer Traitée
                       </button>
                     )}
 
@@ -657,7 +643,6 @@ export default function Missions() {
               <option value="EN_COURS">En cours</option>
               <option value="TERMINÉE">Terminée</option>
               <option value="DÉVIÉE">Déviée</option>
-              <option value="RETARDÉE">Retardée</option>
             </select>
 
             {/* Filtre Dépôt */}
