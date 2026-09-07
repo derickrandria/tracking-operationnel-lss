@@ -321,7 +321,7 @@ def _recuperer_missions_filtrees(db: Session, date_debut: str | None,
                                  q: str | None) -> tuple[date, date, list[Mission]]:
     now = now_local()
     fin = date.fromisoformat(date_fin) if date_fin else now.date()
-    debut = date.fromisoformat(date_debut) if date_debut else (fin - timedelta(days=30))
+    debut = date.fromisoformat(date_debut) if date_debut else fin
 
     query = select(Mission).where(Mission.date_jour >= debut, Mission.date_jour <= fin)
 

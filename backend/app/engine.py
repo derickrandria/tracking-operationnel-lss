@@ -1516,8 +1516,8 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                 km_v = round(km_tot_j, 1)
                 km_c = 0.0
 
-            # 3. Anti-Doublon / Upsert
-            if ts_depart_base or numero_ot or s_j or h_j:
+            # 3. Anti-Doublon / Upsert (Règle 8 : intégrité absolue, jamais de création fictive)
+            if missions_j or numero_ot or (evs_j and ts_depart_base):
                 stats["total_traites"] += 1
                 missions_exist = list(db.scalars(
                     select(Mission).where(
@@ -1573,7 +1573,7 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         maj = True
                     if maj:
                         stats["mises_a_jour"] += 1
-                else:
+                elif numero_ot or (evs_j and ts_depart_base):
                     code = _formater_code_mission(numero_ot, j, 1)
                     est_term = bool(ts_dechargement)
                     statut_m = StatutMission.TERMINEE if est_term else StatutMission.EN_COURS
