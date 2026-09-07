@@ -12,7 +12,7 @@ from ..engine import (PUBLISH_ENABLED, _formater_code_mission, appliquer_champs_
                       ensure_suivi, ensure_suivis_du_jour, get_seuils,
                       initialiser_ou_maj_mission, prefill_positions_gps,
                       reconcilier_alertes_missions_en_attente)
-from ..models import (Alerte, Conducteur, Infraction, Mission, StatutAlerte,
+from ..models import (Alerte, Conducteur, Infraction, Mission, Role, StatutAlerte,
                       StatutCamion, StatutMission, SuiviJournalier, TypeAlerte,
                       Vehicule, uid)
 from ..security import ECRITURE, TOUS, audit, require_roles
@@ -963,3 +963,13 @@ def detail_mission(mid: str, db: Session = Depends(get_db),
     if m is None:
         raise HTTPException(404, "Mission introuvable")
     return s_mission(m)
+
+
+@router.post("/missions/reinitialiser")
+def api_reinitialiser_missions(db: Session = Depends(get_db),
+                               user=Depends(require_roles(Role.ADMIN))):
+    """Réinitialisation chirurgicale à 0 de toutes les données et alertes Missions (Admin uniquement)."""
+    from ..reparation import reinitialiser_donnees_missions
+    res = reinitialiser_donnees_missions(db)
+    return {"statut": "OK", "resultat": res}
+

@@ -1204,3 +1204,61 @@ def nettoyer_alertes_missions_invalides(db=None) -> dict:
         if propre:
             db.close()
     return resultat
+
+
+def reinitialiser_donnees_missions(db=None) -> dict:
+    """Réinitialisation chirurgicale à 0 de toutes les données et alertes Missions.
+    Conserve intacts :
+      - HistoriqueJournalier (archives scellées)
+      - Trajets réels et temps de conduite (TCC, TCJ, TTJ, TCH glissant)
+      - Chauffeurs et véhicules dédoublonnés
+    Purge à zéro :
+      - Table missions
+      - Alertes logistiques (MISSION_SANS_OT, VALIDATION_CHARGEMENT, VALIDATION_DECHARGEMENT, DEVIATION_DETECTEE, MISSION_RETARDEE)
+      - Réinitialisation des statuts de chargement sur les suivis du jour (LIBRE, mission_id=None, numero_ot=None)
+    """
+    propre = False
+    if db is None:
+        db = SessionLocal()
+        propre = True
+    resultat = {"succes": True}
+    try:
+        from .models import Mission, Alerte, SuiviJournalier, StatutCamion, StatutAlerte, TypeAlerte
+        
+        # 1. Purge des missions
+        nb_missions = db.query(Mission).delete()
+        resultat["missions_supprimees"] = nb_missions
+
+        # 2. Purge des alertes logistiques
+        types_missions = [
+            TypeAlerte.MISSION_SANS_OT,
+            TypeAlerte.VALIDATION_CHARGEMENT,
+            TypeAlerte.VALIDATION_DECHARGEMENT,
+            TypeAlerte.DEVIATION_DETECTEE,
+            TypeAlerte.MISSION_RETARDEE,
+        ]
+        nb_alertes = db.query(Alerte).filter(Alerte.type.in_(types_missions)).delete(synchronize_session=False)
+        resultat["alertes_supprimees"] = nb_alertes
+
+        # 3. Réinitialisation des suivis
+        nb_suivis = db.query(SuiviJournalier).update({
+            SuiviJournalier.mission_id: None,
+            SuiviJournalier.numero_ot: None,
+            SuiviJournalier.produit: None,
+            SuiviJournalier.distributeur: None,
+            SuiviJournalier.depot_recepteur: None,
+            SuiviJournalier.statut_camion: StatutCamion.LIBRE
+        }, synchronize_session=False)
+        resultat["suivis_reinitialises"] = nb_suivis
+
+        db.commit()
+        log.warning("Réinitialisation chirurgicale des missions à 0 terminée : %s", resultat)
+    except Exception as e:
+        db.rollback()
+        log.exception("reinitialiser_donnees_missions en échec : %s", e)
+        resultat["succes"] = False
+        resultat["erreur"] = str(e)
+    finally:
+        if propre:
+            db.close()
+    return resultat
