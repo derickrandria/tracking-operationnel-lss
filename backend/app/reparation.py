@@ -1276,16 +1276,17 @@ def reinitialiser_donnees_missions(db=None) -> dict:
             depot_p = s.depot_recepteur or s.situation
             nom_dep = nom_officiel_depot(depot_p) or depot_p
 
-            # Créer la mission UNIQUEMENT si un OT officiel est renseigné ou si le camion est en mission active
-            if num_ot and statut_c in ("VIDE", "CHARGE"):
-                code = _formater_code_mission(num_ot, s.date_jour, 1)
+            # 1. Si le camion est CHARGÉ ou VIDE dans le SuiviJournalier -> Création d'une mission active fidèle 1:1
+            if statut_c in ("VIDE", "CHARGE"):
+                code = _formater_code_mission(num_ot, s.date_jour, missions_creees + 1)
                 statut_m = StatutMission.EN_COURS
                 
-                ts_debut = s.trajets[0].heure_debut if (s.trajets and s.trajets[0].heure_debut) else datetime.combine(jour_auj, time(6, 0))
+                ts_debut = s.trajets[0].heure_debut if (s.trajets and s.trajets[0].heure_debut) else (s.heure_depart or datetime.combine(jour_auj, time(6, 0)))
                 ts_chg = datetime.combine(jour_auj, time(10, 0)) if statut_c == "CHARGE" else None
 
                 etapes = []
-                etapes.append({"etat": "INITIALISATION_OT", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
+                if num_ot:
+                    etapes.append({"etat": "INITIALISATION_OT", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
                 if ts_debut:
                     etapes.append({"etat": "DEPART_BASE", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
                 if statut_c == "CHARGE":
@@ -1310,16 +1311,56 @@ def reinitialiser_donnees_missions(db=None) -> dict:
                     numero_ot=num_ot,
                     distributeur=s.distributeur,
                     produit=s.produit,
-                    depot=nom_dep,
-                    depot_prevu=nom_dep,
-                    depot_effectif=nom_dep,
+                    depot=nom_dep if nom_dep and nom_dep != "Hors zone" else None,
+                    depot_prevu=nom_dep if nom_dep and nom_dep != "Hors zone" else None,
+                    depot_effectif=nom_dep if nom_dep and nom_dep != "Hors zone" else None,
                     est_deviee=False,
-                    validation_chargement="VALIDÉ" if statut_c == "CHARGE" else "NON_REQUIS",
+                    validation_chargement="VALIDÉ" if statut_c == "CHARGE" else "EN_ATTENTE",
                     validation_dechargement="EN_ATTENTE" if (nom_dep and nom_dep != "Hors zone" and statut_c == "CHARGE") else "NON_REQUIS",
                     km_vide=km_v,
                     km_charge=km_c,
                     kilometrage=round(km_v + km_c, 1),
                     kilometrage_total=round(km_v + km_c, 1),
+                    origine="Base LSS — Antananarivo",
+                    etapes=etapes
+                )
+                db.add(m)
+                db.flush()
+                s.mission_id = m.id
+                missions_creees += 1
+
+            # 2. Si le camion est LIBRE mais a quitté Base TNR avec durée de roulage >= 1h (Règle 1 : Sans OT pour le moment)
+            elif (s.heure_depart is not None or (s.tcj_s and s.tcj_s >= 3600) or (s.km_parcourus and s.km_parcourus >= 30)) and ("repos" not in sit_l and "retour" not in sit_l and "cyclone" not in sit_l and "maintenance" not in sit_l):
+                code = f"MIS-{jour_auj.strftime('%Y%m%d')}-{missions_creees + 1:02d}"
+                ts_debut = s.trajets[0].heure_debut if (s.trajets and s.trajets[0].heure_debut) else (s.heure_depart or datetime.combine(jour_auj, time(6, 0)))
+                etapes = [{"etat": "DEPART_BASE", "ts": iso(ts_debut), "lieu": "Sortie Base Tanà (RN2)", "zone": "BASETNR"}]
+                km_tot = float(s.km_parcourus or 0.0)
+
+                m = Mission(
+                    id=uid(),
+                    code_mission=code,
+                    date_jour=s.date_jour,
+                    conducteur_id=s.conducteur_id or v.conducteur_actuel_id,
+                    vehicule_id=v.id,
+                    numero_mission_du_jour=1,
+                    statut=StatutMission.EN_COURS,
+                    statut_camion_actuel="LIBRE",
+                    heure_debut=ts_debut,
+                    heure_chargement=None,
+                    heure_fin=None,
+                    numero_ot=None,
+                    distributeur=None,
+                    produit=None,
+                    depot=None,
+                    depot_prevu=None,
+                    depot_effectif=None,
+                    est_deviee=False,
+                    validation_chargement="NON_REQUIS",
+                    validation_dechargement="NON_REQUIS",
+                    km_vide=round(km_tot, 1),
+                    km_charge=0.0,
+                    kilometrage=round(km_tot, 1),
+                    kilometrage_total=round(km_tot, 1),
                     origine="Base LSS — Antananarivo",
                     etapes=etapes
                 )
