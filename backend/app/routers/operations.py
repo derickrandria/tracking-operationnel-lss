@@ -135,6 +135,89 @@ def modifier_suivi_batch(data: SuiviBatchPatch, db: Session = Depends(get_db),
             "serveur_heure": now_local().strftime("%H:%M:%S")}
 
 
+class ArbitrageConducteurIn(BaseModel):
+    suivi_id: str
+    choix: str  # "PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE"
+    conducteur_id: str | None = None
+    alerte_id: str | None = None
+
+
+@router.post("/suivi/arbitrer-conducteur")
+def arbitrer_conducteur(data: ArbitrageConducteurIn, db: Session = Depends(get_db),
+                        user=Depends(require_roles(*ECRITURE))):
+    s = db.get(SuiviJournalier, data.suivi_id)
+    if s is None:
+        raise HTTPException(404, "Ligne de suivi introuvable")
+
+    vehicule = s.vehicule
+    conducteur_cible = db.get(Conducteur, data.conducteur_id) if data.conducteur_id else None
+    titulaire = vehicule.conducteur_actuel if (vehicule and vehicule.conducteur_actuel) else s.conducteur
+
+    if data.choix == "PASSAGE_TEMPORAIRE":
+        # Conserver le titulaire sur la ligne de suivi avec le flag RELAIS
+        if titulaire:
+            s.conducteur_id = titulaire.id
+        s.conducteur_origine = "RELAIS"
+        # Les trajets individuels conservent leurs badges respectifs (répartition proportionnelle du TCH)
+        audit(db, user, "suivi.arbitrage_relais", "suivi", s.id, {
+            "choix": "PASSAGE_TEMPORAIRE",
+            "titulaire": titulaire.nom_prenom if titulaire else None,
+            "relais": conducteur_cible.nom_prenom if conducteur_cible else None
+        })
+
+    elif data.choix == "REMPLACEMENT_JOURNEE":
+        # Réassigner toute la journée au nouveau chauffeur
+        if conducteur_cible:
+            s.conducteur_id = conducteur_cible.id
+        s.conducteur_origine = "MANUEL"
+        # Réassigner tous les trajets du jour au nouveau chauffeur
+        if s.trajets and conducteur_cible:
+            for t in s.trajets:
+                t.conducteur_badge_id = conducteur_cible.id
+                t.conducteur_badge = conducteur_cible.nom_prenom
+        audit(db, user, "suivi.arbitrage_remplacement", "suivi", s.id, {
+            "choix": "REMPLACEMENT_JOURNEE",
+            "nouveau_conducteur": conducteur_cible.nom_prenom if conducteur_cible else None
+        })
+
+    elif data.choix == "MAINTENIR_TITULAIRE":
+        # Forcer 100% au titulaire et écraser les badges portails
+        if titulaire:
+            s.conducteur_id = titulaire.id
+            if s.trajets:
+                for t in s.trajets:
+                    t.conducteur_badge_id = titulaire.id
+                    t.conducteur_badge = titulaire.nom_prenom
+        s.conducteur_origine = "MANUEL"
+        audit(db, user, "suivi.arbitrage_maintien_titulaire", "suivi", s.id, {
+            "choix": "MAINTENIR_TITULAIRE",
+            "titulaire": titulaire.nom_prenom if titulaire else None
+        })
+
+    # Fermer l'alerte d'arbitrage associée si spécifiée
+    if data.alerte_id:
+        alt = db.get(Alerte, data.alerte_id)
+        if alt:
+            alt.statut = StatutAlerte.TRAITEE
+
+    # Clôturer toutes les alertes de changement/conflit pour ce véhicule sur ce jour
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == s.vehicule_id,
+        Alerte.type.in_([TypeAlerte.CHANGEMENT_CONDUCTEUR_DETECTE, TypeAlerte.CONFLIT_AFFECTATION, TypeAlerte.DOUBLON_CONDUCTEUR]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    from ..engine import recalculer_temps
+    recalculer_temps(db, s, now_local())
+    db.commit()
+
+    return {
+        "statut": "OK",
+        "choix": data.choix,
+        "suivi": s_suivi(s, get_seuils(db))
+    }
+
+
 # ------------------- exports Suivi Journalier (Addendum v1.1 §3) -------------------
 def _suivis_filtres(db: Session, jour: date, statut: str | None, q: str | None) -> list[dict]:
     """Lignes de suivi du jour filtrées EXACTEMENT comme à l'écran (§3.3 :
@@ -281,8 +364,8 @@ def _calculer_stats_missions(missions: list[Mission], db: Session) -> dict:
     deviees = sum(1 for m in missions if m.statut == StatutMission.DEVIEE or getattr(m, "est_deviee", False))
     retardees = sum(1 for m in missions if m.statut == StatutMission.RETARDEE)
 
-    nb_vide = sum(1 for m in en_cours if getattr(m, "statut_camion_actuel", "VIDE") == "VIDE")
-    nb_charge = sum(1 for m in en_cours if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE")
+    nb_vide = sum(1 for m in en_cours if str(getattr(m, "statut_camion_actuel", "VIDE")).upper() in ("VIDE", "STATUTCAMION.VIDE"))
+    nb_charge = sum(1 for m in en_cours if str(getattr(m, "statut_camion_actuel", "VIDE")).upper() in ("CHARGE", "CHARGÉ", "STATUTCAMION.CHARGE"))
 
     km_vide = sum(getattr(m, "km_vide", 0.0) or 0.0 for m in missions)
     km_charge = sum(getattr(m, "km_charge", 0.0) or 0.0 for m in missions)
@@ -751,16 +834,29 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
 
     elif data.action == "INVALIDER_DECHARGEMENT":
         if m:
-            m.validation_dechargement = "INVALIDÉ"
-            m.motif_invalidation = data.motif or "Invalidation déchargement"
-            if data.commentaire:
-                m.motif_invalidation += f" ({data.commentaire})"
-            m.statut = StatutMission.EN_COURS
-            m.statut_camion_actuel = "CHARGE"
+            if data.nouveau_depot or (data.motif and "déviation" in data.motif.lower()):
+                m.est_deviee = True
+                m.statut = StatutMission.DEVIEE
+                if data.nouveau_depot:
+                    m.depot_effectif = data.nouveau_depot
+                m.motif_deviation = data.commentaire or data.motif or f"Déviation vers {data.nouveau_depot}"
+                m.validation_dechargement = "INVALIDÉ"
+                m.statut_camion_actuel = "CHARGE"
+            else:
+                m.validation_dechargement = "INVALIDÉ"
+                m.motif_invalidation = data.motif or "Invalidation déchargement"
+                if data.commentaire:
+                    m.motif_invalidation += f" ({data.commentaire})"
+                m.statut = StatutMission.EN_COURS
+                m.statut_camion_actuel = "CHARGE"
+
+            suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+            if suivi:
+                suivi.statut_camion = StatutCamion.CHARGE
         if v:
             db.query(Alerte).filter(
                 Alerte.vehicule_id == v.id,
-                Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+                Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
                 Alerte.statut != StatutAlerte.TRAITEE
             ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
 

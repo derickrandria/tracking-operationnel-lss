@@ -314,7 +314,7 @@ export default function Suivi() {
             refs={refs} lectureSeule={lectureSeule}
             onEdit={lectureSeule ? undefined : programmer} pendingUI={pendingUI}
             /* §0vicies decies N1 — TCC « 0:00 » dès que le jour n'est plus le jour en cours */
-            masquerTCC={date !== todayISO()} />
+            masquerTCC={date !== todayISO()} onRefresh={charger} />
         )}
       </div>
     </div>

@@ -10,6 +10,7 @@
  * `onEdit` absent / `lectureSeule` → cellules désactivées, structure inchangée.
  */
 import { Fragment, useMemo, useState } from "react";
+import { api } from "../api";
 import Icon from "./icons";
 import { Modal } from "./ui";
 import { Referentiels, SuiviLigne } from "../types";
@@ -122,6 +123,7 @@ export interface GrilleSuiviProps {
   pendingUI?: Record<string, boolean>;
   /** §0vicies decies N1 : journée terminée → colonne TCC affichée « 0:00 ». */
   masquerTCC?: boolean;
+  onRefresh?: () => void;
 }
 
 function extraireConducteursRelais(l: SuiviLigne): Array<{ nom: string; duree_s: number }> {
@@ -160,8 +162,12 @@ function fmtDureeRelais(sec: number): string {
 
 export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                                       lectureSeule, onEdit, pendingUI,
-                                      masquerTCC }: GrilleSuiviProps) {
+                                      masquerTCC, onRefresh }: GrilleSuiviProps) {
   const [extra, setExtra] = useState<SuiviLigne | null>(null);
+  const [arbitrageLigne, setArbitrageLigne] = useState<SuiviLigne | null>(null);
+  const [choixArbitrage, setChoixArbitrage] = useState<"PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE">("PASSAGE_TEMPORAIRE");
+  const [envoiArbitrage, setEnvoiArbitrage] = useState(false);
+
   const fige = lectureSeule || !onEdit;
   const edit = onEdit || PAS_DE_MODIF;
   const pauseMin = seuils?.DUREE_MIN_PAUSE_VALIDE || 900;
@@ -176,6 +182,27 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
     }
     return map;
   }, [lignes]);
+
+  async function validerArbitrage() {
+    if (!arbitrageLigne) return;
+    setEnvoiArbitrage(true);
+    try {
+      await api("/api/suivi/arbitrer-conducteur", {
+        method: "POST",
+        body: JSON.stringify({
+          suivi_id: arbitrageLigne.id,
+          choix: choixArbitrage,
+          conducteur_id: arbitrageLigne.conducteur?.id,
+        })
+      });
+      setArbitrageLigne(null);
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      console.error("Erreur lors de l'arbitrage conducteur:", e);
+    } finally {
+      setEnvoiArbitrage(false);
+    }
+  }
 
   return (
     <>
@@ -258,7 +285,33 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                           Manuel
                         </span>
                       )}
-                      {estDoublonChauffeur && (
+                      {l.conducteur_origine === "RELAIS" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setArbitrageLigne(l);
+                            setChoixArbitrage("PASSAGE_TEMPORAIRE");
+                          }}
+                          className="px-1.5 py-0.2 rounded text-[9.5px] font-semibold bg-sky-500/15 text-sky-600 dark:text-sky-400 border border-sky-500/30 hover:bg-sky-500/25 flex items-center gap-1 cursor-pointer"
+                          title="Passage temporaire / Relais validé — cliquer pour modifier l'arbitrage"
+                        >
+                          🔄 Relais
+                        </button>
+                      )}
+                      {relais.length > 0 && l.conducteur_origine !== "RELAIS" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setArbitrageLigne(l);
+                            setChoixArbitrage("PASSAGE_TEMPORAIRE");
+                          }}
+                          className="px-1.5 py-0.2 rounded text-[9.5px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 hover:bg-amber-500/25 flex items-center gap-1 cursor-pointer animate-pulse"
+                          title="Nouveau conducteur détecté — cliquer pour arbitrer l'attribution"
+                        >
+                          ⚡ Arbitrer
+                        </button>
+                      )}
+                      {estDoublonChauffeur && relais.length === 0 && (
                         <span className="px-1 py-0.2 rounded text-[9.5px] font-bold bg-red-500/15 text-red-600 border border-red-500/30 animate-pulse" title="Doublon : ce chauffeur est affecté à plus d'un camion sur cette journée !">
                           ⚠️ Doublon
                         </span>
@@ -426,6 +479,139 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
           une heure ne passe en noir que lorsque le trajet est terminé ET suivi d'une pause ≥ 20 min.
         </p>
       )}
+
+      {/* Modal d'arbitrage changement / relais conducteur */}
+      <Modal
+        ouvert={!!arbitrageLigne}
+        onFermer={() => setArbitrageLigne(null)}
+        titre={`Arbitrage Conducteur — ${arbitrageLigne?.plaque || ""}`}
+      >
+        {arbitrageLigne && (
+          <div className="space-y-4 text-sm">
+            <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+              <div className="font-semibold text-slate-800 dark:text-slate-100 flex items-center justify-between">
+                <span>Véhicule : <b className="font-mono">{arbitrageLigne.plaque}</b></span>
+                <span className="text-xs text-slate-500">Journée du {arbitrageLigne.date_jour}</span>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <span className="text-slate-400">Titulaire affecté :</span>
+                  <p className="font-bold text-slate-700 dark:text-slate-200">
+                    {arbitrageLigne.conducteur?.nom_prenom || "Non défini"}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-slate-400">Conducteur(s) relais détecté(s) :</span>
+                  <p className="font-bold text-sky-600 dark:text-sky-400">
+                    {extraireConducteursRelais(arbitrageLigne).map(r => r.nom).join(", ") || "Autre badge portail"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Choisir le mode d'attribution pour cette journée :
+              </label>
+
+              {/* Option A */}
+              <label className={cls(
+                "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors",
+                choixArbitrage === "PASSAGE_TEMPORAIRE"
+                  ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/40 text-blue-900 dark:text-blue-100"
+                  : "border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              )}>
+                <input
+                  type="radio"
+                  name="arbitrage_choix"
+                  value="PASSAGE_TEMPORAIRE"
+                  checked={choixArbitrage === "PASSAGE_TEMPORAIRE"}
+                  onChange={() => setChoixArbitrage("PASSAGE_TEMPORAIRE")}
+                  className="mt-1"
+                />
+                <div>
+                  <div className="font-bold text-xs flex items-center gap-1.5">
+                    <span>Option A : Passage temporaire / Relais (Recommandé)</span>
+                    <span className="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/15 text-emerald-600 font-semibold">Conseillé</span>
+                  </div>
+                  <p className="text-[11.5px] text-slate-600 dark:text-slate-300 mt-0.5">
+                    Le camion reste attribué au titulaire (<b>{arbitrageLigne.conducteur?.prenom_usuel || arbitrageLigne.conducteur?.nom_prenom}</b>).
+                    Le temps de conduite de chaque trajet est ventilé proportionnellement au TCH du conducteur qui était réellement au volant.
+                  </p>
+                </div>
+              </label>
+
+              {/* Option B */}
+              <label className={cls(
+                "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors",
+                choixArbitrage === "REMPLACEMENT_JOURNEE"
+                  ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/40 text-blue-900 dark:text-blue-100"
+                  : "border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              )}>
+                <input
+                  type="radio"
+                  name="arbitrage_choix"
+                  value="REMPLACEMENT_JOURNEE"
+                  checked={choixArbitrage === "REMPLACEMENT_JOURNEE"}
+                  onChange={() => setChoixArbitrage("REMPLACEMENT_JOURNEE")}
+                  className="mt-1"
+                />
+                <div>
+                  <div className="font-bold text-xs">
+                    Option B : Remplacement pour toute la journée
+                  </div>
+                  <p className="text-[11.5px] text-slate-600 dark:text-slate-300 mt-0.5">
+                    La ligne du jour est entièrement réattribuée au nouveau conducteur. Tous les trajets et l'intégralité du TCJ lui sont rattachés.
+                  </p>
+                </div>
+              </label>
+
+              {/* Option C */}
+              <label className={cls(
+                "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors",
+                choixArbitrage === "MAINTENIR_TITULAIRE"
+                  ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/40 text-blue-900 dark:text-blue-100"
+                  : "border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              )}>
+                <input
+                  type="radio"
+                  name="arbitrage_choix"
+                  value="MAINTENIR_TITULAIRE"
+                  checked={choixArbitrage === "MAINTENIR_TITULAIRE"}
+                  onChange={() => setChoixArbitrage("MAINTENIR_TITULAIRE")}
+                  className="mt-1"
+                />
+                <div>
+                  <div className="font-bold text-xs">
+                    Option C : Maintenir 100% au titulaire (Ignorer le badge portail)
+                  </div>
+                  <p className="text-[11.5px] text-slate-600 dark:text-slate-300 mt-0.5">
+                    100% du temps de conduite de la journée reste rattaché au titulaire (ex: clé garage ou carte de service passée par erreur).
+                  </p>
+                </div>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-200 dark:border-slate-700">
+              <button
+                type="button"
+                onClick={() => setArbitrageLigne(null)}
+                className="px-3 py-1.5 text-xs font-semibold rounded-md border border-slate-300 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={envoiArbitrage}
+                onClick={validerArbitrage}
+                className="px-4 py-1.5 text-xs font-semibold rounded-md bg-blue-600 hover:bg-blue-700 text-white shadow-xs"
+              >
+                {envoiArbitrage ? "Enregistrement…" : "Confirmer l'arbitrage"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
 
       {/* Trajets supplémentaires (> 9) : consultables, jamais perdus */}
       <Modal ouvert={!!extra} onFermer={() => setExtra(null)}

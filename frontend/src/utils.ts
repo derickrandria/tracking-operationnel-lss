@@ -77,6 +77,7 @@ export const LABELS_ALERTE: Record<string, string> = {
   TCH_LIMITE_ATTEINTE: "TCH limite atteinte",
   CONFLIT_AFFECTATION: "Conflit d'affectation chauffeur",
   DOUBLON_CONDUCTEUR: "Doublon chauffeur",
+  CHANGEMENT_CONDUCTEUR_DETECTE: "Changement de conducteur détecté (arbitrage)",
 };
 
 export const COULEURS_GRAVITE: Record<string, string> = {
@@ -89,6 +90,7 @@ export const COULEURS_GRAVITE: Record<string, string> = {
 export const COULEURS_STATUT_CAMION: Record<string, string> = {
   "LIBRE": "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border-emerald-500/40",
   "VIDE": "bg-sky-500/15 text-sky-600 dark:text-sky-400 border-sky-500/40",
+  "CHARGE": "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/40",
   "CHARGÉ": "bg-amber-500/15 text-amber-600 dark:text-amber-400 border-amber-500/40",
 };
 

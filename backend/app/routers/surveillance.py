@@ -44,6 +44,7 @@ TYPES_ALERTE = {
     "TCH_LIMITE_ATTEINTE": "TCH limite atteinte (≥ 56h)",
     "CONFLIT_AFFECTATION": "Conflit d'affectation chauffeur (manuel vs portail)",
     "DOUBLON_CONDUCTEUR": "Doublon chauffeur sur la journée",
+    "CHANGEMENT_CONDUCTEUR_DETECTE": "Changement de conducteur détecté (arbitrage requis)",
 }
 
 

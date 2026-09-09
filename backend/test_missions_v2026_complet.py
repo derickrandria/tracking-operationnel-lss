@@ -98,18 +98,25 @@ def test_missions_cycle_complet():
     suivi = ensure_suivi(db, v, jour)
     assert suivi.statut_camion == StatutCamion.LIBRE
 
-    # Déplacement et sortie de Base vers RN2
+    # Déplacement et sortie de Base vers RN2 (à t1 = +30 min, < 1h de conduite RN2 -> pas encore de mission)
     t1 = maintenant + timedelta(minutes=30)
     ingest_event(db, v, t1, -18.9100, 47.6500, "RN2 — Sortie Antananarivo", 40.0, "ON", source="SIMULATEUR")
 
     db.refresh(suivi)
-    assert suivi.mission_id is not None
+    assert suivi.mission_id is None, "A moins de 1h de conduite RN2, la mission ne doit pas encore être créée"
+
+    # Conduite continue sur RN2 confirmée (> 1h après la sortie base à t1)
+    t1_conf = t1 + timedelta(minutes=65)
+    ingest_event(db, v, t1_conf, -18.9489, 48.2257, "RN2 — PK 90 vers Moramanga", 45.0, "ON", source="SIMULATEUR")
+
+    db.refresh(suivi)
+    assert suivi.mission_id is not None, "Après ≥1h de conduite RN2, la mission doit être validée"
     m = db.get(Mission, suivi.mission_id)
     assert m is not None
-    assert m.heure_debut is not None
+    assert m.heure_debut == t1, "L'heure de début doit être calée sur la sortie effective de la Base"
     assert m.statut_camion_actuel == "LIBRE"
     assert suivi.statut_camion == StatutCamion.LIBRE
-    print(f"  ✅ Mission {m.code_mission} créée au départ physique de la Base")
+    print(f"  ✅ Règle 1 : Mission {m.code_mission} créée après ≥1h de conduite RN2")
     print(f"  ✅ heure_debut={m.heure_debut}, statut_camion={m.statut_camion_actuel}")
 
     # -------------------------------------------------------------------------
@@ -204,14 +211,28 @@ def test_missions_cycle_complet():
     print(f"  ✅ Déviation constatée : mission {m.statut.value}, nouveau dépôt {m.depot_effectif}")
 
     # -------------------------------------------------------------------------
-    # RÈGLE 5 : Déchargement au Dépôt Récepteur (Arrêt ≥ 3h) + Validation
+    # RÈGLE 5 : Déchargement au Dépôt Récepteur (Arrêt ≥ 3h) + Validation Opérateur
     # -------------------------------------------------------------------------
-    print("\n[RÈGLE 5] Déchargement au Dépôt (Arrêt ≥ 3h) -> Validation & Statut LIBRE")
+    print("\n[RÈGLE 5] Déchargement au Dépôt (Arrêt ≥ 3h) -> Alerte & Validation Opérateur -> LIBRE")
     t_arret_dfia = t_dfia + timedelta(minutes=5)
     ingest_event(db, v, t_arret_dfia, -21.4536, 47.0857, "Dépôt DFIA — Fianarantsoa", 0.0, "OFF", source="SIMULATEUR")
 
     t_apres_3h = t_arret_dfia + timedelta(hours=3, minutes=15)
     ingest_event(db, v, t_apres_3h, -21.4536, 47.0857, "Dépôt DFIA — Fianarantsoa", 0.0, "OFF", source="SIMULATEUR")
+
+    db.refresh(m)
+    assert m.validation_dechargement == "EN_ATTENTE"
+    print("  ✅ Alerte VALIDATION_DECHARGEMENT générée après arrêt ≥ 3h")
+
+    # Validation par l'opérateur
+    from backend.app.routers.operations import (
+        MissionDeclarerDeviation, MissionInvaliderDechargement,
+        MissionValiderChargement, MissionValiderDechargement,
+        declarer_deviation_mission, invalider_dechargement_mission,
+        valider_chargement_mission, valider_dechargement_mission,
+        executer_action_rapide_mission, ActionMissionRapideIn)
+
+    valider_dechargement_mission(m.id, db=db, user=cond)
 
     db.refresh(m)
     db.refresh(suivi)
@@ -246,12 +267,6 @@ def test_missions_cycle_complet():
     suivi.statut_camion = StatutCamion.CHARGE
     db.commit()
 
-    from backend.app.routers.operations import (
-        MissionDeclarerDeviation, MissionInvaliderDechargement,
-        MissionValiderChargement, MissionValiderDechargement,
-        declarer_deviation_mission, invalider_dechargement_mission,
-        valider_chargement_mission, valider_dechargement_mission)
-
     # Invalidation pour échantillonnage
     invalider_dechargement_mission(
         "m-test-inval-02",
@@ -269,20 +284,24 @@ def test_missions_cycle_complet():
     print(f"  ✅ Invalidation réussie : statut conservé CHARGÉ, motif: {m2.motif_invalidation}")
 
     # -------------------------------------------------------------------------
-    # RÈGLE 6b : Test Déclaration de Déviation manuelle
+    # RÈGLE 5c : Test Invalidation avec Déviation ("Déviation vers un autre dépôt")
     # -------------------------------------------------------------------------
-    print("\n[RÈGLE 6b] Test API Déclaration Déviation manuelle")
-    declarer_deviation_mission(
-        "m-test-inval-02",
-        MissionDeclarerDeviation(nouveau_depot="Depot Soanierana (DSNR)", motif="Changement de commande Total"),
-        db=db,
-        user=cond
-    )
+    print("\n[RÈGLE 5c] Test Invalidation avec Déviation vers nouveau dépôt")
+    res_inval_dev = executer_action_rapide_mission(ActionMissionRapideIn(
+        action="INVALIDER_DECHARGEMENT",
+        mission_id=m2.id,
+        vehicule_id=v.id,
+        motif="Déviation vers un autre dépôt",
+        nouveau_depot="Depot Antsirabe (DABE)",
+        commentaire="Réorientation urgente Total"
+    ), db=db, user=cond)
+
     db.refresh(m2)
-    assert m2.est_deviee is True
     assert m2.statut == StatutMission.DEVIEE
-    assert m2.depot_effectif == "Depot Soanierana (DSNR)"
-    print(f"  ✅ Déviation manuelle enregistrée : {m2.depot_effectif}")
+    assert m2.est_deviee is True
+    assert m2.depot_effectif == "Depot Antsirabe (DABE)"
+    assert m2.statut_camion_actuel == "CHARGE"
+    print(f"  ✅ Invalidation avec déviation confirmée : Statut DÉVIÉE, nouveau dépôt: {m2.depot_effectif}, reste CHARGÉ")
 
     # -------------------------------------------------------------------------
     # RÈGLE DÉPÔTS STRICTS : Dépôt officiel unique GRT + 7 dépôts déchargement stricts

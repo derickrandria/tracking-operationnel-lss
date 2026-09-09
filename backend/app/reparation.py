@@ -1207,15 +1207,11 @@ def nettoyer_alertes_missions_invalides(db=None) -> dict:
 
 
 def reinitialiser_donnees_missions(db=None) -> dict:
-    """Réinitialisation chirurgicale à 0 de toutes les données et alertes Missions.
-    Conserve intacts :
-      - HistoriqueJournalier (archives scellées)
-      - Trajets réels et temps de conduite (TCC, TCJ, TTJ, TCH glissant)
-      - Chauffeurs et véhicules dédoublonnés
-    Purge à zéro :
-      - Table missions
-      - Alertes logistiques (MISSION_SANS_OT, VALIDATION_CHARGEMENT, VALIDATION_DECHARGEMENT, DEVIATION_DETECTEE, MISSION_RETARDEE)
-      - Réinitialisation des statuts de chargement sur les suivis du jour (LIBRE, mission_id=None, numero_ot=None)
+    """Nettoie les anciennes lignes de missions orphelines/synthétiques et synchronise
+    proprement les missions actives à partir des données de SuiviJournalier saisies pour chaque camion.
+    - Conserve intactes toutes les informations saisies (OT, distributeur, produit, dépôt, statut camion).
+    - Clôture les alertes des jours passés (< aujourd'hui).
+    - Rétablit et persiste les alertes légitimes à compter d'aujourd'hui.
     """
     propre = False
     if db is None:
@@ -1223,13 +1219,20 @@ def reinitialiser_donnees_missions(db=None) -> dict:
         propre = True
     resultat = {"succes": True}
     try:
-        from .models import Mission, Alerte, SuiviJournalier, StatutCamion, StatutAlerte, TypeAlerte
+        from .models import Mission, Alerte, SuiviJournalier, StatutCamion, StatutAlerte, TypeAlerte, StatutMission, Vehicule, uid
+        from .geozones import nom_officiel_depot
+        from .engine import _formater_code_mission, reconcilier_alertes_missions_en_attente
+        from .config import now_local
         
-        # 1. Purge des missions
+        maintenant = now_local()
+        jour_auj = maintenant.date()
+        debut_auj_dt = datetime.combine(jour_auj, time.min)
+
+        # 1. Purge complète des missions pour repartir sur une base 100% fidèle au SuiviJournalier
         nb_missions = db.query(Mission).delete()
         resultat["missions_supprimees"] = nb_missions
 
-        # 2. Purge des alertes logistiques
+        # 2. Clôture des alertes des jours passés (< aujourd'hui) et alertes invalides
         types_missions = [
             TypeAlerte.MISSION_SANS_OT,
             TypeAlerte.VALIDATION_CHARGEMENT,
@@ -1237,22 +1240,102 @@ def reinitialiser_donnees_missions(db=None) -> dict:
             TypeAlerte.DEVIATION_DETECTEE,
             TypeAlerte.MISSION_RETARDEE,
         ]
-        nb_alertes = db.query(Alerte).filter(Alerte.type.in_(types_missions)).delete(synchronize_session=False)
-        resultat["alertes_supprimees"] = nb_alertes
+        nb_alertes_passees = db.query(Alerte).filter(
+            Alerte.type.in_(types_missions),
+            Alerte.date_heure < debut_auj_dt
+        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+        resultat["alertes_passees_cloturees"] = nb_alertes_passees
 
-        # 3. Réinitialisation des suivis
-        nb_suivis = db.query(SuiviJournalier).update({
-            SuiviJournalier.mission_id: None,
-            SuiviJournalier.numero_ot: None,
-            SuiviJournalier.produit: None,
-            SuiviJournalier.distributeur: None,
-            SuiviJournalier.depot_recepteur: None,
-            SuiviJournalier.statut_camion: StatutCamion.LIBRE
-        }, synchronize_session=False)
-        resultat["suivis_reinitialises"] = nb_suivis
+        # 3. Synchronisation et recréation fidèle des missions depuis SuiviJournalier
+        suivis_recents = db.scalars(
+            select(SuiviJournalier).where(SuiviJournalier.date_jour == jour_auj)
+            .order_by(SuiviJournalier.vehicule_id.asc())
+        ).all()
 
+        missions_creees = 0
+        for s in suivis_recents:
+            v = db.get(Vehicule, s.vehicule_id)
+            if not v:
+                continue
+
+            statut_c_raw = s.statut_camion.value if hasattr(s.statut_camion, "value") else str(s.statut_camion or "LIBRE")
+            statut_c = "CHARGE" if str(statut_c_raw).upper() in ("CHARGE", "CHARGÉ") else ("VIDE" if str(statut_c_raw).upper() == "VIDE" else "LIBRE")
+            sit_l = (s.situation or "").lower()
+
+            # Règle 8 & 10 : Si le véhicule est au repos, au garage, ou en retour/repositionnement sans mission active,
+            # il est STRICTEMENT en statut LIBRE sans Ordre de Transport officiel.
+            if statut_c == "LIBRE" and ("repos" in sit_l or "retour tana" in sit_l or "cyclone" in sit_l or "garage" in sit_l or "maintenance" in sit_l):
+                s.numero_ot = None
+                s.depot_recepteur = None
+                s.distributeur = None
+                s.produit = None
+                s.mission_id = None
+                continue
+
+            num_ot = s.numero_ot
+            depot_p = s.depot_recepteur or s.situation
+            nom_dep = nom_officiel_depot(depot_p) or depot_p
+
+            # Créer la mission UNIQUEMENT si un OT officiel est renseigné ou si le camion est en mission active
+            if num_ot and statut_c in ("VIDE", "CHARGE"):
+                code = _formater_code_mission(num_ot, s.date_jour, 1)
+                statut_m = StatutMission.EN_COURS
+                
+                ts_debut = s.trajets[0].heure_debut if (s.trajets and s.trajets[0].heure_debut) else datetime.combine(jour_auj, time(6, 0))
+                ts_chg = datetime.combine(jour_auj, time(10, 0)) if statut_c == "CHARGE" else None
+
+                etapes = []
+                etapes.append({"etat": "INITIALISATION_OT", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
+                if ts_debut:
+                    etapes.append({"etat": "DEPART_BASE", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
+                if statut_c == "CHARGE":
+                    etapes.append({"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts_chg or ts_debut), "lieu": "GRT (GALANA RAFINERIE TERMINALE)", "zone": "GRT"})
+
+                km_tot = float(s.km_parcourus or 0.0)
+                km_v = round(km_tot * 0.5, 1) if statut_c == "CHARGE" else round(km_tot, 1)
+                km_c = round(km_tot * 0.5, 1) if statut_c == "CHARGE" else 0.0
+
+                m = Mission(
+                    id=uid(),
+                    code_mission=code,
+                    date_jour=s.date_jour,
+                    conducteur_id=s.conducteur_id or v.conducteur_actuel_id,
+                    vehicule_id=v.id,
+                    numero_mission_du_jour=1,
+                    statut=statut_m,
+                    statut_camion_actuel=statut_c,
+                    heure_debut=ts_debut,
+                    heure_chargement=ts_chg,
+                    heure_fin=None,
+                    numero_ot=num_ot,
+                    distributeur=s.distributeur,
+                    produit=s.produit,
+                    depot=nom_dep,
+                    depot_prevu=nom_dep,
+                    depot_effectif=nom_dep,
+                    est_deviee=False,
+                    validation_chargement="VALIDÉ" if statut_c == "CHARGE" else "NON_REQUIS",
+                    validation_dechargement="EN_ATTENTE" if (nom_dep and nom_dep != "Hors zone" and statut_c == "CHARGE") else "NON_REQUIS",
+                    km_vide=km_v,
+                    km_charge=km_c,
+                    kilometrage=round(km_v + km_c, 1),
+                    kilometrage_total=round(km_v + km_c, 1),
+                    origine="Base LSS — Antananarivo",
+                    etapes=etapes
+                )
+                db.add(m)
+                db.flush()
+                s.mission_id = m.id
+                missions_creees += 1
+            else:
+                s.mission_id = None
+
+        resultat["missions_creees"] = missions_creees
         db.commit()
-        log.warning("Réinitialisation chirurgicale des missions à 0 terminée : %s", resultat)
+
+        # 4. Rétablir les alertes légitimes à compter d'aujourd'hui
+        reconcilier_alertes_missions_en_attente(db)
+        log.warning("Synchronisation des missions depuis SuiviJournalier terminée : %s", resultat)
     except Exception as e:
         db.rollback()
         log.exception("reinitialiser_donnees_missions en échec : %s", e)

@@ -66,6 +66,7 @@ const MOTIFS_INVALIDATION = [
   "Échantillonnage de produit (simple passage)",
   "Repos chauffeur sur parking du dépôt",
   "Attente ouverture du dépôt / Congé",
+  "Déviation vers un autre dépôt",
   "Autre motif opérationnel",
 ];
 
@@ -932,7 +933,7 @@ export default function Missions() {
                             </button>
                           )}
 
-                          {m.statut === "EN_COURS" && statutCamion === "CHARGE" && (
+                          {m.statut === "EN_COURS" && (statutCamion === "CHARGE" || statutCamion === "CHARGÉ") && (
                             <>
                               <button
                                 type="button"
@@ -1274,12 +1275,12 @@ function ModalDetailMission({
                 <Icon nom="recherche" className="w-3.5 h-3.5 text-purple-500" />
                 <span>Déclarer Déviation</span>
               </Btn>
-              {mission.statut_camion_actuel !== "CHARGE" && (
+              {(mission.statut_camion_actuel !== "CHARGE" && mission.statut_camion_actuel !== "CHARGÉ") && (
                 <Btn variante="secondaire" onClick={validerChargementDirect} disabled={enAction} className="border-amber-400 text-amber-700 dark:text-amber-300">
                   <span>Valider Chargement GRT</span>
                 </Btn>
               )}
-              {mission.statut_camion_actuel === "CHARGE" && (
+              {(mission.statut_camion_actuel === "CHARGE" || mission.statut_camion_actuel === "CHARGÉ") && (
                 <Btn variante="secondaire" onClick={onOuvrirInvalidation} disabled={enAction}>
                   <span>Invalider Déchargement</span>
                 </Btn>
@@ -1572,7 +1573,7 @@ function ModalSaisieOT({
 }
 
 // =============================================================================
-// MODAL INVALIDATION DE DÉCHARGEMENT AVEC MOTIFS PRÉDÉFINIS (RÈGLE 5)
+// MODAL INVALIDATION DE DÉCHARGEMENT AVEC MOTIFS PRÉDÉFINIS & DÉVIATION (RÈGLE 5)
 // =============================================================================
 function ModalInvalidation({
   cible,
@@ -1584,8 +1585,11 @@ function ModalInvalidation({
   onSucces: () => void;
 }) {
   const [motif, setMotif] = useState(MOTIFS_INVALIDATION[0]);
+  const [nouveauDepot, setNouveauDepot] = useState(cible.depot_effectif || DEPOTS_LISTE[0].label);
   const [commentaire, setCommentaire] = useState("");
   const [envoi, setEnvoi] = useState(false);
+
+  const estDeviation = motif === "Déviation vers un autre dépôt";
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -1599,6 +1603,7 @@ function ModalInvalidation({
           alerte_id: cible.alerte_id,
           plaque: cible.plaque,
           motif,
+          nouveau_depot: estDeviation ? nouveauDepot : undefined,
           commentaire: commentaire.trim() || undefined,
         }),
       });
@@ -1613,9 +1618,15 @@ function ModalInvalidation({
   return (
     <Modal ouvert={true} onFermer={onFermer} titre={`Invalider Déchargement — ${cible.plaque}`}>
       <form onSubmit={handleSubmit} className="space-y-4 text-[13px]">
-        <div className="p-3 bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-lg text-[12px] text-slate-700 dark:text-slate-300">
-          ⓘ L'invalidation du déchargement maintient la mission <b>EN COURS</b> et conserve le statut du camion à <b>CHARGÉ</b> (ex: simple passage pour échantillon, repos de nuit).
-        </div>
+        {estDeviation ? (
+          <div className="p-3 bg-purple-50 dark:bg-purple-950/40 border border-purple-200 dark:border-purple-800 rounded-lg text-[12px] text-purple-800 dark:text-purple-300">
+            ⇄ <b>Déviation d'itinéraire</b> : Le déchargement au dépôt initial est invalidé. La mission passera en statut <b>DÉVIÉE</b> vers le nouveau dépôt récepteur et le camion restera à <b>CHARGÉ</b>.
+          </div>
+        ) : (
+          <div className="p-3 bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 rounded-lg text-[12px] text-slate-700 dark:text-slate-300">
+            ⓘ L'invalidation du déchargement maintient la mission <b>EN COURS</b> et conserve le statut du camion à <b>CHARGÉ</b> (ex: simple passage pour échantillon, repos de nuit).
+          </div>
+        )}
 
         <Champ label="Motif d'invalidation">
           <select
@@ -1632,22 +1643,62 @@ function ModalInvalidation({
           </select>
         </Champ>
 
-        <Champ label="Remarque / Commentaire complémentaire (facultatif)">
-          <textarea
-            value={commentaire}
-            onChange={(e) => setCommentaire(e.target.value)}
-            placeholder="Détails complémentaires sur la situation..."
-            rows={3}
-            className={inputCls}
-          />
-        </Champ>
+        {estDeviation && (
+          <>
+            <Champ label="Nouveau Dépôt Récepteur Officiel">
+              <select
+                value={nouveauDepot}
+                onChange={(e) => setNouveauDepot(e.target.value)}
+                className={inputCls}
+                required
+              >
+                {DEPOTS_LISTE.map((d) => (
+                  <option key={d.code} value={d.label}>
+                    {d.label}
+                  </option>
+                ))}
+              </select>
+            </Champ>
+
+            <Champ label="Instruction ou motif de réorientation du distributeur">
+              <input
+                type="text"
+                value={commentaire}
+                onChange={(e) => setCommentaire(e.target.value)}
+                placeholder="Ex: Réorientation demandée par Total suite à besoin urgent..."
+                className={inputCls}
+              />
+            </Champ>
+          </>
+        )}
+
+        {!estDeviation && (
+          <Champ label="Remarque / Commentaire complémentaire (facultatif)">
+            <textarea
+              value={commentaire}
+              onChange={(e) => setCommentaire(e.target.value)}
+              placeholder="Détails complémentaires sur la situation..."
+              rows={3}
+              className={inputCls}
+            />
+          </Champ>
+        )}
 
         <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
           <Btn variante="fantome" onClick={onFermer}>
             Annuler
           </Btn>
-          <Btn type="submit" variante="primaire" disabled={envoi} className="bg-slate-700 hover:bg-slate-800 text-white">
-            {envoi ? <Spinner /> : <span>Confirmer Invalidation (Reste CHARGÉ)</span>}
+          <Btn
+            type="submit"
+            variante="primaire"
+            disabled={envoi}
+            className={cls(estDeviation ? "bg-purple-600 hover:bg-purple-700 text-white" : "bg-slate-700 hover:bg-slate-800 text-white")}
+          >
+            {envoi ? (
+              <Spinner />
+            ) : (
+              <span>{estDeviation ? "Confirmer Déviation (Reste CHARGÉ)" : "Confirmer Invalidation (Reste CHARGÉ)"}</span>
+            )}
           </Btn>
         </div>
       </form>

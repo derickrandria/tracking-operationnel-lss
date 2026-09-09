@@ -24,6 +24,7 @@ SUITES_CRITIQUES = [
     ("Temps de Conduite & TCH Glissant", "backend/test_temps_conduite.py"),
     ("Dédoublonnage & Rapprochement Chauffeurs", "backend/test_conducteurs_fusion.py"),
     ("Conduite & Seuils Réglementaires", "backend/test_conduite_v127.py"),
+    ("Détection Relais & Arbitrage Conducteurs", "backend/test_arbitrage_conducteurs.py"),
 ]
 
 def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:

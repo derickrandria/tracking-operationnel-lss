@@ -17,6 +17,7 @@ const ICONES: Record<string, string> = {
   REPARATION_DONNEES: "historique",
   TCH_PROCHE_LIMITE: "horloge", TCH_LIMITE_ATTEINTE: "horloge",
   CONFLIT_AFFECTATION: "conducteurs", DOUBLON_CONDUCTEUR: "conducteurs",
+  CHANGEMENT_CONDUCTEUR_DETECTE: "conducteurs",
 };
 
 export default function Alertes() {

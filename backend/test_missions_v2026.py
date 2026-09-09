@@ -200,16 +200,28 @@ def test_missions_complet():
     print(f"  ✅ Nouvelle destination enregistrée : {m.depot_effectif}")
 
     # -------------------------------------------------------------------------
-    # 6. Test Déchargement Validé (Arrêt >= 3h au Dépôt Récepteur)
+    # 6. Test Déchargement Validé (Arrêt >= 3h au Dépôt Récepteur -> Alerte & Validation)
     # -------------------------------------------------------------------------
-    print("\n[T6] Déchargement au Dépôt Récepteur (Arrêt >= 3h -> Clôture LIBRE)")
+    print("\n[T6] Déchargement au Dépôt Récepteur (Arrêt >= 3h -> Alerte & Validation Clôture LIBRE)")
     # Arrêt dans le dépôt récepteur
     t_arret = maintenant + timedelta(hours=12, minutes=5)
     ingest_event(db, v, t_arret, -21.4536, 47.0857, "Dépôt DFIA — Fianarantsoa", 0.0, "OFF", source="SIMULATEUR")
     
-    # Événement 3h15 plus tard (arrêt >= 3h confirmé)
+    # Événement 3h15 plus tard (arrêt >= 3h confirmé) -> Alerte de validation générée
     t_fin_decharge = maintenant + timedelta(hours=15, minutes=20)
     ingest_event(db, v, t_fin_decharge, -21.4536, 47.0857, "Dépôt DFIA — Fianarantsoa", 0.0, "OFF", source="SIMULATEUR")
+
+    db.refresh(m)
+    assert m.validation_dechargement == "EN_ATTENTE"
+    print("  ✅ Alerte VALIDATION_DECHARGEMENT générée après arrêt >= 3h")
+
+    # Validation par l'opérateur
+    from app.routers.operations import executer_action_rapide_mission, ActionMissionRapideIn
+    res_val = executer_action_rapide_mission(ActionMissionRapideIn(
+        action="VALIDER_DECHARGEMENT",
+        mission_id=m.id,
+        vehicule_id=v.id
+    ), db=db, user=None)
 
     db.refresh(m)
     db.refresh(suivi)
@@ -220,8 +232,7 @@ def test_missions_complet():
     assert suivi.mission_id is None
     assert m.heure_fin is not None
     assert m.duree_s > 0
-    assert any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in m.etapes)
-    print("  ✅ Déchargement validé après arrêt >= 3h")
+    print("  ✅ Déchargement validé par l'opérateur")
     print(f"  ✅ Mission TERMINÉE, camion revenu à LIBRE, durée : {m.duree_s//3600}h{(m.duree_s%3600)//60:02d}")
 
     # -------------------------------------------------------------------------

@@ -560,6 +560,7 @@ async def lifespan(app: FastAPI):
     try:
         db_a = SessionLocal()
         try:
+            reparation.reinitialiser_donnees_missions(db_a)
             reparation.nettoyer_alertes_missions_invalides(db_a)
         finally:
             db_a.close()

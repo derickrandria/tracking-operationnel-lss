@@ -113,6 +113,9 @@ SEUILS_DEFAUT = {
         "Seuil d'alerte TCH proche de la limite — avertissement (46h)"),
     "SEUIL_TCH_MAX": (201600, "DUREE_S",
         "Temps de conduite hebdomadaire maximal (56h)"),
+    # --- Module Missions & Cycles Logistiques (Règle 1) ---
+    "SEUIL_DUREE_DEPART_RN2": (3600, "DUREE_S",
+        "Durée minimale de conduite sur RN2 hors Base Tana pour valider le début effectif de mission (1h00 — Règle 1)"),
 }
 
 _cache_seuils: dict = {"valeurs": None, "charge_le": None}
@@ -939,23 +942,42 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
     # --- Détection automatique logistique & transitions géographiques (§3) ---
     z_info = detecter_zone_logistique(lat, lon, adresse)
     z_type, z_code, z_nom = z_info["type"], z_info["code"], z_info["nom"]
+    seuil_rn2_s = float(seuils.get("SEUIL_DUREE_DEPART_RN2", 3600))
+    flag_sortie = ("sortie_base", vehicule.id)
 
-    # 0. Initialisation automatique de mission au départ de Base Tana si aucune mission active
-    if not suivi.mission_id:
+    # 0. Initialisation automatique de mission au départ de Base Tana vers RN2 (Règle 1 : départ validé après ≥ 1h de conduite RN2)
+    # RÈGLE ABSOLUE : Un déplacement au Sud (RN7), un retour vers la Base ou un déplacement local ne crée JAMAIS de mission.
+    est_sur_rn2_est = (lon is not None and lon > 47.53 and (lat is None or lat > -19.0)) or ("rn2" in (adresse or "").lower()) or (z_type == "GRT")
+    if not suivi.mission_id and (suivi.numero_ot or est_sur_rn2_est):
         if prev_lat is not None and prev_lng is not None:
             prev_z = detecter_zone_logistique(prev_lat, prev_lng, vehicule.last_adresse)
-            if prev_z["type"] == "BASETNR" and z_type != "BASETNR":
-                # Sortie physique effective de BASETNR sans OT préalable -> Création d'une mission en statut LIBRE
-                m_nouv = initialiser_ou_maj_mission(db, suivi, vehicule, None, None, None, None, ts)
-                m_nouv.heure_debut = ts
-                m_nouv.statut = StatutMission.EN_COURS
-                m_nouv.statut_camion_actuel = "LIBRE"
-                suivi.statut_camion = StatutCamion.LIBRE
-                m_nouv.etapes = [{"etat": "DEPART_BASE", "ts": iso(ts), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
-                log.info("Départ Base Tana détecté sans OT pour %s -> Mission %s créée (LIBRE, heure_debut=%s)",
-                         vehicule.plaque, m_nouv.code_mission or m_nouv.id, ts)
-                if PUBLISH_ENABLED["on"]:
-                    publish("mission.new", s_mission(m_nouv))
+            if prev_z["type"] == "BASETNR" and z_type != "BASETNR" and est_sur_rn2_est:
+                with _lock:
+                    _flags[flag_sortie] = ts
+
+        ts_cand = None
+        with _lock:
+            ts_cand = _flags.get(flag_sortie)
+
+        if ts_cand:
+            if z_type == "BASETNR" or not est_sur_rn2_est:
+                with _lock:
+                    _flags.pop(flag_sortie, None)
+            else:
+                duree_hors_base_s = (ts - ts_cand).total_seconds()
+                if (duree_hors_base_s >= seuil_rn2_s and (roule or (vitesse and vitesse > 3))) or z_type == "GRT":
+                    m_nouv = initialiser_ou_maj_mission(db, suivi, vehicule, None, None, None, None, ts_cand)
+                    m_nouv.heure_debut = ts_cand
+                    m_nouv.statut = StatutMission.EN_COURS
+                    m_nouv.statut_camion_actuel = "LIBRE"
+                    suivi.statut_camion = StatutCamion.LIBRE
+                    m_nouv.etapes = [{"etat": "DEPART_BASE", "ts": iso(ts_cand), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
+                    with _lock:
+                        _flags.pop(flag_sortie, None)
+                    log.info("Règle 1 validée : départ Base Tana confirmé après ≥1h RN2 pour %s -> Mission %s créée (LIBRE, heure_debut=%s)",
+                             vehicule.plaque, m_nouv.code_mission or m_nouv.id, ts_cand)
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.new", s_mission(m_nouv))
 
     if suivi.mission_id:
         m_actuelle = db.get(Mission, suivi.mission_id)
@@ -965,23 +987,34 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
             # 1. Détection du départ physique (BASETNR ou Moramanga) -> Début réel de mission (heure_debut)
             if m_actuelle.heure_debut is None:
                 if z_type == "BASETNR":
+                    with _lock:
+                        _flags.pop(flag_sortie, None)
                     if not any(e.get("etat") == "PRESENCE_BASE" for e in (m_actuelle.etapes or [])):
                         m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "PRESENCE_BASE", "ts": iso(ts), "lieu": z_nom, "zone": "BASETNR"}]
                 else:
-                    # Sortie physique effective de BASETNR (ou Moramanga)
-                    m_actuelle.heure_debut = ts
-                    m_actuelle.statut = StatutMission.EN_COURS
-                    if not m_actuelle.numero_ot:
-                        m_actuelle.statut_camion_actuel = "LIBRE"
-                        suivi.statut_camion = StatutCamion.LIBRE
-                    else:
-                        m_actuelle.statut_camion_actuel = "VIDE"
-                        suivi.statut_camion = StatutCamion.VIDE
-                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEPART_BASE", "ts": iso(ts), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
-                    log.info("Sortie physique Base détectée pour %s -> Début réel mission %s à %s",
-                             vehicule.plaque, m_actuelle.code_mission or m_actuelle.id, ts)
-                    if PUBLISH_ENABLED["on"]:
-                        publish("mission.update", s_mission(m_actuelle))
+                    ts_cand = None
+                    with _lock:
+                        ts_cand = _flags.get(flag_sortie)
+                        if not ts_cand:
+                            _flags[flag_sortie] = ts
+                            ts_cand = ts
+                    duree_hors_base_s = (ts - ts_cand).total_seconds()
+                    if (duree_hors_base_s >= seuil_rn2_s and (roule or (vitesse and vitesse > 3))) or z_type == "GRT" or m_actuelle.numero_ot:
+                        m_actuelle.heure_debut = ts_cand
+                        m_actuelle.statut = StatutMission.EN_COURS
+                        if not m_actuelle.numero_ot:
+                            m_actuelle.statut_camion_actuel = "LIBRE"
+                            suivi.statut_camion = StatutCamion.LIBRE
+                        else:
+                            m_actuelle.statut_camion_actuel = "VIDE"
+                            suivi.statut_camion = StatutCamion.VIDE
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEPART_BASE", "ts": iso(ts_cand), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
+                        with _lock:
+                            _flags.pop(flag_sortie, None)
+                        log.info("Sortie physique Base confirmée pour %s -> Début réel mission %s à %s",
+                                 vehicule.plaque, m_actuelle.code_mission or m_actuelle.id, ts_cand)
+                        if PUBLISH_ENABLED["on"]:
+                            publish("mission.update", s_mission(m_actuelle))
 
             # 2. Présence et Chargement au Dépôt GRT (Tamatave)
             if z_type == "GRT":
@@ -1121,7 +1154,7 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                                 if PUBLISH_ENABLED["on"]:
                                     publish("mission.update", s_mission(m_actuelle))
 
-                # Contrôle de déchargement : arrêt >= 3h (10800 s) STRICTEMENT dans un des 7 dépôts récepteurs officiels
+                # Contrôle de déchargement (Règle 5) : arrêt ≥ 3h (10800 s) STRICTEMENT dans un des 7 dépôts récepteurs officiels ou sortie dépôt
                 est_dans_depot_officiel = (z_type == "DEPOT_RECEPTEUR" and z_code in DEPOTS_DECHARGEMENT_CODES)
                 a_arrivee_depot_officiel = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in (m_actuelle.etapes or []))
 
@@ -1145,44 +1178,17 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
 
                         nom_depot_alerte = nom_officiel_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_nom) or (z_nom if z_code in DEPOTS_DECHARGEMENT_CODES else None)
 
-                        # Alerte validation de déchargement si arrêt >= 3h dans un dépôt officiel
-                        if arret_depot_s >= 10800 and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
+                        # Règle 5 : Alerte validation de déchargement si arrêt ≥ 3h dans un dépôt officiel OU si sortie du dépôt sans validation
+                        if (arret_depot_s >= 10800 or (not est_dans_depot_officiel and a_arrivee_depot_officiel)) and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
                             m_actuelle.validation_dechargement = "EN_ATTENTE"
                             if not _alerte_recente(db, TypeAlerte.VALIDATION_DECHARGEMENT, vehicule.id, 120):
                                 a = creer_alerte(
                                     db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
-                                    f"Validation requise : Déchargement au {nom_depot_alerte} pour {vehicule.plaque} (durée arrêt ≥ 3h)",
+                                    f"Validation requise : Déchargement au {nom_depot_alerte} pour {vehicule.plaque} (durée arrêt ≥ 3h ou sortie dépôt)",
                                     ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
                                     lien_module="/missions")
                                 if PUBLISH_ENABLED["on"]:
                                     publish("alerte.new", s_alerte(a))
-
-                        # Si arrêt >= 3h et déchargement non invalidé : validation et clôture de mission
-                        if arret_depot_s >= 10800 and m_actuelle.validation_dechargement != "INVALIDÉ" and not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])) and nom_depot_alerte:
-                            m_actuelle.statut = StatutMission.TERMINEE
-                            m_actuelle.statut_camion_actuel = "LIBRE"
-                            m_actuelle.validation_dechargement = "VALIDÉ"
-                            m_actuelle.heure_fin = ts
-                            if m_actuelle.heure_debut:
-                                m_actuelle.duree_s = int((ts - m_actuelle.heure_debut).total_seconds())
-                            if not m_actuelle.depot_effectif:
-                                m_actuelle.depot_effectif = nom_depot_alerte
-                            code_zone_fin = normaliser_code_depot(m_actuelle.depot_effectif) or z_code
-                            m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": m_actuelle.depot_effectif, "zone": code_zone_fin}]
-                            suivi.statut_camion = StatutCamion.LIBRE
-                            suivi.mission_id = None  # Verrouillage absolu : la mission est terminée et détachée
-                            
-                            # Auto-résolution alertes de déchargement
-                            db.query(Alerte).filter(
-                                Alerte.vehicule_id == vehicule.id,
-                                Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
-                                Alerte.statut != StatutAlerte.TRAITEE
-                            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
-
-                            log.info("Déchargement validé après arrêt >= 3h au %s pour %s (Mission %s) -> LIBRE / TERMINÉE",
-                                     m_actuelle.depot_effectif, vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
-                            if PUBLISH_ENABLED["on"]:
-                                publish("mission.update", s_mission(m_actuelle))
 
     db.commit()
 
@@ -1463,14 +1469,19 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         dans_grt = False
                     
                     if z_t == "DEPOT_RECEPTEUR" and z_c in DEPOTS_DECHARGEMENT_CODES:
-                        code_p = normaliser_code_depot(depot_prev)
-                        # Moramanga traversé en transit RN2 vers Tana n'est pas un déchargement terminal
-                        if z_c == "DMMG" and code_p in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"):
+                        # RÈGLE FONDAMENTALE : Un déchargement ne peut exister QUE si le camion a DÉJÀ chargé à GRT !
+                        if not ts_sortie_grt or dans_grt:
+                            # En cours d'aller vers Tamatave / GRT : Moramanga ou tout autre lieu n'est JAMAIS un déchargement
                             pass
                         else:
-                            depot_detecte = nom_officiel_depot(z_c)
-                            if ev.type_evenement == TypeEvenement.ARRET or ev.vitesse < 3:
-                                ts_dechargement = ev.horodatage
+                            code_p = normaliser_code_depot(depot_prev)
+                            # Moramanga traversé en transit RN2 vers Tana/Sud n'est pas un déchargement terminal
+                            if z_c == "DMMG" and code_p in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"):
+                                pass
+                            elif code_p and z_c == code_p:
+                                depot_detecte = nom_officiel_depot(z_c)
+                                if ev.type_evenement == TypeEvenement.ARRET or ev.vitesse < 3:
+                                    ts_dechargement = ev.horodatage
 
             # 2. Complément depuis les trajets
             if not ts_depart_base and trajets_j:
@@ -1480,7 +1491,7 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                 if t1_deb:
                     ts_depart_base = t1_deb
 
-            if not ts_sortie_grt and ts_depart_base:
+            if not ts_sortie_grt and ts_depart_base and (numero_ot or (s_j and s_j.statut_camion == StatutCamion.CHARGE)):
                 if len(trajets_j) >= 2:
                     t_grt = trajets_j[0]
                     t_grt_fin = t_grt.heure_fin if hasattr(t_grt, "heure_fin") else (
@@ -1517,7 +1528,7 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                 km_c = 0.0
 
             # 3. Anti-Doublon / Upsert (Règle 8 : intégrité absolue, jamais de création fictive)
-            if missions_j or numero_ot or (evs_j and ts_depart_base):
+            if missions_j or numero_ot or (j == maintenant.date() and s_j and s_j.numero_ot):
                 stats["total_traites"] += 1
                 missions_exist = list(db.scalars(
                     select(Mission).where(
@@ -1540,9 +1551,46 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                             break
                 if not m_exist and missions_exist:
                     m_exist = missions_exist[0]
+                    for me in missions_exist:
+                        if not me.heure_chargement or not me.heure_fin:
+                            m_exist = me
+                            break
+                if not m_exist and missions_exist:
+                    m_exist = missions_exist[0]
 
                 if m_exist:
                     maj = False
+                    # Pour aujourd'hui, alignement strict avec les saisies manuelles de SuiviJournalier
+                    if j == maintenant.date() and s_j:
+                        if s_j.numero_ot and m_exist.numero_ot != s_j.numero_ot:
+                            m_exist.numero_ot = s_j.numero_ot
+                            m_exist.code_mission = _formater_code_mission(s_j.numero_ot, j, m_exist.numero_mission_du_jour)
+                            maj = True
+                        if s_j.distributeur and m_exist.distributeur != s_j.distributeur:
+                            m_exist.distributeur = s_j.distributeur
+                            maj = True
+                        if s_j.produit and m_exist.produit != s_j.produit:
+                            m_exist.produit = s_j.produit
+                            maj = True
+                        if s_j.depot_recepteur:
+                            nom_d = nom_officiel_depot(s_j.depot_recepteur) or s_j.depot_recepteur
+                            if m_exist.depot_prevu != nom_d:
+                                m_exist.depot = nom_d
+                                m_exist.depot_prevu = nom_d
+                                if not m_exist.est_deviee:
+                                    m_exist.depot_effectif = nom_d
+                                maj = True
+                        stat_c_s = s_j.statut_camion.value if hasattr(s_j.statut_camion, "value") else str(s_j.statut_camion)
+                        if stat_c_s in ("VIDE", "CHARGE"):
+                            m_exist.statut_camion_actuel = stat_c_s
+                            m_exist.statut = StatutMission.DEVIEE if m_exist.est_deviee else StatutMission.EN_COURS
+                            m_exist.heure_fin = None
+                            maj = True
+                        elif stat_c_s == "LIBRE" and m_exist.heure_fin:
+                            m_exist.statut_camion_actuel = "LIBRE"
+                            m_exist.statut = StatutMission.TERMINEE
+                            maj = True
+
                     if not m_exist.heure_debut and ts_depart_base:
                         m_exist.heure_debut = ts_depart_base
                         maj = True
@@ -1552,12 +1600,18 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                             m_exist.statut_camion_actuel = "CHARGE"
                         maj = True
                     if not m_exist.heure_fin and ts_dechargement:
-                        m_exist.heure_fin = ts_dechargement
-                        m_exist.statut = StatutMission.TERMINEE
-                        m_exist.statut_camion_actuel = "LIBRE"
-                        if m_exist.heure_debut:
-                            m_exist.duree_s = int((ts_dechargement - m_exist.heure_debut).total_seconds())
-                        maj = True
+                        if j < maintenant.date():
+                            m_exist.heure_fin = ts_dechargement
+                            m_exist.statut = StatutMission.TERMINEE
+                            m_exist.statut_camion_actuel = "LIBRE"
+                            if m_exist.heure_debut:
+                                m_exist.duree_s = int((ts_dechargement - m_exist.heure_debut).total_seconds())
+                            maj = True
+                        else:
+                            # Pour aujourd'hui : l'arrivée au dépôt ne clôture JAMAIS automatiquement la mission !
+                            if not m_exist.heure_fin and m_exist.statut != StatutMission.TERMINEE:
+                                m_exist.validation_dechargement = "EN_ATTENTE"
+                                maj = True
                     if not m_exist.depot_effectif and depot_detecte:
                         m_exist.depot_effectif = depot_detecte
                         maj = True
@@ -1573,9 +1627,9 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         maj = True
                     if maj:
                         stats["mises_a_jour"] += 1
-                elif numero_ot or (evs_j and ts_depart_base):
+                elif numero_ot or (j < maintenant.date() and evs_j and ts_depart_base):
                     code = _formater_code_mission(numero_ot, j, 1)
-                    est_term = bool(ts_dechargement)
+                    est_term = bool(ts_dechargement) and (j < maintenant.date())
                     statut_m = StatutMission.TERMINEE if est_term else StatutMission.EN_COURS
                     statut_c = "LIBRE" if est_term else ("CHARGE" if ts_sortie_grt else (StatutCamion.VIDE.value if numero_ot else StatutCamion.LIBRE.value))
                     
@@ -1584,12 +1638,12 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         etapes.append({"etat": "DEPART_BASE", "ts": iso(ts_depart_base), "lieu": "Sortie Base Tana", "zone": "BASETNR"})
                     if ts_sortie_grt:
                         etapes.append({"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts_sortie_grt), "lieu": "GRT (GALANA RAFINERIE TERMINALE)", "zone": "GRT"})
-                    if ts_dechargement:
+                    if ts_dechargement and est_term:
                         nom_dep_eff = nom_officiel_depot(depot_detecte) or "Depot Soanierana (DSNR)"
                         code_dep_eff = normaliser_code_depot(depot_detecte) or "DSNR"
                         etapes.append({"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts_dechargement), "lieu": nom_dep_eff, "zone": code_dep_eff})
 
-                    duree = int((ts_dechargement - ts_depart_base).total_seconds()) if (ts_dechargement and ts_depart_base) else 0
+                    duree = int((ts_dechargement - ts_depart_base).total_seconds()) if (est_term and ts_dechargement and ts_depart_base) else 0
 
                     m_nouv = Mission(
                         id=uid(),
@@ -1602,7 +1656,7 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         statut_camion_actuel=statut_c,
                         heure_debut=ts_depart_base,
                         heure_chargement=ts_sortie_grt,
-                        heure_fin=ts_dechargement,
+                        heure_fin=ts_dechargement if est_term else None,
                         duree_s=duree,
                         numero_ot=numero_ot,
                         distributeur=distributeur,
@@ -1611,6 +1665,7 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
                         depot_prevu=depot_prev or depot_detecte,
                         depot_effectif=depot_detecte or depot_prev,
                         est_deviee=False,
+                        validation_dechargement="VALIDÉ" if est_term else ("EN_ATTENTE" if ts_dechargement else "NON_REQUIS"),
                         km_vide=km_v,
                         km_charge=km_c,
                         kilometrage=round(km_v + km_c, 1),
@@ -2580,12 +2635,14 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
     """B2 — le badge fait foi sur le chauffeur du JOUR (grille Parties A) :
     l'attribution « MANUEL » n'est jamais écrasée ; une attribution « BADGE »
     (ou absente) suit le dernier badge valide publié.
-    Gestion stricte anti-doublon et détection de conflit (saisie manuelle vs portail)."""
+    Gestion intelligente des passages temporaires (relais) et détection anti-doublon."""
     if suivi is None or fiche is None:
         return
     vehicule = db.get(Vehicule, suivi.vehicule_id)
     if vehicule is None or vehicule.statut != StatutVehicule.ACTIF:
         return
+
+    titulaire = vehicule.conducteur_actuel if (vehicule and vehicule.conducteur_actuel) else None
 
     # 1. Si la ligne de suivi actuelle est déjà attribuée MANUELLEMENT :
     # La saisie manuelle prime TOUJOURS sur les relevés des portails.
@@ -2597,7 +2654,39 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
                      fiche.nom_prenom)
         return
 
-    # 2. Vérification anti-doublon : ce chauffeur (fiche.id) est-il déjà affecté à un AUTRE véhicule ce jour ?
+    # 2. Si le véhicule est déjà arbitré ou marqué en « RELAIS » :
+    # On maintient le titulaire sur le suivi, le trajet individuel conserve son badge spécifique.
+    if getattr(suivi, "conducteur_origine", None) == "RELAIS":
+        if titulaire and suivi.conducteur_id == titulaire.id:
+            return
+
+    # 3. Détection intelligente de passage temporaire (Relais / Sandwich) :
+    # Si le camion est rattaché à son titulaire et qu'un autre chauffeur conduit un trajet :
+    if titulaire and suivi.conducteur_id == titulaire.id and fiche.id != titulaire.id:
+        # Le camion reste attribué à son titulaire, la ligne passe en statut RELAIS
+        suivi.conducteur_origine = "RELAIS"
+        nom_titulaire = titulaire.nom_prenom
+        nom_relais = fiche.nom_prenom
+
+        msg = (f"Changement de conducteur détecté sur {vehicule.plaque} : "
+               f"trajet badgé par {nom_relais} (titulaire habituel : {nom_titulaire}). "
+               f"Arbitrage disponible.")
+        if not _alerte_recente_ouverte(db, TypeAlerte.CHANGEMENT_CONDUCTEUR_DETECTE, suivi.vehicule_id, fenetre_s=3600):
+            creer_alerte(
+                db, TypeAlerte.CHANGEMENT_CONDUCTEUR_DETECTE, GraviteAlerte.INFORMATION,
+                msg, vehicule_id=suivi.vehicule_id, conducteur_id=fiche.id,
+                lien_module=f"/suivi?date={suivi.date_jour.isoformat()}&vehicule={suivi.vehicule_id}"
+            )
+        _auditer(db, "suivi.relais_detecte", suivi.id, {
+            "plaque": vehicule.plaque, "titulaire": nom_titulaire,
+            "relais": nom_relais, "conducteur_relais_id": fiche.id,
+            "regle": "Passage temporaire : le titulaire reste affecté au camion, répartition proportionnelle du TCH"
+        })
+        log.info("Passage temporaire détecté sur %s : %s au volant (titulaire %s conservé)",
+                 vehicule.plaque, nom_relais, nom_titulaire)
+        return
+
+    # 4. Vérification anti-doublon : ce chauffeur (fiche.id) est-il déjà affecté à un AUTRE véhicule ce jour ?
     autre_suivi = db.scalar(select(SuiviJournalier).where(
         SuiviJournalier.date_jour == suivi.date_jour,
         SuiviJournalier.conducteur_id == fiche.id,

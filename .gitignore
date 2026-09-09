@@ -6,9 +6,11 @@ __pycache__/
 # Données locales
 backend/data/
 sauvegardes/
+archive/
 
-# Node
+# Node & Build
 node_modules/
+frontend/dist/
 
 # Divers
 .env
