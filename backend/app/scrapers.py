@@ -72,10 +72,11 @@ from sqlalchemy import func, select
 from .config import (normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
-from .engine import (creer_conducteur_auto, creer_vehicule_auto,
-                     ingest_event, verifier_alertes_conduite)
+from .engine import (cle_idempotence_evenement, creer_conducteur_auto,
+                     creer_vehicule_auto, ingest_event, verifier_alertes_conduite)
 from .geozones import charger_zones, en_geozone
-from .models import EvenementGPS, SourceEvenement, Vehicule
+from .models import (CollecteCheckpoint, EvenementGPS, SourceEvenement,
+                      TypeEvenement, Vehicule)
 from .api_mzonex import (ApiMZoneX, point_depuis_evenement_api,
                          trajet_depuis_api)
 from .api_wialon import (ApiWialon, jeton_configure,
@@ -143,6 +144,40 @@ def _collecte_protegee(source: str, action) -> int:
         return 0
     finally:
         COLLECTE_LOCK.release()
+
+
+def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str:
+    db = SessionLocal()
+    try:
+        cp = db.scalar(select(CollecteCheckpoint).where(
+            CollecteCheckpoint.source == source,
+            CollecteCheckpoint.fenetre_debut == debut,
+            CollecteCheckpoint.fenetre_fin == fin))
+        if cp is None:
+            cp = CollecteCheckpoint(source=source, fenetre_debut=debut,
+                                   fenetre_fin=fin, statut="EN_COURS",
+                                   tentatives=1)
+            db.add(cp)
+        else:
+            cp.statut = "EN_COURS"
+            cp.tentatives = (cp.tentatives or 0) + 1
+            cp.derniere_erreur = None
+        db.commit()
+        return cp.id
+    finally:
+        db.close()
+
+
+def _checkpoint_ferme(checkpoint_id: str, statut: str, erreur: str | None = None):
+    db = SessionLocal()
+    try:
+        cp = db.get(CollecteCheckpoint, checkpoint_id)
+        if cp is not None:
+            cp.statut = statut
+            cp.derniere_erreur = erreur
+            db.commit()
+    finally:
+        db.close()
 
 
 def _mzonex_api_active() -> bool:
@@ -944,7 +979,7 @@ class CollectorBase:
         propres.sort(key=lambda p: p["horodatage"])   # rejeu chronologique
         return propres
 
-    def inserer(self, points: list[dict]) -> int:
+    def inserer(self, points: list[dict], historique: bool = False) -> int:
         db = SessionLocal()
         inseres = 0
         try:
@@ -988,6 +1023,22 @@ class CollectorBase:
                     EvenementGPS.type_evenement == p.get("type_evenement")
                     if p.get("type_evenement") else True)) or 0
                 if deja:
+                    continue
+                if historique:
+                    cle = cle_idempotence_evenement(
+                        vehicule.id, p["horodatage"], p["lat"], p["lng"], self.source)
+                    if db.scalar(select(EvenementGPS.id).where(
+                            EvenementGPS.idempotence_key == cle)):
+                        continue
+                    db.add(EvenementGPS(
+                        vehicule_id=vehicule.id, horodatage=p["horodatage"],
+                        latitude=p["lat"], longitude=p["lng"],
+                        adresse=p.get("adresse"), vitesse=p["vitesse"],
+                        etat_moteur=p["moteur"],
+                        type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
+                        source=self.source, idempotence_key=cle,
+                        received_at=now_local(), historique=True))
+                    inseres += 1
                     continue
                 ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
                              p.get("adresse"), p["vitesse"], p["moteur"],
@@ -1587,7 +1638,13 @@ class MZoneXApiCollector(CollectorBase):
             db.close()
         maintenant = now_local()
         debut_utc, fin_utc = self.api.fenetre_incrementale(derniere, maintenant)
-        lignes = self.api.evenements(debut_utc, fin_utc)
+        checkpoint_id = _checkpoint_ouvre("MZONEX_N1", debut_utc, fin_utc)
+        try:
+            lignes = self.api.evenements(debut_utc, fin_utc)
+        except Exception as exc:
+            _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+            raise
+        _checkpoint_ferme(checkpoint_id, "TERMINE")
         log.info("MZoneX API (Événements) : %d événement(s), fenêtre %s → %s UTC",
                  len(lignes), debut_utc.strftime("%H:%M:%S"),
                  fin_utc.strftime("%H:%M:%S"))
@@ -2062,13 +2119,21 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
     total = 0
     try:
         for debut_local, fin_local in fenetres:
-            brut = coll.api.evenements(coll.api._utc_naive(debut_local),
-                                       coll.api._utc_naive(fin_local))
+            debut_utc = coll.api._utc_naive(debut_local)
+            fin_utc = coll.api._utc_naive(fin_local)
+            checkpoint_id = _checkpoint_ouvre("MZONEX_N1_RELECTURE",
+                                              debut_utc, fin_utc)
+            try:
+                brut = coll.api.evenements(debut_utc, fin_utc)
+            except Exception as exc:
+                _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+                raise
             points = coll.normaliser(brut)
             n = 0
             if points:
-                n = coll.inserer(points)
+                n = coll.inserer(points, historique=True)
                 total += n
+            _checkpoint_ferme(checkpoint_id, "TERMINE")
             log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
                      "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
                      fin_local.strftime("%H:%M"), len(brut), n)

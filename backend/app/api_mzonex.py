@@ -209,6 +209,11 @@ class ApiMZoneX:
                 "découpez la fenêtre (le découpage horaire d'`evenements()` "
                 "est là pour ça)", MAX_PAGES, TAILLE_PAGE, len(lignes),
                 chemin_requete.split("?")[0])
+            # Ne jamais transmettre un lot tronqué au moteur : le checkpoint
+            # de la fenêtre sera marqué en échec et repris ultérieurement.
+            raise ErreurApiMZoneX(
+                f"pagination incomplète pour {chemin_requete.split('?')[0]} "
+                f"({len(lignes)} lignes, plafond atteint)")
         return lignes
 
     # ---------------------------------------------------------------- flotte

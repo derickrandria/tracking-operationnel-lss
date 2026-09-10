@@ -91,6 +91,7 @@ def migrer_schema():
     """Migrations additives sans Alembic (base démo SQLite / prod PostgreSQL) :
     colonnes ajoutées par les addendums sur une base EXISTANTE. `create_all`
     (seed) suffit pour une base neuve ; ici on complète les bases déjà livrées."""
+    import hashlib
     from sqlalchemy import inspect, text
     from .database import engine as _engine
     from .seed import VEHICULES_CAMTRACKPRO
@@ -102,6 +103,35 @@ def migrer_schema():
     cols_t = {c["name"] for c in insp.get_columns("trajets")}
     cols_v = {c["name"] for c in insp.get_columns("vehicules")}
     with _engine.begin() as cx:
+        # SQLite ne peut pas réfléchir via une seconde connexion pendant que
+        # cette transaction détient le verrou d'écriture.
+        insp_cx = inspect(cx)
+        # P1 — événement brut : heure de réception distincte de l'heure GPS,
+        # mode historique explicite et clé d'idempotence imposée par SQL.
+        if "evenements_gps" in tables:
+            cols_e = {c["name"] for c in insp_cx.get_columns("evenements_gps")}
+            if "idempotence_key" not in cols_e:
+                cx.execute(text("ALTER TABLE evenements_gps ADD COLUMN idempotence_key VARCHAR(128)"))
+            if "received_at" not in cols_e:
+                cx.execute(text("ALTER TABLE evenements_gps ADD COLUMN received_at DATETIME"))
+                cx.execute(text("UPDATE evenements_gps SET received_at = created_at "
+                                "WHERE received_at IS NULL"))
+            if "historique" not in cols_e:
+                cx.execute(text("ALTER TABLE evenements_gps ADD COLUMN historique BOOLEAN DEFAULT 0"))
+            rows = cx.execute(text(
+                "SELECT id, vehicule_id, horodatage, latitude, longitude, source "
+                "FROM evenements_gps ORDER BY created_at, id")).mappings()
+            vus = set()
+            for row in rows:
+                brut = "|".join(str(row.get(c) or "") for c in (
+                    "vehicule_id", "horodatage", "latitude", "longitude", "source"))
+                cle = hashlib.sha256(brut.encode("utf-8")).hexdigest()
+                valeur = cle if cle not in vus else None
+                vus.add(cle)
+                cx.execute(text("UPDATE evenements_gps SET idempotence_key = :cle "
+                                "WHERE id = :id"), {"cle": valeur, "id": row["id"]})
+            cx.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS "
+                            "ux_evenement_idempotence ON evenements_gps (idempotence_key)"))
         # Addendum v1.4 §3.1 (table trajets)
         if "statut_source" not in cols_t:
             cx.execute(text("ALTER TABLE trajets ADD COLUMN statut_source VARCHAR(40)"))
@@ -131,7 +161,7 @@ def migrer_schema():
             if col not in cols_t:
                 cx.execute(text(f"ALTER TABLE trajets ADD COLUMN {col} {typ}"))
                 log.info("Migration : trajets.%s ajouté (§0septies)", col)
-        cols_s = {c["name"] for c in insp.get_columns("suivi_journalier")}
+        cols_s = {c["name"] for c in insp_cx.get_columns("suivi_journalier")}
         if "conducteur_origine" not in cols_s:
             cx.execute(text("ALTER TABLE suivi_journalier ADD COLUMN conducteur_origine VARCHAR(10)"))
             log.info("Migration : suivi_journalier.conducteur_origine ajouté (§0septies)")
@@ -145,7 +175,7 @@ def migrer_schema():
 
         # Migration automatique et exhaustive de la table missions
         if "missions" in tables:
-            cols_m = {c["name"] for c in insp.get_columns("missions")}
+            cols_m = {c["name"] for c in insp_cx.get_columns("missions")}
             cols_missions_ajouts = [
                 ("code_mission", "VARCHAR(50)"),
                 ("statut_camion_actuel", "VARCHAR(20) DEFAULT 'VIDE'"),
@@ -172,12 +202,12 @@ def migrer_schema():
                     cx.execute(text(f"ALTER TABLE missions ADD COLUMN {col} {typ}"))
                     log.info("Migration table missions : colonne %s ajoutée", col)
         # v3 AM-5 / C3 (22/08/2026) : vitre Infractions = lecture externe seule
-        cols_i = {c["name"] for c in insp.get_columns("infractions")}
+        cols_i = {c["name"] for c in insp_cx.get_columns("infractions")}
         if "exterieure" not in cols_i:
             cx.execute(text(
                 "ALTER TABLE infractions ADD COLUMN exterieure BOOLEAN DEFAULT 0"))
             log.info("Migration : infractions.exterieure ajouté (§0nonies AM-5)")
-        cols_i = {c["name"] for c in insp.get_columns("infractions")}
+        cols_i = {c["name"] for c in insp_cx.get_columns("infractions")}
         # §0quinquies decies I1→I4 (25/08/2026) — source Ym@ne + validation
         # + I5 exécution (26/08/2026, v1.36) : seuil_texte (verbatim du portail)
         for col, typ in (("niveau", "VARCHAR(20)"), ("nom_ymane", "VARCHAR(160)"),
@@ -196,7 +226,7 @@ def migrer_schema():
         # §0octies decies L2 (27/08/2026, v1.41) — période de l'infraction
         # (enddatetime verbatim Ym@ne) ; les lignes existantes sont
         # rattrapées seules par l'upsert I5 à la prochaine relecture J-8→J.
-        cols_i = {c["name"] for c in insp.get_columns("infractions")}
+        cols_i = {c["name"] for c in insp_cx.get_columns("infractions")}
         for col, typ in (("date_fin", "DATE"), ("heure_fin", "TIME")):
             if col not in cols_i:
                 cx.execute(text(f"ALTER TABLE infractions ADD COLUMN {col} {typ}"))
@@ -204,7 +234,7 @@ def migrer_schema():
         # §0sexies decies J1 (27/08/2026) : forme canonique anti-doublon
         # chauffeur. L'index UNIQUE est volontairement posé PLUS TARD, par la
         # réparation v1.38 (§J3), une fois les doublons hérités résorbés.
-        cols_c_raw = {c["name"]: c for c in insp.get_columns("conducteurs")}
+        cols_c_raw = {c["name"]: c for c in insp_cx.get_columns("conducteurs")}
         cols_c = set(cols_c_raw.keys())
         if "nom_normalise" not in cols_c:
             cx.execute(text(

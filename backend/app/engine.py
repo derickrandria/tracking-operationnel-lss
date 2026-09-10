@@ -9,6 +9,7 @@ Déclenché à chaque nouvel événement GPS (collecte §10). Il :
 Aucune valeur seuil n'est codée en dur : tout vient de `ParametrageSeuil` (§5.8).
 """
 import logging
+import hashlib
 import math
 import os
 from datetime import date, datetime, time, timedelta
@@ -722,6 +723,14 @@ def _auditer(db, action: str, entite_id: str | None, details: dict):
                     entite_id=entite_id, details=details))
 
 
+def cle_idempotence_evenement(vehicule_id: str, ts: datetime, lat: float,
+                              lon: float, source: SourceEvenement) -> str:
+    """Clé stable d'un événement brut, indépendante de sa passe de collecte."""
+    brut = "|".join((str(vehicule_id), ts.isoformat(), f"{float(lat):.6f}",
+                     f"{float(lon):.6f}", str(getattr(source, "value", source))))
+    return hashlib.sha256(brut.encode("utf-8")).hexdigest()
+
+
 def _finaliser_trajet(db, trajet: "Trajet", vehicule: Vehicule, seuils: dict,
                       ts: datetime):
     """Addendum v1.5 §1.1/§2.5 — à la clôture DÉFINITIVE d'un trajet (vraie
@@ -773,13 +782,26 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                  adresse: str | None, vitesse: float, moteur: str,
                  type_force: TypeEvenement | None = None,
                  source: SourceEvenement = SourceEvenement.SIMULATEUR,
-                 publier: bool = True) -> dict | None:
+                 publier: bool = True, historique: bool = False) -> dict | None:
     """Point d'entrée unique d'un événement GPS (scraper ou simulateur).
 
     §7.1 : début de mouvement (vitesse > 0 après arrêt), arrêt (vitesse nulle
     persistante > bruit), pause (arrêt ≥ DUREE_MIN_PAUSE_VALIDE), reprise.
     """
     seuils = get_seuils(db)
+    idempotence_key = cle_idempotence_evenement(
+        vehicule.id, ts, lat, lon, source)
+    if db.scalar(select(EvenementGPS.id).where(
+            EvenementGPS.idempotence_key == idempotence_key)):
+        return None
+    if historique:
+        db.add(EvenementGPS(
+            vehicule_id=vehicule.id, horodatage=ts, latitude=lat,
+            longitude=lon, adresse=adresse, vitesse=round(float(vitesse or 0), 1),
+            etat_moteur=moteur, type_evenement=type_force or TypeEvenement.POSITION,
+            source=source, idempotence_key=idempotence_key,
+            received_at=now_local(), historique=True))
+        return {"historique": True, "idempotence_key": idempotence_key}
     # Addendum v1.5 : le seuil « bruit GPS » (2 min) est englobé par la règle
     # de fusion des pauses < 20 min — plus de rôle distinct ici.
     pause_min = seuils["DUREE_MIN_PAUSE_VALIDE"]
@@ -887,21 +909,25 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
     ev = EvenementGPS(
         vehicule_id=vehicule.id, horodatage=ts, latitude=lat, longitude=lon,
         adresse=adresse, vitesse=round(float(vitesse or 0), 1), etat_moteur=moteur,
-        type_evenement=type_ev, source=source)
+        type_evenement=type_ev or TypeEvenement.POSITION, source=source,
+        idempotence_key=idempotence_key, received_at=now_local(),
+        historique=historique)
     db.add(ev)
 
     # Une relecture historique peut ingérer un événement dont l'heure est
     # antérieure au dernier signal déjà reçu. Elle ne doit jamais faire
     # reculer l'état temps réel du véhicule ni créer un faux retard GPS.
-    if vehicule.last_event_at is None or ts >= vehicule.last_event_at:
+    if (not historique and
+            (vehicule.last_event_at is None or ts >= vehicule.last_event_at)):
         vehicule.last_lat, vehicule.last_lng = lat, lon
         vehicule.last_vitesse = vitesse
         vehicule.last_adresse = adresse
         vehicule.last_event_at = ts
         vehicule.moteur_on = (moteur == "ON")
 
-    recalculer_temps(db, suivi, ts)
-    _verifier_temps(db, suivi, vehicule, seuils, ts)
+    if not historique:
+        recalculer_temps(db, suivi, ts)
+        _verifier_temps(db, suivi, vehicule, seuils, ts)
 
     # --- événements de conduite (source boîtier OBC) — v3 AM-5/C3 : plus
     # AUCUNE écriture locale dans `Infraction` ; l'excès de vitesse dont le

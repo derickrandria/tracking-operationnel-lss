@@ -526,7 +526,9 @@ class ParametrageSeuil(Base):
 class EvenementGPS(Base):
     """Données brutes issues du scraping/simulateur — table technique (§10)."""
     __tablename__ = "evenements_gps"
-    __table_args__ = (Index("ix_evenement_vehicule_ts", "vehicule_id", "horodatage"),)
+    __table_args__ = (
+        Index("ix_evenement_vehicule_ts", "vehicule_id", "horodatage"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
@@ -540,7 +542,30 @@ class EvenementGPS(Base):
         SAEnum(TypeEvenement, **SA_ENUM_KW), default=TypeEvenement.POSITION)
     source: Mapped[SourceEvenement] = mapped_column(
         SAEnum(SourceEvenement, **SA_ENUM_KW), default=SourceEvenement.SIMULATEUR)
+    idempotence_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=now_local, index=True)
+    historique: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_local)
+
+
+class CollecteCheckpoint(Base):
+    """Fenêtre de collecte durable, repriseable après panne ou redémarrage."""
+    __tablename__ = "collecte_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("source", "fenetre_debut", "fenetre_fin",
+                         name="uq_collecte_checkpoint_fenetre"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    source: Mapped[str] = mapped_column(String(30), index=True)
+    fenetre_debut: Mapped[datetime] = mapped_column(DateTime)
+    fenetre_fin: Mapped[datetime] = mapped_column(DateTime)
+    statut: Mapped[str] = mapped_column(String(20), default="EN_COURS")
+    curseur: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tentatives: Mapped[int] = mapped_column(Integer, default=0)
+    derniere_erreur: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_local,
+                                                  onupdate=now_local)
 
 
 # ------------------------------------------------------------- audit (§11)
