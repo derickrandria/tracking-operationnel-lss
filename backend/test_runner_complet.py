@@ -33,9 +33,14 @@ def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     
     # Préservation de sys.path (site-packages, venv, user base) + ajout de backend
     cur_pypath = env.get("PYTHONPATH", "")
-    pypaths = ["backend"]
+    pypaths = [os.path.abspath("backend"), os.path.abspath("."), "/tmp/pylib"]
+    for p in sys.path:
+        if p and p not in pypaths:
+            pypaths.append(p)
     if cur_pypath:
-        pypaths.append(cur_pypath)
+        for p in cur_pypath.split(os.pathsep):
+            if p and p not in pypaths:
+                pypaths.append(p)
     env["PYTHONPATH"] = os.pathsep.join(pypaths)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"

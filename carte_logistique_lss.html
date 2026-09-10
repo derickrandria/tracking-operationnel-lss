@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Carte des Zones Logistiques Officielles — LSS Tracking</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif; }
+    body { display: flex; height: 100vh; background: #0f172a; color: #f8fafc; overflow: hidden; }
+    #sidebar { width: 380px; background: #1e293b; border-right: 1px solid #334155; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+    #map { flex: 1; height: 100%; background: #0b1120; }
+    
+    h1 { font-size: 1.25rem; font-weight: 700; color: #38bdf8; display: flex; align-items: center; gap: 8px; }
+    .subtitle { font-size: 0.82rem; color: #94a3b8; }
+    
+    .section-title { font-size: 0.8rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; margin-top: 8px; }
+    
+    .card { background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 12px; cursor: pointer; transition: all 0.2s; }
+    .card:hover { border-color: #38bdf8; transform: translateY(-1px); }
+    
+    .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+    .card-title { font-weight: 600; font-size: 0.95rem; display: flex; align-items: center; gap: 6px; }
+    .badge { font-size: 0.7rem; font-weight: 700; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+    
+    .badge-grt { background: #b91c1c; color: #fef2f2; }
+    .badge-base { background: #475569; color: #f8fafc; }
+    .badge-depot { background: #0284c7; color: #f0f9ff; }
+    .badge-sud { background: #059669; color: #ecfdf5; }
+    
+    .card-coords { font-size: 0.75rem; color: #94a3b8; font-family: monospace; }
+    .card-desc { font-size: 0.8rem; color: #cbd5e1; margin-top: 4px; }
+    
+    .corridor-box { background: #1e293b; border: 1px dashed #475569; border-radius: 8px; padding: 10px; font-size: 0.8rem; color: #94a3b8; }
+    .corridor-item { display: flex; align-items: center; gap: 8px; margin-top: 6px; color: #e2e8f0; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; }
+  </style>
+</head>
+<body>
+
+  <div id="sidebar">
+    <div>
+      <h1>📍 Référentiel Logistique LSS</h1>
+      <p class="subtitle">1 Base · 1 Dépôt de Chargement · 7 Dépôts Récepteurs</p>
+    </div>
+
+    <div class="corridor-box">
+      <div style="font-weight: 600; color: #38bdf8; margin-bottom: 4px;">Corridors de Transport :</div>
+      <div class="corridor-item"><span class="dot" style="background: #ef4444;"></span> RN2 (Est) : Base TNR ⇄ GRT Tamatave</div>
+      <div class="corridor-item"><span class="dot" style="background: #10b981;"></span> RN7 (Sud) : Base TNR ⇄ Antsirabe / Fianar</div>
+      <div class="corridor-item"><span class="dot" style="background: #f59e0b;"></span> RN34/35 (Ouest) : Base TNR ⇄ Morondava</div>
+    </div>
+
+    <div class="section-title">1. Base Principale & Centre Opérationnel</div>
+    <div class="card" onclick="zoomZone(-18.9537, 47.5449, 14)">
+      <div class="card-header">
+        <span class="card-title">🏢 Base Tanà (BASETNR)</span>
+        <span class="badge badge-base">Base LSS</span>
+      </div>
+      <div class="card-coords">-18.9537, 47.5449 · Rayon 3.0 km</div>
+      <div class="card-desc">Alasora / By Pass / Alamabrah — Point de départ officiel vers la RN2 (Validation après ≥1h).</div>
+    </div>
+
+    <div class="section-title">2. Dépôt de Chargement Unique</div>
+    <div class="card" onclick="zoomZone(-18.1492, 49.4023, 14)">
+      <div class="card-header">
+        <span class="card-title">⛽ GRT (Galana Raffinerie)</span>
+        <span class="badge badge-grt">Chargement</span>
+      </div>
+      <div class="card-coords">-18.1492, 49.4023 · Toamasina (Est)</div>
+      <div class="card-desc">Seul point officiel de chargement hydrocarbures. Alerte ≥15min sans OT, chargement ≥30min.</div>
+    </div>
+
+    <div class="section-title">3. Les 7 Dépôts Récepteurs Officiels</div>
+
+    <div class="card" onclick="zoomZone(-18.8100, 47.4450, 14)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Alarobia (DABI)</span>
+        <span class="badge badge-depot">Dépôt Nord</span>
+      </div>
+      <div class="card-coords">-18.8100, 47.4450 · Antananarivo</div>
+      <div class="card-desc">Livraison Corridor Tanà Nord. Alerte déchargement après arrêt ≥3h.</div>
+    </div>
+
+    <div class="card" onclick="zoomZone(-18.9300, 47.5200, 14)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Soanierana (DSNR)</span>
+        <span class="badge badge-depot">Dépôt Sud</span>
+      </div>
+      <div class="card-coords">-18.9300, 47.5200 · Antananarivo</div>
+      <div class="card-desc">Livraison Corridor Tanà Sud / Hydrocarbures Total & Galana.</div>
+    </div>
+
+    <div class="card" onclick="zoomZone(-18.9489, 48.2257, 14)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Moramanga (DMMG)</span>
+        <span class="badge badge-depot">Dépôt RN2</span>
+      </div>
+      <div class="card-coords">-18.9489, 48.2257 · Moramanga</div>
+      <div class="card-desc">Livraison locale RN2. Attention : Le transit normal vers Tanà/Sud n'est pas un déchargement.</div>
+    </div>
+
+    <div class="card" onclick="zoomZone(-19.8659, 47.0333, 14)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Antsirabe (DABE)</span>
+        <span class="badge badge-sud">Corridor Sud</span>
+      </div>
+      <div class="card-coords">-19.8659, 47.0333 · RN7 Vakinankaratra</div>
+      <div class="card-desc">Livraison Axe RN7 Sud. Le camion traverse Tanà en restant strictement CHARGÉ.</div>
+    </div>
+
+    <div class="card" onclick="zoomZone(-21.4536, 47.0857, 13)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Fianarantsoa (DFIA)</span>
+        <span class="badge badge-sud">Grand Sud</span>
+      </div>
+      <div class="card-coords">-21.4536, 47.0857 · RN7 Haute Matsiatra</div>
+      <div class="card-desc">Livraison Grand Sud. Maintien du statut CHARGÉ sur tout le corridor.</div>
+    </div>
+
+    <div class="card" onclick="zoomZone(-22.1486, 48.0106, 13)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Manakara (DMKR)</span>
+        <span class="badge badge-sud">Côte Sud-Est</span>
+      </div>
+      <div class="card-coords">-22.1486, 48.0106 · RN25 / Manakara</div>
+      <div class="card-desc">Livraison Côte Est Sud.</div>
+    </div>
+
+    <div class="card" onclick="zoomZone(-20.2833, 44.2833, 13)">
+      <div class="card-header">
+        <span class="card-title">🛢️ Depot Morondava (DMDV)</span>
+        <span class="badge badge-sud">Corridor Ouest</span>
+      </div>
+      <div class="card-coords">-20.2833, 44.2833 · RN34-35 Menabe</div>
+      <div class="card-desc">Livraison Côte Ouest Canal du Mozambique.</div>
+    </div>
+  </div>
+
+  <div id="map"></div>
+
+  <script>
+    const map = L.map('map').setView([-19.5, 47.5], 7);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '© OpenStreetMap contributors',
+      maxZoom: 18,
+    }).addTo(map);
+
+    const zones = [
+      { code: 'BASETNR', nom: 'Base Tana (BASETNR)', type: 'BASE', lat: -18.9537, lng: 47.5449, r: 3000, color: '#64748b', desc: 'Base Centrale Opérationnelle LSS — Départ RN2' },
+      { code: 'GRT', nom: 'GRT (GALANA RAFINERIE TERMINALE)', type: 'CHARGEMENT', lat: -18.1492, lng: 49.4023, r: 3500, color: '#ef4444', desc: 'DÉPÔT UNIQUE DE CHARGEMENT — Toamasina' },
+      { code: 'DABI', nom: 'Depot Alarobia (DABI)', type: 'DEPOT', lat: -18.8100, lng: 47.4450, r: 3000, color: '#0284c7', desc: 'Dépôt Récepteur Officiel — Antananarivo Nord' },
+      { code: 'DSNR', nom: 'Depot Soanierana (DSNR)', type: 'DEPOT', lat: -18.9300, lng: 47.5200, r: 3000, color: '#0284c7', desc: 'Dépôt Récepteur Officiel — Antananarivo Sud' },
+      { code: 'DMMG', nom: 'Depot Moramanga (DMMG)', type: 'DEPOT', lat: -18.9489, lng: 48.2257, r: 1500, color: '#0284c7', desc: 'Dépôt Récepteur Officiel — Moramanga RN2' },
+      { code: 'DABE', nom: 'Depot Antsirabe (DABE)', type: 'DEPOT', lat: -19.8659, lng: 47.0333, r: 4000, color: '#10b981', desc: 'Dépôt Récepteur Officiel — Antsirabe RN7' },
+      { code: 'DFIA', nom: 'Depot Fianarantsoa (DFIA)', type: 'DEPOT', lat: -21.4536, lng: 47.0857, r: 4000, color: '#10b981', desc: 'Dépôt Récepteur Officiel — Fianarantsoa RN7' },
+      { code: 'DMKR', nom: 'Depot Manakara (DMKR)', type: 'DEPOT', lat: -22.1486, lng: 48.0106, r: 4000, color: '#10b981', desc: 'Dépôt Récepteur Officiel — Manakara Côte Sud-Est' },
+      { code: 'DMDV', nom: 'Depot Morondava (DMDV)', type: 'DEPOT', lat: -20.2833, lng: 44.2833, r: 5000, color: '#f59e0b', desc: 'Dépôt Récepteur Officiel — Morondava Ouest' },
+    ];
+
+    // Tracer les corridors routiers
+    const rn2_route = [
+      [-18.9537, 47.5449], // Base Tana
+      [-18.9100, 47.6500], // Sortie Tana Est
+      [-18.9489, 48.2257], // Moramanga
+      [-18.7700, 48.7000], // Beforona
+      [-18.8200, 49.0700], // Brickaville
+      [-18.1492, 49.4023]  // GRT Tamatave
+    ];
+    L.polyline(rn2_route, { color: '#ef4444', weight: 4, opacity: 0.8, dashArray: '8, 8' }).addTo(map).bindPopup("<b>Corridor RN2 (Est)</b><br>Base Tanà ⇄ GRT Tamatave (~360 km)");
+
+    const rn7_route = [
+      [-18.9537, 47.5449], // Base Tana
+      [-19.3000, 47.3000], // Ambatolampy
+      [-19.8659, 47.0333], // Antsirabe (DABE)
+      [-20.6000, 47.1500], // Ambositra
+      [-21.4536, 47.0857]  // Fianarantsoa (DFIA)
+    ];
+    L.polyline(rn7_route, { color: '#10b981', weight: 4, opacity: 0.8, dashArray: '8, 8' }).addTo(map).bindPopup("<b>Corridor RN7 (Sud)</b><br>Antananarivo ⇄ Antsirabe ⇄ Fianarantsoa");
+
+    const rn34_route = [
+      [-19.8659, 47.0333], // Antsirabe
+      [-19.5500, 46.0000], // Miandrivazo
+      [-20.2833, 44.2833]  // Morondava (DMDV)
+    ];
+    L.polyline(rn34_route, { color: '#f59e0b', weight: 3, opacity: 0.8, dashArray: '6, 6' }).addTo(map).bindPopup("<b>Corridor Ouest (RN34/35)</b><br>Antsirabe ⇄ Morondava");
+
+    const rn25_route = [
+      [-21.4536, 47.0857], // Fianarantsoa
+      [-21.7500, 47.6000], // Ranomafana
+      [-22.1486, 48.0106]  // Manakara (DMKR)
+    ];
+    L.polyline(rn25_route, { color: '#10b981', weight: 3, opacity: 0.8, dashArray: '6, 6' }).addTo(map).bindPopup("<b>Corridor Sud-Est (RN25)</b><br>Fianarantsoa ⇄ Manakara");
+
+    // Marqueurs et cercles géographiques
+    zones.forEach(z => {
+      L.circle([z.lat, z.lng], {
+        color: z.color,
+        fillColor: z.color,
+        fillOpacity: 0.25,
+        radius: z.r
+      }).addTo(map);
+
+      const marker = L.circleMarker([z.lat, z.lng], {
+        radius: 8,
+        color: '#ffffff',
+        weight: 2,
+        fillColor: z.color,
+        fillOpacity: 1
+      }).addTo(map);
+
+      marker.bindPopup(`
+        <div style="font-family: sans-serif; color: #0f172a; min-width: 200px;">
+          <h3 style="margin: 0 0 4px 0; color: ${z.color}; font-size: 1rem;">${z.nom}</h3>
+          <p style="margin: 0 0 6px 0; font-size: 0.8rem; font-weight: bold; color: #475569;">Code Officiel : <code>${z.code}</code></p>
+          <p style="margin: 0 0 6px 0; font-size: 0.85rem;">${z.desc}</p>
+          <div style="font-size: 0.75rem; color: #64748b;">GPS : ${z.lat.toFixed(4)}, ${z.lng.toFixed(4)} (Rayon : ${z.r}m)</div>
+        </div>
+      `);
+    });
+
+    window.zoomZone = function(lat, lng, zoom) {
+      map.flyTo([lat, lng], zoom, { duration: 1.2 });
+    };
+  </script>
+</body>
+</html>

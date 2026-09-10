@@ -300,7 +300,7 @@ ZONES_CANONIQUES = {
         "mots_cles": ["jovenna by pass", "by pass", "alamabrah", "alasora",
                       "ambohimangakely-iavoloha-cc", "iavoloha", "ambohimangakely",
                       "base lss", "base tana", "base antananarivo"],
-        "coords": [(-18.8792, 47.5079, 4500), (-18.9600, 47.5800, 3500)],
+        "coords": [(-18.9537, 47.5449, 3000), (-18.8792, 47.5079, 4500), (-18.9600, 47.5800, 3500)],
         "est_depot_sud": False,
     },
     "GRT": {

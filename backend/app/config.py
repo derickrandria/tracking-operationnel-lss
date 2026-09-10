@@ -219,7 +219,7 @@ CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 # Chargement : GRT (GALANA RAFINERIE TERMINALE) unique.
 # Déchargement : 7 dépôts officiels stricts (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE).
 GEO = {
-    "BASE_TANA": (-18.8792, 47.5079, "Base LSS — Antananarivo"),
+    "BASE_TANA": (-18.9537, 47.5449, "Base LSS — Antananarivo"),
     "GRT": (-18.1492, 49.4023, "GRT (GALANA RAFINERIE TERMINALE)"),
     "DSNR": (-18.9300, 47.5200, "Depot Soanierana (DSNR)"),
     "DABI": (-18.8100, 47.4450, "Depot Alarobia (DABI)"),
