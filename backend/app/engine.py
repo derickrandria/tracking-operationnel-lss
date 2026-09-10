@@ -890,11 +890,15 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
         type_evenement=type_ev, source=source)
     db.add(ev)
 
-    vehicule.last_lat, vehicule.last_lng = lat, lon
-    vehicule.last_vitesse = vitesse
-    vehicule.last_adresse = adresse
-    vehicule.last_event_at = ts
-    vehicule.moteur_on = (moteur == "ON")
+    # Une relecture historique peut ingérer un événement dont l'heure est
+    # antérieure au dernier signal déjà reçu. Elle ne doit jamais faire
+    # reculer l'état temps réel du véhicule ni créer un faux retard GPS.
+    if vehicule.last_event_at is None or ts >= vehicule.last_event_at:
+        vehicule.last_lat, vehicule.last_lng = lat, lon
+        vehicule.last_vitesse = vitesse
+        vehicule.last_adresse = adresse
+        vehicule.last_event_at = ts
+        vehicule.moteur_on = (moteur == "ON")
 
     recalculer_temps(db, suivi, ts)
     _verifier_temps(db, suivi, vehicule, seuils, ts)
