@@ -1178,13 +1178,43 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
 
                         nom_depot_alerte = nom_officiel_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_nom) or (z_nom if z_code in DEPOTS_DECHARGEMENT_CODES else None)
 
-                        # Règle 5 : Alerte validation de déchargement si arrêt ≥ 3h dans un dépôt officiel OU si sortie du dépôt sans validation
-                        if (arret_depot_s >= 10800 or (not est_dans_depot_officiel and a_arrivee_depot_officiel)) and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
+                        # Règle 5 : Sortie du dépôt récepteur officiel -> Clôture automatique fluide de la mission
+                        if not est_dans_depot_officiel and a_arrivee_depot_officiel and m_actuelle.validation_dechargement != "INVALIDÉ":
+                            m_actuelle.validation_dechargement = "VALIDÉ"
+                            m_actuelle.statut = StatutMission.TERMINEE
+                            m_actuelle.statut_camion_actuel = "LIBRE"
+                            m_actuelle.heure_fin = ts
+                            if m_actuelle.heure_debut:
+                                m_actuelle.duree_s = max(0, int((ts - m_actuelle.heure_debut).total_seconds()))
+                            if not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])):
+                                m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": nom_depot_alerte or "Dépôt Récepteur", "zone": code_actuel_dep or "DEPOT"}]
+
+                            suivi.statut_camion = StatutCamion.LIBRE
+                            suivi.situation = f"Déchargé au {nom_depot_alerte or 'dépôt'} — Repositionnement"
+                            suivi.numero_ot = None
+                            suivi.distributeur = None
+                            suivi.produit = None
+                            suivi.depot_recepteur = None
+                            suivi.mission_id = None
+
+                            db.query(Alerte).filter(
+                                Alerte.vehicule_id == vehicule.id,
+                                Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+                                Alerte.statut != StatutAlerte.TRAITEE
+                            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+                            log.info("Mission %s terminée automatiquement suite à la sortie de %s pour %s",
+                                     m_actuelle.code_mission or m_actuelle.id, nom_depot_alerte, vehicule.plaque)
+                            if PUBLISH_ENABLED["on"]:
+                                publish("mission.update", s_mission(m_actuelle))
+                                publish("suivi.update", {"suivi": s_suivi(suivi, seuils)})
+
+                        elif arret_depot_s >= 10800 and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
                             m_actuelle.validation_dechargement = "EN_ATTENTE"
                             if not _alerte_recente(db, TypeAlerte.VALIDATION_DECHARGEMENT, vehicule.id, 120):
                                 a = creer_alerte(
                                     db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
-                                    f"Validation requise : Déchargement au {nom_depot_alerte} pour {vehicule.plaque} (durée arrêt ≥ 3h ou sortie dépôt)",
+                                    f"Validation requise : Déchargement au {nom_depot_alerte} pour {vehicule.plaque} (durée arrêt ≥ 3h)",
                                     ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
                                     lien_module="/missions")
                                 if PUBLISH_ENABLED["on"]:
