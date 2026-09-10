@@ -1940,7 +1940,13 @@ def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
             continue
 
         if cle == "statut_camion" and val:
-            val = StatutCamion(val)
+            val_str = str(val.value if hasattr(val, "value") else val).upper()
+            if val_str in ("CHARGE", "CHARGÉ"):
+                val = StatutCamion.CHARGE
+            elif val_str == "VIDE":
+                val = StatutCamion.VIDE
+            else:
+                val = StatutCamion.LIBRE
         ancienne = getattr(suivi, cle)
         ancienne_s = ancienne.value if hasattr(ancienne, "value") else ancienne
         nouvelle_s = val.value if hasattr(val, "value") else val
@@ -1951,11 +1957,41 @@ def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
     nouveau_statut = suivi.statut_camion.value if suivi.statut_camion else None
     if "statut_camion" in champs and ancien_statut != nouveau_statut:
         transition_statut(db, suivi, vehicule, ancien_statut, nouveau_statut, ts)
-    elif any(k in champs for k in ("numero_ot", "produit", "depot_recepteur", "distributeur")):
-        if suivi.numero_ot or suivi.depot_recepteur:
-            initialiser_ou_maj_mission(db, suivi, vehicule, suivi.numero_ot,
-                                       suivi.distributeur, suivi.produit,
-                                       suivi.depot_recepteur, ts)
+
+    # Synchronisation stricte et bidirectionnelle 1:1 vers l'onglet Missions
+    if any(k in champs for k in ("numero_ot", "produit", "depot_recepteur", "distributeur", "statut_camion")):
+        stat_c_str = suivi.statut_camion.value if hasattr(suivi.statut_camion, "value") else str(suivi.statut_camion or "LIBRE")
+        if suivi.numero_ot or stat_c_str in ("VIDE", "CHARGE"):
+            m = initialiser_ou_maj_mission(
+                db, suivi, vehicule,
+                suivi.numero_ot, suivi.distributeur, suivi.produit,
+                suivi.depot_recepteur, ts
+            )
+            if m:
+                m.statut_camion_actuel = "CHARGE" if stat_c_str in ("CHARGE", "CHARGÉ") else ("VIDE" if stat_c_str == "VIDE" else "LIBRE")
+                if suivi.numero_ot:
+                    m.numero_ot = suivi.numero_ot
+                    m.code_mission = _formater_code_mission(suivi.numero_ot, suivi.date_jour, m.numero_mission_du_jour)
+                if suivi.distributeur:
+                    m.distributeur = suivi.distributeur
+                if suivi.produit:
+                    m.produit = suivi.produit
+                if suivi.depot_recepteur:
+                    nom_d = nom_officiel_depot(suivi.depot_recepteur) or suivi.depot_recepteur
+                    m.depot = nom_d
+                    m.depot_prevu = nom_d
+                    if not m.est_deviee:
+                        m.depot_effectif = nom_d
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    publish("mission.update", s_mission(m))
+        elif stat_c_str == "LIBRE" and not suivi.numero_ot:
+            if suivi.mission_id:
+                m_anc = db.get(Mission, suivi.mission_id)
+                if m_anc and m_anc.statut != StatutMission.TERMINEE:
+                    m_anc.statut_camion_actuel = "LIBRE"
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.update", s_mission(m_anc))
 
     suivi.updated_at = now_local()
     db.commit()

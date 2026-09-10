@@ -584,6 +584,35 @@ def modifier_mission(mid: str, data: MissionPatch, db: Session = Depends(get_db)
             setattr(m, cle, val)
 
     if diffs:
+        # Synchronisation immédiate vers SuiviJournalier
+        suivi = db.scalar(select(SuiviJournalier).where(
+            (SuiviJournalier.mission_id == m.id) |
+            ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+        ))
+        if suivi:
+            if m.numero_ot:
+                suivi.numero_ot = m.numero_ot
+            if m.distributeur:
+                suivi.distributeur = m.distributeur
+            if m.produit:
+                suivi.produit = m.produit
+            if m.depot_effectif or m.depot_prevu:
+                suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+            if m.statut == StatutMission.TERMINEE:
+                suivi.statut_camion = StatutCamion.LIBRE
+                suivi.mission_id = None
+            elif m.statut_camion_actuel in ("CHARGE", "CHARGÉ"):
+                suivi.statut_camion = StatutCamion.CHARGE
+                suivi.mission_id = m.id
+            elif m.statut_camion_actuel == "VIDE":
+                suivi.statut_camion = StatutCamion.VIDE
+                suivi.mission_id = m.id
+            elif m.statut_camion_actuel == "LIBRE":
+                suivi.statut_camion = StatutCamion.LIBRE
+            if PUBLISH_ENABLED["on"]:
+                from ..event_bus import publish
+                publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
         audit(db, user, "mission.modification", "mission", m.id, diffs)
         db.commit()
         if PUBLISH_ENABLED["on"]:
@@ -623,9 +652,18 @@ def valider_chargement_mission(mid: str, data: MissionValiderChargement | None =
     m.statut_camion_actuel = "CHARGE"
     m.heure_chargement = ts_val
 
-    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
     if suivi:
         suivi.statut_camion = StatutCamion.CHARGE
+        if m.depot_effectif or m.depot_prevu:
+            suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+        suivi.mission_id = m.id
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
 
     # Auto-résolution des alertes associées
     db.query(Alerte).filter(
@@ -683,10 +721,17 @@ def valider_dechargement_mission(mid: str, data: MissionValiderDechargement | No
                                        "lieu": m.depot_effectif or m.depot_prevu or "Dépôt Récepteur",
                                        "zone": "DEPOT"}]
 
-    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
     if suivi:
         suivi.statut_camion = StatutCamion.LIBRE
+        suivi.situation = f"Déchargé au {m.depot_effectif or m.depot_prevu or 'dépôt'} — Repositionnement"
         suivi.mission_id = None
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
 
     # Auto-résolution des alertes
     db.query(Alerte).filter(
@@ -720,9 +765,16 @@ def invalider_dechargement_mission(mid: str, data: MissionInvaliderDechargement,
     m.statut = StatutMission.EN_COURS
     m.statut_camion_actuel = "CHARGE"
 
-    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
     if suivi:
         suivi.statut_camion = StatutCamion.CHARGE
+        suivi.mission_id = m.id
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
 
     db.query(Alerte).filter(
         Alerte.vehicule_id == m.vehicule_id,
@@ -754,6 +806,19 @@ def declarer_deviation_mission(mid: str, data: MissionDeclarerDeviation,
     m.statut = StatutMission.DEVIEE
     m.depot_effectif = data.nouveau_depot
     m.motif_deviation = data.motif or f"Déviation vers {data.nouveau_depot} (prévu : {m.depot_prevu or '—'})"
+
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
+    if suivi:
+        suivi.depot_recepteur = data.nouveau_depot
+        suivi.statut_camion = StatutCamion.CHARGE
+        suivi.situation = f"Dévié vers {data.nouveau_depot}"
+        suivi.mission_id = m.id
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
 
     db.query(Alerte).filter(
         Alerte.vehicule_id == m.vehicule_id,
@@ -803,9 +868,18 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
             m.validation_chargement = "VALIDÉ"
             m.statut_camion_actuel = "CHARGE"
             m.heure_chargement = m.heure_chargement or now_local()
-            suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
             if suivi:
                 suivi.statut_camion = StatutCamion.CHARGE
+                if m.depot_effectif or m.depot_prevu:
+                    suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
         if v:
             db.query(Alerte).filter(
                 Alerte.vehicule_id == v.id,
@@ -821,10 +895,17 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
             m.heure_fin = m.heure_fin or now_local()
             if m.heure_debut:
                 m.duree_s = max(0, int((m.heure_fin - m.heure_debut).total_seconds()))
-            suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
             if suivi:
                 suivi.statut_camion = StatutCamion.LIBRE
+                suivi.situation = f"Déchargé au {m.depot_effectif or m.depot_prevu or 'dépôt'} — Repositionnement"
                 suivi.mission_id = None
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
         if v:
             db.query(Alerte).filter(
                 Alerte.vehicule_id == v.id,
@@ -850,9 +931,18 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
                 m.statut = StatutMission.EN_COURS
                 m.statut_camion_actuel = "CHARGE"
 
-            suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
             if suivi:
                 suivi.statut_camion = StatutCamion.CHARGE
+                if data.nouveau_depot:
+                    suivi.depot_recepteur = data.nouveau_depot
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
         if v:
             db.query(Alerte).filter(
                 Alerte.vehicule_id == v.id,
@@ -866,6 +956,18 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
             m.statut = StatutMission.DEVIEE
             m.depot_effectif = data.nouveau_depot or m.depot_effectif
             m.motif_deviation = data.motif or f"Déviation vers {data.nouveau_depot}"
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                suivi.depot_recepteur = m.depot_effectif
+                suivi.statut_camion = StatutCamion.CHARGE
+                suivi.situation = f"Dévié vers {m.depot_effectif}"
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
         if v:
             db.query(Alerte).filter(
                 Alerte.vehicule_id == v.id,
@@ -886,8 +988,31 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
                 m.produit = data.produit
             if data.nouveau_depot:
                 m.depot_prevu = data.nouveau_depot
+                if not m.est_deviee:
+                    m.depot_effectif = data.nouveau_depot
             if m.statut_camion_actuel == "LIBRE":
                 m.statut_camion_actuel = "VIDE"
+
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                if data.numero_ot:
+                    suivi.numero_ot = data.numero_ot
+                if data.distributeur:
+                    suivi.distributeur = data.distributeur
+                if data.produit:
+                    suivi.produit = data.produit
+                if data.nouveau_depot:
+                    suivi.depot_recepteur = data.nouveau_depot
+                if suivi.statut_camion == StatutCamion.LIBRE:
+                    suivi.statut_camion = StatutCamion.VIDE
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
         if v:
             db.query(Alerte).filter(
                 Alerte.vehicule_id == v.id,
