@@ -173,7 +173,7 @@ def test_missions_complet():
     print("\n[T4] Transit CHARGÉ & Règle Dépôts Sud (Passage Base Tana)")
     t_charge1 = maintenant + timedelta(hours=9)
     # Arrivée Base Tana en transit vers le Sud (Antsirabe)
-    ingest_event(db, v, t_charge1, -18.8792, 47.5079, "Base LSS — Antananarivo", 30.0, "ON", source="SIMULATEUR")
+    ingest_event(db, v, t_charge1, -18.9537, 47.5449, "Base LSS — Antananarivo", 30.0, "ON", source="SIMULATEUR")
     db.refresh(m)
     db.refresh(suivi)
 

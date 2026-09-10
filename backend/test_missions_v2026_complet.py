@@ -94,7 +94,7 @@ def test_missions_cycle_complet():
     # -------------------------------------------------------------------------
     print("\n[RÈGLE 1] Détection sortie Base Tana sans OT -> Statut LIBRE & heure_debut")
     # Position initiale à Base Tana
-    ingest_event(db, v, maintenant, -18.8792, 47.5079, "Base LSS — Antananarivo", 0.0, "OFF", source="SIMULATEUR")
+    ingest_event(db, v, maintenant, -18.9537, 47.5449, "Base LSS — Antananarivo", 0.0, "OFF", source="SIMULATEUR")
     suivi = ensure_suivi(db, v, jour)
     assert suivi.statut_camion == StatutCamion.LIBRE
 
@@ -188,7 +188,7 @@ def test_missions_cycle_complet():
     # -------------------------------------------------------------------------
     print("\n[RÈGLE 4] Corridor Sud — Passage Base Tana sans rupture du statut CHARGÉ")
     t_passage_base = t_grt_sortie + timedelta(hours=3)
-    ingest_event(db, v, t_passage_base, -18.8792, 47.5079, "Base LSS — Antananarivo (Transit)", 15.0, "ON", source="SIMULATEUR")
+    ingest_event(db, v, t_passage_base, -18.9537, 47.5449, "Base LSS — Antananarivo (Transit)", 15.0, "ON", source="SIMULATEUR")
 
     db.refresh(m)
     db.refresh(suivi)
