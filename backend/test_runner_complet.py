@@ -21,6 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 SUITES_CRITIQUES = [
     ("Missions & Cycles Logistiques (v2026.1)", "backend/test_missions_v2026.py"),
     ("Missions & Règles Logistiques v2026 (1 à 9)", "backend/test_missions_v2026_complet.py"),
+    ("Règlement Métier Missions (Art. 1 à 45)", "backend/test_reglement_metier_missions.py"),
     ("Temps de Conduite & TCH Glissant", "backend/test_temps_conduite.py"),
     ("Dédoublonnage & Rapprochement Chauffeurs", "backend/test_conducteurs_fusion.py"),
     ("Conduite & Seuils Réglementaires", "backend/test_conduite_v127.py"),

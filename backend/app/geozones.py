@@ -280,17 +280,25 @@ DEPOT_OFFICIEL_CHARGEMENT = {
 }
 
 DEPOTS_OFFICIELS_DECHARGEMENT = {
-    "DSNR": "Depot Soanierana (DSNR)",
     "DABI": "Depot Alarobia (DABI)",
-    "DMMG": "Depot Moramanga (DMMG)",
-    "DFIA": "Depot Fianarantsoa (DFIA)",
+    "DABE": "Depot Antsirabe (DABE)",
     "DMDV": "Depot Morondava (DMDV)",
     "DMKR": "Depot Manakara (DMKR)",
-    "DABE": "Depot Antsirabe (DABE)",
+    "DFIA": "Depot Fianarantsoa (DFIA)",
+    "DSNR": "Depot Soanierana (DSNR)",
+    "DMMG": "Depot Moramanga (DMMG)et parking (devant depot + steel 1947)",
 }
 
 DEPOTS_DECHARGEMENT_CODES = {"DSNR", "DABI", "DMMG", "DFIA", "DMDV", "DMKR", "DABE"}
 DEPOTS_SUD_CODES = {"DABE", "DFIA", "DMDV", "DMKR"}
+
+CHECKPOINTS_RN2 = {
+    "MORAMANGA": {"mots": ["moramanga", "dmmg", "steel 1947"], "lat": -18.9489, "lng": 48.2257},
+    "ANDASIBE": {"mots": ["andasibe", "perinet"], "lat": -18.9261, "lng": 48.4178},
+    "AMBATOSONEGALY": {"mots": ["ambatosonegaly", "ambatosoratra"], "lat": -18.8833, "lng": 48.6500},
+    "ANDRIAKA": {"mots": ["andriaka", "andakana", "anjiro"], "lat": -18.9167, "lng": 48.0500},
+    "TANA": {"mots": ["tana", "antananarivo", "basetnr", "dsnr", "dabi", "iavoloha", "by pass"], "lat": -18.9537, "lng": 47.5449},
+}
 
 ZONES_CANONIQUES = {
     "BASETNR": {
@@ -331,8 +339,8 @@ ZONES_CANONIQUES = {
     "DMMG": {
         "type": "DEPOT_RECEPTEUR",
         "code": "DMMG",
-        "nom": "Depot Moramanga (DMMG)",
-        "mots_cles": ["depot moramanga", "dépôt moramanga", "moramanga", "dmmg"],
+        "nom": "Depot Moramanga (DMMG)et parking (devant depot + steel 1947)",
+        "mots_cles": ["depot moramanga", "dépôt moramanga", "moramanga", "dmmg", "steel 1947"],
         "coords": [(-18.9489, 48.2257, 1500)],
         "est_depot_sud": False,
     },
@@ -385,7 +393,7 @@ def normaliser_code_depot(texte: str | None) -> str | None:
         return "DSNR"
     if "alarobia" in t or "dabi" in t or "ambohibao" in t:
         return "DABI"
-    if "moramanga" in t or "dmmg" in t:
+    if "moramanga" in t or "dmmg" in t or "steel 1947" in t:
         return "DMMG"
     if "fianarantsoa" in t or "dfia" in t:
         return "DFIA"
@@ -401,6 +409,35 @@ def normaliser_code_depot(texte: str | None) -> str | None:
     code_maj = texte.strip().upper()
     if code_maj in DEPOTS_DECHARGEMENT_CODES or code_maj == "GRT":
         return code_maj
+    return None
+
+
+def extraire_depot_portail(libelle_position: str | None) -> str | None:
+    """Extraction exacte du dépôt récepteur officiel depuis la chaîne du portail GPS (§6).
+    Exemples :
+      'Depot Antsirabe (DABE) - ...' -> 'DABE'
+      'Depot Fianarantsoa (DFIA)' -> 'DFIA'
+      'Depot Moramanga (DMMG)et parking (devant depot + steel 1947)' -> 'DMMG'
+      'Depot Soanierana (DSNR)' -> 'DSNR'
+      'Depot Alarobia (DABI)' -> 'DABI'
+      'Depot Morondava (DMDV)' -> 'DMDV'
+      'Depot Manakara (DMKR)' -> 'DMKR'
+      'GRT (GALANA RAFINERIE TERMINALE)' -> 'GRT'
+    """
+    if not libelle_position:
+        return None
+    return normaliser_code_depot(libelle_position)
+
+
+def detecter_checkpoint_rn2(lat: float | None, lng: float | None, adresse: str | None = None) -> str | None:
+    """Détecte les checkpoints clés le long de la RN2 pour la preuve rétrospective ou l'invalidation DMMG."""
+    adr_l = (adresse or "").lower()
+    for cp, data in CHECKPOINTS_RN2.items():
+        if any(m in adr_l for m in data["mots"]):
+            return cp
+        if lat is not None and lng is not None:
+            if _haversine_m(lat, lng, data["lat"], data["lng"]) <= 12000.0:
+                return cp
     return None
 
 
