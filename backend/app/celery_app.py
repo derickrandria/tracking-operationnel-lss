@@ -17,11 +17,14 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery = Celery("lss", broker=REDIS_URL, backend=REDIS_URL)
 celery.conf.timezone = "Indian/Antananarivo"
+CELERY_ENABLED = os.getenv("CELERY_ENABLED", "0") == "1"
 
 
 @celery.task
 def collecte_gps():
     """Collecte API MZoneX/CamtrackPro (§10) — planifiée toutes les 10 s."""
+    if not CELERY_ENABLED:
+        return {"desactive": True, "orchestrateur": "ASYNCIO"}
     from .scrapers import (SOURCES, MZoneXCollector,
                            synchroniser_trajets_valides)
     source = os.getenv("COLLECTOR_SOURCE", "MZONEX")
@@ -40,6 +43,8 @@ def collecte_gps():
 @celery.task
 def chien_de_garde():
     """GPS hors ligne, immobilisations, missions retardées (§6.5)."""
+    if not CELERY_ENABLED:
+        return {"desactive": True, "orchestrateur": "ASYNCIO"}
     from .engine import boucle_surveillance
     boucle_surveillance()
 
@@ -47,6 +52,8 @@ def chien_de_garde():
 @celery.task
 def cycle_minuit():
     """Archivage + nouvelle journée + reset sélectif (§8)."""
+    if not CELERY_ENABLED:
+        return {"desactive": True, "orchestrateur": "ASYNCIO"}
     from datetime import date, timedelta
     from .daily import executer_cycle_quotidien
     aujourd = date.today()

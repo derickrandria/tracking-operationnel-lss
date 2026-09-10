@@ -63,6 +63,7 @@ unités à 60 s (N1 CamtrackPro enfin possible, borne §5 levée par A4), rappor
 """
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -81,6 +82,67 @@ from .api_wialon import (ApiWialon, jeton_configure,
                          point_depuis_position_wialon)
 
 log = logging.getLogger("lss.scraper")
+
+COLLECTE_LOCK = threading.Lock()
+_ETAT_COLLECTE_LOCK = threading.Lock()
+_ETAT_COLLECTE = {
+    "orchestrateur": "ASYNCIO",
+    "pid": os.getpid(),
+    "dernier_cycle_debut": None,
+    "dernier_cycle_fin": None,
+    "derniere_erreur": None,
+    "sources": {},
+}
+
+
+def _etat_collecte_debut(source: str):
+    with _ETAT_COLLECTE_LOCK:
+        instant = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_debut"] = instant
+        _ETAT_COLLECTE["sources"].setdefault(source, {})["dernier_debut"] = instant
+
+
+def _etat_collecte_fin(source: str, nombre: int):
+    with _ETAT_COLLECTE_LOCK:
+        instant = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_fin"] = instant
+        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
+            {"derniere_reussite": instant, "dernier_nombre": nombre,
+             "derniere_erreur": None})
+
+
+def _etat_collecte_erreur(source: str, exc: Exception):
+    with _ETAT_COLLECTE_LOCK:
+        erreur = f"{type(exc).__name__}: {exc}"
+        _ETAT_COLLECTE["derniere_erreur"] = erreur
+        _ETAT_COLLECTE["sources"].setdefault(source, {})["derniere_erreur"] = erreur
+
+
+def etat_collecte_memoire() -> dict:
+    with _ETAT_COLLECTE_LOCK:
+        return {
+            **_ETAT_COLLECTE,
+            "sources": {k: dict(v) for k, v in _ETAT_COLLECTE["sources"].items()},
+            "verrou_occupe": COLLECTE_LOCK.locked(),
+        }
+
+
+def _collecte_protegee(source: str, action) -> int:
+    """Exécute une passe de source sans chevauchement dans le processus."""
+    if not COLLECTE_LOCK.acquire(blocking=False):
+        log.warning("Collecte %s ignorée : une autre passe est en cours", source)
+        return 0
+    _etat_collecte_debut(source)
+    try:
+        nombre = int(action() or 0)
+        _etat_collecte_fin(source, nombre)
+        return nombre
+    except Exception as exc:
+        _etat_collecte_erreur(source, exc)
+        log.exception("Échec collecte protégée %s", source)
+        return 0
+    finally:
+        COLLECTE_LOCK.release()
 
 
 def _mzonex_api_active() -> bool:
@@ -1738,6 +1800,16 @@ VALIDATEURS_TRAJETS = {
 
 
 def synchroniser_trajets_valides(source: str | None = None) -> dict:
+    if not COLLECTE_LOCK.acquire(blocking=False):
+        log.warning("Synchronisation Niveau 2 ignorée : une collecte est déjà en cours")
+        return {"occupee": True}
+    try:
+        return _synchroniser_trajets_valides(source)
+    finally:
+        COLLECTE_LOCK.release()
+
+
+def _synchroniser_trajets_valides(source: str | None = None) -> dict:
     """Addendum v1.4 §2.4 — Collecte l'onglet Trajets / rapport trajets de la
     plateforme `source` puis réconcilie (remplacement PROVISOIRE → VALIDÉ,
     recalcul TCC/TCJ/TTJ, propagation §9, audits §11).
@@ -2046,20 +2118,17 @@ def boucle_collecte():
         except Exception:
             pass
         for nom, classe in classes:
-            try:
-                if nom == "MZONEX" and _mzonex_api_active():
-                    n = _collecter_mzonex_n1_avec_repli(classe)
-                else:
-                    n = classe().run()
-                log.info("Collecte %s : %d points insérés", nom, n)
-            except Exception:
-                # gestion des pannes : journalisation, pas de plantage (§10)
-                log.exception("Échec collecte %s", nom)
+            n = _collecte_protegee(
+                nom,
+                (lambda c=classe: _collecter_mzonex_n1_avec_repli(c)
+                 if nom == "MZONEX" and _mzonex_api_active()
+                 else c().run()))
+            log.info("Collecte %s : %d points insérés", nom, n)
         # §0sexies A4 (arbitrage 20/08/2026) — N1 CamtrackPro via l'API Wialon
         # à la même cadence (dernier message par unité ; échec → cycle reporté,
         # aucun flux écran fiable §5)
         if source != "CAMTRACKPRO" and jeton_configure():
-            n_ctp = _collecter_camtrackpro_n1()
+            n_ctp = _collecte_protegee("CAMTRACKPRO", _collecter_camtrackpro_n1)
             if n_ctp:
                 log.info("Collecte CAMTRACKPRO (API) : %d points insérés",
                          n_ctp)
@@ -2071,7 +2140,7 @@ def boucle_collecte():
                 or mono_n1 - _relecture_n1_memo["mono"] >= RELECTURE_N1_PERIODE_S):
             _relecture_n1_memo["mono"] = mono_n1
             try:
-                n_n1 = relecture_n1_mzonex()
+                n_n1 = _collecte_protegee("MZONEX_RELECTURE", relecture_n1_mzonex)
                 if n_n1:
                     log.info("Relecture N1 (Événements MZoneX, %d jours) : "
                              "%d point(s) rattrapé(s)", RELECTURE_N1_JOURS, n_n1)
