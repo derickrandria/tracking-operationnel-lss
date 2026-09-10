@@ -73,11 +73,16 @@ export const LABELS_ALERTE: Record<string, string> = {
   SANS_BADGE: "Roule sans badge",
   REPARATION_DONNEES: "Réparation de données",
   COLLECTE_YMANE: "Collecte Ym@ne en échec",
+  COLLECTE_RETARD: "Collecte GPS en retard",
   TCH_PROCHE_LIMITE: "TCH proche de la limite",
   TCH_LIMITE_ATTEINTE: "TCH limite atteinte",
   CONFLIT_AFFECTATION: "Conflit d'affectation chauffeur",
   DOUBLON_CONDUCTEUR: "Doublon chauffeur",
   CHANGEMENT_CONDUCTEUR_DETECTE: "Changement de conducteur détecté (arbitrage)",
+  MISSION_SANS_OT: "Mission sans OT",
+  VALIDATION_CHARGEMENT: "Validation chargement",
+  VALIDATION_DECHARGEMENT: "Validation déchargement",
+  DEVIATION_DETECTEE: "Déviation détectée",
 };
 
 export const COULEURS_GRAVITE: Record<string, string> = {

@@ -1685,64 +1685,26 @@ def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
 
 def reconcilier_alertes_missions_en_attente(db: Session) -> int:
     """Restaure et persiste les alertes LÉGITIMES non traitées des missions réelles.
-    RÈGLE ABSOLUE D'INTÉGRITÉ :
-      - Seule une présence physique AVÉRÉE dans GRT peut générer MISSION_SANS_OT ou VALIDATION_CHARGEMENT.
-      - Seule une arrivée physique AVÉRÉE dans l'un des 7 dépôts officiels (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE)
-        avec arrêt ≥ 3h peut générer VALIDATION_DECHARGEMENT.
-      - Tout camion resté à la Base Tana ou en transit ne doit JAMAIS recevoir d'alerte de déchargement.
-      - Toutes les alertes orphelines, fictives ou basées sur des lieux inventés sont automatiquement purgées.
+    RÈGLE ABSOLUE DE STABILITÉ ET D'INTÉGRITÉ :
+      - Les alertes actives restent stables et persistantes en base (NOUVELLE / VUE).
+      - Une alerte n'est clôturée (TRAITEE) QUE si la mission est formellement terminée (StatutMission.TERMINEE)
+        ou si l'action a été expressément validée par l'opérateur.
+      - Aucun clignotement ou purge intempestive en boucle.
     """
     nb_creees = 0
     now = now_local()
 
-    # 1. Nettoyage préventif des alertes obsolètes et fictives
-    db.query(Alerte).filter(
-        Alerte.type == TypeAlerte.MISSION_RETARDEE,
-        Alerte.statut != StatutAlerte.TRAITEE
-    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+    # 1. Clôture des alertes UNIQUEMENT pour les missions formellement terminées
+    missions_terminees_ids = {m.id for m in db.scalars(select(Mission).where(Mission.statut == StatutMission.TERMINEE)).all()}
+    vehicules_termines_ids = {m.vehicule_id for m in db.scalars(select(Mission).where(Mission.statut == StatutMission.TERMINEE)).all()}
 
-    # Purge / Clôture des alertes de déchargement/chargement fictives existantes
-    alertes_existantes = db.query(Alerte).filter(
-        Alerte.type.in_([
-            TypeAlerte.MISSION_SANS_OT,
-            TypeAlerte.VALIDATION_CHARGEMENT,
-            TypeAlerte.VALIDATION_DECHARGEMENT,
-            TypeAlerte.DEVIATION_DETECTEE,
-        ]),
-        Alerte.statut != StatutAlerte.TRAITEE
-    ).all()
-
-    for a in alertes_existantes:
-        m = db.query(Mission).filter(Mission.vehicule_id == a.vehicule_id).order_by(Mission.date_jour.desc()).first() if a.vehicule_id else None
-        etapes = m.etapes if m else []
-        est_valide = False
-
-        if a.type == TypeAlerte.VALIDATION_DECHARGEMENT:
-            # Doit avoir une étape d'arrivée physique dans l'un des 7 dépôts officiels
-            a_arrivee_depot = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in etapes)
-            if a_arrivee_depot and m and m.validation_dechargement != "VALIDÉ" and m.statut != StatutMission.TERMINEE:
-                est_valide = True
-
-        elif a.type == TypeAlerte.VALIDATION_CHARGEMENT:
-            # Doit être entré à GRT et ne pas en être encore sorti (pas de CHARGEMENT_EFFECTUE)
-            a_entree_grt = any(e.get("etat") == "ENTREE_GRT" for e in etapes)
-            a_sortie_grt = any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in etapes)
-            if a_entree_grt and not a_sortie_grt and m and m.validation_chargement != "VALIDÉ":
-                est_valide = True
-
-        elif a.type == TypeAlerte.MISSION_SANS_OT:
-            a_entree_grt = any(e.get("etat") == "ENTREE_GRT" for e in etapes)
-            a_sortie_grt = any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in etapes)
-            if a_entree_grt and not a_sortie_grt and m and (not m.numero_ot or m.statut_camion_actuel == "LIBRE"):
-                est_valide = True
-
-        elif a.type == TypeAlerte.DEVIATION_DETECTEE:
-            a_dev = any(e.get("etat") == "DEVIATION_DETECTEE" and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in etapes)
-            if a_dev and m and m.est_deviee:
-                est_valide = True
-
-        if not est_valide:
-            a.statut = StatutAlerte.TRAITEE
+    # Clôture des alertes de déchargement pour les camions dont la mission est déjà terminée
+    if vehicules_termines_ids:
+        db.query(Alerte).filter(
+            Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+            Alerte.vehicule_id.in_(list(vehicules_termines_ids)),
+            Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
 
     # 2. Réconciliation stricte sur les missions réellement actives
     debut_recherche = now.date() - timedelta(days=30)

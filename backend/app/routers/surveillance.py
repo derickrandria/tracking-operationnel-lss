@@ -40,11 +40,16 @@ TYPES_ALERTE = {
     "SANS_BADGE": "Camion qui roule sans badge chauffeur",
     "REPARATION_DONNEES": "Réparation de données (§0decies)",
     "COLLECTE_YMANE": "Collecte Ym@ne en échec (§0septies decies K1)",
+    "COLLECTE_RETARD": "Collecte GPS en retard",
     "TCH_PROCHE_LIMITE": "TCH proche de la limite (≥ 46h)",
     "TCH_LIMITE_ATTEINTE": "TCH limite atteinte (≥ 56h)",
     "CONFLIT_AFFECTATION": "Conflit d'affectation chauffeur (manuel vs portail)",
     "DOUBLON_CONDUCTEUR": "Doublon chauffeur sur la journée",
     "CHANGEMENT_CONDUCTEUR_DETECTE": "Changement de conducteur détecté (arbitrage requis)",
+    "MISSION_SANS_OT": "Mission sans OT à GRT",
+    "VALIDATION_CHARGEMENT": "Validation chargement requise",
+    "VALIDATION_DECHARGEMENT": "Validation déchargement requise",
+    "DEVIATION_DETECTEE": "Déviation détectée",
 }
 
 

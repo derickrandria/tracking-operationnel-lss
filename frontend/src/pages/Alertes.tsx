@@ -18,6 +18,11 @@ const ICONES: Record<string, string> = {
   TCH_PROCHE_LIMITE: "horloge", TCH_LIMITE_ATTEINTE: "horloge",
   CONFLIT_AFFECTATION: "conducteurs", DOUBLON_CONDUCTEUR: "conducteurs",
   CHANGEMENT_CONDUCTEUR_DETECTE: "conducteurs",
+  MISSION_SANS_OT: "missions",
+  VALIDATION_CHARGEMENT: "missions",
+  VALIDATION_DECHARGEMENT: "missions",
+  DEVIATION_DETECTEE: "localisation",
+  COLLECTE_RETARD: "horloge",
 };
 
 export default function Alertes() {
