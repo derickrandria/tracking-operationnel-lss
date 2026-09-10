@@ -12,12 +12,21 @@ const COULEURS_STATUT: Record<string, string> = {
   "CHARGÉ": "#f59e0b", "VIDE": "#3b82f6", "LIBRE": "#22c55e",
 };
 
-function iconeCamion(statut: string | null) {
+function iconeCamion(statut: string | null, moteur?: boolean, vitesse?: number) {
   const c = COULEURS_STATUT[statut || ""] || "#94a3b8";
+  const estEnMouvement = (vitesse || 0) > 3;
+  const estMoteurOn = Boolean(moteur);
+
+  const bordure = estEnMouvement
+    ? "border-emerald-500 shadow-emerald-500/50"
+    : estMoteurOn
+    ? "border-amber-500 shadow-amber-500/40"
+    : "border-slate-400 opacity-90";
+
   return L.divIcon({
     className: "",
-    html: `<div class="marqueur-camion" style="width:14px;height:14px;background:${c}"></div>`,
-    iconSize: [14, 14], iconAnchor: [7, 7], popupAnchor: [0, -8],
+    html: `<div class="marqueur-camion ${bordure}" style="width:16px;height:16px;border-radius:50%;background:${c};border:2.5px solid white;box-shadow:0 2px 5px rgba(0,0,0,0.4);"></div>`,
+    iconSize: [16, 16], iconAnchor: [8, 8], popupAnchor: [0, -10],
   });
 }
 
@@ -81,17 +90,29 @@ function CarteFlotte({ positions, suivre }: { positions: any[]; suivre: Map<stri
       (positions || []).forEach((p) => {
         if (p.lat == null || p.lng == null) return;
         presents.add(p.vehicule_id);
-        const html = `<b>${p.plaque}</b> — ${p.conducteur || "sans chauffeur"}<br/>` +
-          `${p.adresse || "position inconnue"}<br/>` +
-          `Vitesse : ${Math.round(p.vitesse || 0)} km/h · ${p.statut_camion || "—"}<br/>` +
-          `<span style="color:#94a3b8">MAJ ${p.maj ? p.maj.slice(11, 16) : "—"}</span>`;
+        const contactTxt = p.vitesse > 3
+          ? `<span style="color:#22c55e;font-weight:bold;">🟢 En mouvement (${Math.round(p.vitesse)} km/h)</span>`
+          : p.moteur
+          ? `<span style="color:#f59e0b;font-weight:bold;">🟠 Moteur ON (À l'arrêt)</span>`
+          : `<span style="color:#64748b;">⚪ Stationné / Moteur OFF</span>`;
+
+        const html = `<div style="font-size:12px;min-width:180px;line-height:1.4;">` +
+          `<div style="font-weight:bold;font-size:13px;border-bottom:1px solid #e2e8f0;padding-bottom:3px;margin-bottom:4px;">` +
+          `${p.plaque} <span style="font-weight:normal;color:#64748b;">(${p.conducteur || "Sans chauffeur"})</span>` +
+          `</div>` +
+          `<div style="color:#334155;margin-bottom:3px;">📍 ${p.adresse || "Position enregistrée"}</div>` +
+          `<div style="margin-bottom:2px;"><b>Statut :</b> <span style="color:${COULEURS_STATUT[p.statut_camion] || '#64748b'};font-weight:bold;">${p.statut_camion || '—'}</span></div>` +
+          `<div style="margin-bottom:3px;">${contactTxt}</div>` +
+          `<div style="color:#94a3b8;font-size:11px;">🕒 ${p.maj ? p.maj.slice(0, 16).replace('T', ' ') : 'Dernière position connue'}</div>` +
+          `</div>`;
+
         let m = marqueurs.current.get(p.vehicule_id);
         if (!m) {
-          m = L.marker([p.lat, p.lng], { icon: iconeCamion(p.statut_camion) }).addTo(map);
+          m = L.marker([p.lat, p.lng], { icon: iconeCamion(p.statut_camion, p.moteur, p.vitesse) }).addTo(map);
           marqueurs.current.set(p.vehicule_id, m);
         } else {
           m.setLatLng([p.lat, p.lng]);
-          m.setIcon(iconeCamion(p.statut_camion));
+          m.setIcon(iconeCamion(p.statut_camion, p.moteur, p.vitesse));
         }
         m.bindPopup(html);
       });

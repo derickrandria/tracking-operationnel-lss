@@ -132,13 +132,43 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
                            for s in suivis}
     conducteur_par_vehicule = {s.vehicule_id: s.conducteur.prenom_usuel if s.conducteur else None
                                for s in suivis}
-    for v in db.scalars(select(Vehicule).where(Vehicule.last_lat.isnot(None))).all():
+    for v in db.scalars(select(Vehicule).where(Vehicule.statut == StatutVehicule.ACTIF)).all():
+        lat = v.last_lat
+        lng = v.last_lng
+        adresse = v.last_adresse
+        maj = v.last_event_at
+        vitesse = v.last_vitesse or 0.0
+        moteur = v.moteur_on
+
+        if lat is None or lng is None:
+            # Fallback vers le dernier événement GPS connu historique
+            dernier_ev = db.scalar(
+                select(EvenementGPS)
+                .where(EvenementGPS.vehicule_id == v.id, EvenementGPS.latitude.isnot(None))
+                .order_by(EvenementGPS.horodatage.desc())
+            )
+            if dernier_ev:
+                lat = dernier_ev.latitude
+                lng = dernier_ev.longitude
+                adresse = dernier_ev.adresse or v.last_adresse
+                maj = dernier_ev.horodatage
+                vitesse = dernier_ev.vitesse or 0.0
+                moteur = False if vitesse <= 1 else v.moteur_on
+
+        # Si toujours None, positionner par défaut à la Base Tana LSS (stationné)
+        if lat is None or lng is None:
+            lat = -18.9537
+            lng = 47.5449
+            adresse = "Base LSS Antananarivo (Stationné)"
+            vitesse = 0.0
+            moteur = False
+
         positions.append({
             "vehicule_id": v.id, "plaque": v.plaque,
-            "lat": v.last_lat, "lng": v.last_lng,
-            "vitesse": v.last_vitesse, "adresse": v.last_adresse,
-            "moteur": v.moteur_on, "maj": v.last_event_at.isoformat() if v.last_event_at else None,
-            "statut_camion": statut_par_vehicule.get(v.id),
+            "lat": lat, "lng": lng,
+            "vitesse": vitesse, "adresse": adresse or "Position enregistrée",
+            "moteur": moteur, "maj": maj.isoformat() if maj else None,
+            "statut_camion": statut_par_vehicule.get(v.id) or "LIBRE",
             "conducteur": conducteur_par_vehicule.get(v.id),
         })
 

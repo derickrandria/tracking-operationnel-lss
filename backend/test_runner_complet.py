@@ -31,10 +31,19 @@ SUITES_CRITIQUES = [
 def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     t0 = time.perf_counter()
     env = os.environ.copy()
+    import site
     
-    # Préservation de sys.path (site-packages, venv, user base) + ajout de backend
+    # Préservation de sys.path (site-packages, venv, user base) + ajout de backend et pylib
     cur_pypath = env.get("PYTHONPATH", "")
-    pypaths = [os.path.abspath("backend"), os.path.abspath("."), "/tmp/pylib"]
+    pypaths = [
+        os.path.abspath("backend"),
+        os.path.abspath("."),
+        os.path.abspath("pylib"),
+        site.getusersitepackages(),
+        "/tmp/pylib"
+    ]
+    if hasattr(site, "getsitepackages"):
+        pypaths.extend(site.getsitepackages())
     for p in sys.path:
         if p and p not in pypaths:
             pypaths.append(p)
