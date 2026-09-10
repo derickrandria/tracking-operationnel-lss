@@ -1366,6 +1366,11 @@ def transition_statut(db, suivi: SuiviJournalier, vehicule: Vehicule,
             log.info("Mission %s n°%s terminée", vehicule.plaque, m.numero_mission_du_jour)
             if PUBLISH_ENABLED["on"]:
                 publish("mission.update", s_mission(m))
+        # Effacement automatique des informations OT dans l'onglet suivi journalier
+        suivi.numero_ot = None
+        suivi.distributeur = None
+        suivi.produit = None
+        suivi.depot_recepteur = None
 
 
 def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
@@ -1919,6 +1924,17 @@ def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
     nouveau_statut = suivi.statut_camion.value if suivi.statut_camion else None
     if "statut_camion" in champs and ancien_statut != nouveau_statut:
         transition_statut(db, suivi, vehicule, ancien_statut, nouveau_statut, ts)
+
+    if nouveau_statut == StatutCamion.LIBRE.value and "statut_camion" in champs:
+        # Passage au statut LIBRE -> effacement automatique des informations OT
+        if "numero_ot" not in champs:
+            suivi.numero_ot = None
+        if "distributeur" not in champs:
+            suivi.distributeur = None
+        if "produit" not in champs:
+            suivi.produit = None
+        if "depot_recepteur" not in champs:
+            suivi.depot_recepteur = None
 
     # Synchronisation stricte et bidirectionnelle 1:1 vers l'onglet Missions
     if any(k in champs for k in ("numero_ot", "produit", "depot_recepteur", "distributeur", "statut_camion")):

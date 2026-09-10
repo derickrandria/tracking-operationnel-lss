@@ -105,11 +105,20 @@ export default function Suivi() {
   /** Déclaré à chaque modification de cellule : optimiste + debounce 1,5 s (§2.2.1). */
   const programmer = useCallback((ligne: SuiviLigne, champ: string, valeur: string | null) => {
     if (lectureSeule) return;
+    const isPassageLibre = champ === "statut_camion" && valeur === "LIBRE";
     setData((d) => d && ({
       ...d,
-      lignes: d.lignes.map((l) => (l.id === ligne.id ? { ...l, [champ]: valeur } : l)),
+      lignes: d.lignes.map((l) => (l.id === ligne.id ? {
+        ...l,
+        [champ]: valeur,
+        ...(isPassageLibre ? { numero_ot: null, distributeur: null, produit: null, depot_recepteur: null } : {})
+      } : l)),
     }));
-    pendingRef.current[ligne.id] = { ...pendingRef.current[ligne.id], [champ]: valeur };
+    pendingRef.current[ligne.id] = {
+      ...pendingRef.current[ligne.id],
+      [champ]: valeur,
+      ...(isPassageLibre ? { numero_ot: null, distributeur: null, produit: null, depot_recepteur: null } : {})
+    };
     persisterBrouillon();
     setSave({ etat: "attente", nb: nbEnAttente() });
     window.clearTimeout(debounceRef.current[ligne.id]);

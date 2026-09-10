@@ -590,25 +590,35 @@ def modifier_mission(mid: str, data: MissionPatch, db: Session = Depends(get_db)
             ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
         ))
         if suivi:
-            if m.numero_ot:
-                suivi.numero_ot = m.numero_ot
-            if m.distributeur:
-                suivi.distributeur = m.distributeur
-            if m.produit:
-                suivi.produit = m.produit
-            if m.depot_effectif or m.depot_prevu:
-                suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
-            if m.statut == StatutMission.TERMINEE:
+            if m.statut == StatutMission.TERMINEE or m.statut_camion_actuel == "LIBRE":
                 suivi.statut_camion = StatutCamion.LIBRE
                 suivi.mission_id = None
+                suivi.numero_ot = None
+                suivi.distributeur = None
+                suivi.produit = None
+                suivi.depot_recepteur = None
             elif m.statut_camion_actuel in ("CHARGE", "CHARGÉ"):
                 suivi.statut_camion = StatutCamion.CHARGE
                 suivi.mission_id = m.id
+                if m.numero_ot:
+                    suivi.numero_ot = m.numero_ot
+                if m.distributeur:
+                    suivi.distributeur = m.distributeur
+                if m.produit:
+                    suivi.produit = m.produit
+                if m.depot_effectif or m.depot_prevu:
+                    suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
             elif m.statut_camion_actuel == "VIDE":
                 suivi.statut_camion = StatutCamion.VIDE
                 suivi.mission_id = m.id
-            elif m.statut_camion_actuel == "LIBRE":
-                suivi.statut_camion = StatutCamion.LIBRE
+                if m.numero_ot:
+                    suivi.numero_ot = m.numero_ot
+                if m.distributeur:
+                    suivi.distributeur = m.distributeur
+                if m.produit:
+                    suivi.produit = m.produit
+                if m.depot_effectif or m.depot_prevu:
+                    suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
             if PUBLISH_ENABLED["on"]:
                 from ..event_bus import publish
                 publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
@@ -729,6 +739,10 @@ def valider_dechargement_mission(mid: str, data: MissionValiderDechargement | No
         suivi.statut_camion = StatutCamion.LIBRE
         suivi.situation = f"Déchargé au {m.depot_effectif or m.depot_prevu or 'dépôt'} — Repositionnement"
         suivi.mission_id = None
+        suivi.numero_ot = None
+        suivi.distributeur = None
+        suivi.produit = None
+        suivi.depot_recepteur = None
         if PUBLISH_ENABLED["on"]:
             from ..event_bus import publish
             publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
@@ -903,6 +917,10 @@ def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = De
                 suivi.statut_camion = StatutCamion.LIBRE
                 suivi.situation = f"Déchargé au {m.depot_effectif or m.depot_prevu or 'dépôt'} — Repositionnement"
                 suivi.mission_id = None
+                suivi.numero_ot = None
+                suivi.distributeur = None
+                suivi.produit = None
+                suivi.depot_recepteur = None
                 if PUBLISH_ENABLED["on"]:
                     from ..event_bus import publish
                     publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
