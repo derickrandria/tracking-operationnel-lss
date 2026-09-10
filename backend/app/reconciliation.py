@@ -440,6 +440,26 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                 trajets.remove(t)
             epures += 1
             continue
+        # Un ouvert N1 provisoire peut commencer au milieu d'une ligne N2
+        # publiée après coup. Il s'agit du même trajet observé en direct :
+        # l'officiel couvre l'ouvert, même si sa fin officielle est plus tard.
+        if (t.heure_fin is None
+            and (t.statut_source == StatutSourceTrajet.PROVISOIRE
+                 or t.source_plateforme == "CAMTRACKPRO")
+                and any(d <= t.heure_debut <= (f or d)
+                        for d, f in intervalles)):
+            _audit(db, "trajet.orphelin_purge", t.id, {
+                "plaque": vehicule.plaque, "jour": jour.isoformat(),
+                "debut": iso(t.heure_debut), "fin": None,
+                "raison": "ouvert_recouvert",
+                "regle": "ouvert N1 provisoire recouvert par une ligne N2 "
+                         "officielle : l'officiel fait foi"})
+            log.info("Ligne ouverte recouverte purgée — %s %s",
+                     vehicule.plaque, iso(t.heure_debut))
+            db.delete(t)
+            trajets.remove(t)
+            epures += 1
+            continue
         fin_affichee = t.heure_fin or maintenant
         # un trajet MOTEUR (Niveau 1) vraiment vivant — fin provisoire fraîche
         # (< pause_min) ou pas encore de fin — n'est jamais touché ici

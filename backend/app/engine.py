@@ -747,13 +747,16 @@ def _finaliser_trajet(db, trajet: "Trajet", vehicule: Vehicule, seuils: dict,
     return True
 
 
-def _statut_initial_trajet(plateforme: str) -> "StatutSourceTrajet":
+def _statut_initial_trajet(plateforme: str, source: SourceEvenement = SourceEvenement.SIMULATEUR) -> "StatutSourceTrajet":
     """Addendum v1.4 §2.2/§5 : MZoneX publie les trajets clôturés en différé →
     reconstruction temps réel PROVISOIRE en attendant l'onglet Trajets.
     CamtrackPro « Detail Trajet groupe de véhicules » restitue le calcul natif
     plateforme → VALIDÉ directement (point à re-vérifier avec le métier, §5)."""
     from .models import StatutSourceTrajet
-    if plateforme == "CAMTRACKPRO":
+    # Une position N1 CamtrackPro est une observation temps réel, pas encore
+    # le trajet officiel du rapport N2. Elle doit donc pouvoir être remplacée
+    # par ce rapport au cycle suivant, comme une ligne MZoneX provisoire.
+    if plateforme == "CAMTRACKPRO" and source != SourceEvenement.CAMTRACKPRO:
         return StatutSourceTrajet.VALIDE
     return StatutSourceTrajet.PROVISOIRE
 
@@ -762,7 +765,7 @@ def _nouveau_trajet(suivi: SuiviJournalier, numero: int, debut: datetime,
                     vehicule: Vehicule, source: SourceEvenement) -> "Trajet":
     plateforme = _plateforme_trajet(vehicule, source)
     return Trajet(suivi_id=suivi.id, numero=numero, heure_debut=debut,
-                  statut_source=_statut_initial_trajet(plateforme),
+                  statut_source=_statut_initial_trajet(plateforme, source),
                   source_plateforme=plateforme)
 
 

@@ -22,9 +22,19 @@ celery.conf.timezone = "Indian/Antananarivo"
 @celery.task
 def collecte_gps():
     """Collecte API MZoneX/CamtrackPro (§10) — planifiée toutes les 10 s."""
-    from .scrapers import SOURCES
+    from .scrapers import (SOURCES, MZoneXCollector,
+                           synchroniser_trajets_valides)
     source = os.getenv("COLLECTOR_SOURCE", "MZONEX")
-    return SOURCES[source]().run()
+    if source.upper() == "SIMULATEUR":
+        return 0
+    if source.upper() == "MIXTE":
+        n1 = MZoneXCollector().run()
+        n2 = synchroniser_trajets_valides("MIXTE")
+        return {"niveau1": n1, "niveau2": n2}
+    classe = SOURCES.get(source.upper())
+    if classe is None:
+        raise ValueError(f"Source de collecte inconnue : {source}")
+    return classe().run()
 
 
 @celery.task

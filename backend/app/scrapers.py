@@ -1931,6 +1931,7 @@ def synchroniser_trajets_valides(source: str | None = None) -> dict:
 RELECTURE_N1_ACTIVE = os.getenv("RELECTURE_N1_ACTIVE", "1") == "1"
 RELECTURE_N1_JOURS = int(os.getenv("RELECTURE_N1_JOURS", "7"))
 RELECTURE_N1_PERIODE_S = int(os.getenv("RELECTURE_N1_PERIODE_S", "3600"))
+COLLECTOR_N2_PERIODE_S = _env_int("COLLECTOR_N2_PERIODE_S", 900)
 _relecture_n1_memo: dict = {"mono": 0.0}
 
 
@@ -2030,6 +2031,7 @@ def boucle_collecte():
                      "— jeton API absent, §5)",
                      ", ".join(nom for nom, _ in classes))
     log.info("Boucle de collecte %s démarrée (toutes les %ds)", source, periode)
+    dernier_n2 = 0.0
     # §0septies B4 — géozones des deux portails (gate « en zone / hors zone »
     # de l'alerte vitesse en direct) : chargée au démarrage, auto-rechargée
     # toutes les 6 h par le cache interne — jamais d'exception ici (§10)
@@ -2055,6 +2057,19 @@ def boucle_collecte():
             except Exception:
                 # gestion des pannes : journalisation, pas de plantage (§10)
                 log.exception("Échec collecte %s", nom)
+        # Niveau 2 : les trajets officiels remplacent les provisoires et
+        # recalculent les compteurs. Sans cette passe, la collecte N1 reste
+        # provisoire indéfiniment et les données officielles prennent du retard.
+        mono_n2 = time.monotonic()
+        if (source in ("MZONEX", "CAMTRACKPRO", "MIXTE")
+                and (dernier_n2 == 0.0
+                     or mono_n2 - dernier_n2 >= COLLECTOR_N2_PERIODE_S)):
+            dernier_n2 = mono_n2
+            try:
+                stats_n2 = synchroniser_trajets_valides(source)
+                log.info("Synchronisation Niveau 2 (%s) : %s", source, stats_n2)
+            except Exception:
+                log.exception("Échec synchronisation Niveau 2 (%s)", source)
         # §0sexies A4 (arbitrage 20/08/2026) — N1 CamtrackPro via l'API Wialon
         # à la même cadence (dernier message par unité ; échec → cycle reporté,
         # aucun flux écran fiable §5)
