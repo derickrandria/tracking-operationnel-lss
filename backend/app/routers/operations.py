@@ -1,10 +1,13 @@
 """Module 2 — Suivi Journalier (cœur du système) et Module 3 — Missions."""
+import logging
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
+
+log = logging.getLogger("lss.operations")
 
 from ..config import now_local
 from ..database import get_db
@@ -350,6 +353,7 @@ def sync_gps_immediat(db: Session = Depends(get_db),
         pass
         
     audit(db, user, "suivi.sync_gps_manuel", "suivi", str(now_local().date()), resultat)
+    db.commit()
     return resultat
 
 
