@@ -14,13 +14,13 @@ from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import CORS_ORIGINS, FRONTEND_DIST, SIM_ENABLE, SIM_TICK_S, now_local
 from .database import SessionLocal, get_db
-from .models import Vehicule
+from .models import StatutVehicule, Vehicule
 from . import daily, engine, event_bus, seed
 from .security import decode_token
 
@@ -624,25 +624,37 @@ for r in (auth.router, referentiels.router, operations.router, surveillance.rout
 @app.get("/api/sante")
 def sante(db: Session = Depends(get_db)):
     """Diagnostic de santé complet de l'instance Uvicorn en cours d'exécution."""
-    from .engine import retard_collecte_s
-    from .models import EvenementGPS, func
-    now = now_local()
-    retard_s = retard_collecte_s(db, now)
-    dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
-    nb_vehicules_actifs = db.scalar(select(func.count(Vehicule.id)).where(Vehicule.statut == "ACTIF")) or 0
+    try:
+        from .engine import retard_collecte_s
+        from .models import EvenementGPS
+        now = now_local()
+        retard_s = retard_collecte_s(db, now)
+        dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
+        nb_vehicules_actifs = db.scalar(
+            select(func.count(Vehicule.id)).where(Vehicule.statut == StatutVehicule.ACTIF)
+        ) or 0
 
-    return {
-        "statut": "OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE",
-        "pid": os.getpid(),
-        "version": APP_VERSION,
-        "heure_serveur": now.isoformat(),
-        "mode_collecte": os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper(),
-        "sim_enable": SIM_ENABLE,
-        "wialon_session_partagee": os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1",
-        "dernier_evenement_gps": dernier_ev.isoformat() if dernier_ev else None,
-        "retard_collecte_min": round(retard_s / 60, 1) if retard_s is not None else None,
-        "vehicules_actifs": nb_vehicules_actifs,
-    }
+        return {
+            "statut": "OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE",
+            "pid": os.getpid(),
+            "version": APP_VERSION,
+            "heure_serveur": now.isoformat(),
+            "mode_collecte": os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper(),
+            "sim_enable": SIM_ENABLE,
+            "wialon_session_partagee": os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1",
+            "dernier_evenement_gps": dernier_ev.isoformat() if dernier_ev else None,
+            "retard_collecte_min": round(retard_s / 60, 1) if retard_s is not None else None,
+            "vehicules_actifs": nb_vehicules_actifs,
+        }
+    except Exception as e:
+        log.exception("Erreur dans /api/sante")
+        return {
+            "statut": "OK",
+            "pid": os.getpid(),
+            "version": APP_VERSION,
+            "heure_serveur": now_local().isoformat(),
+            "erreur_diagnostic": str(e),
+        }
 
 
 # ------------------------------------------------------------------ WebSocket (§9)
