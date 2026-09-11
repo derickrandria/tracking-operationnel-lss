@@ -1,4 +1,5 @@
 """Module 1 — Dashboard : KPI, cartes, graphiques (lecture agrégée §6.1)."""
+import logging
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 
@@ -8,11 +9,12 @@ from sqlalchemy.orm import Session
 
 from ..config import now_local
 from ..database import get_db
-from ..models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
+from ..models import (Alerte, Conducteur, EvenementGPS, HistoriqueJournalier, Infraction,
                       Mission, StatutAlerte, StatutCamion, StatutMission,
                       StatutVehicule, SuiviJournalier, Vehicule)
 from ..security import TOUS, require_roles
 
+log = logging.getLogger("lss.dashboard")
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
 
@@ -142,18 +144,23 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
 
         if lat is None or lng is None:
             # Fallback vers le dernier événement GPS connu historique
-            dernier_ev = db.scalar(
-                select(EvenementGPS)
-                .where(EvenementGPS.vehicule_id == v.id, EvenementGPS.latitude.isnot(None))
-                .order_by(EvenementGPS.horodatage.desc())
-            )
-            if dernier_ev:
-                lat = dernier_ev.latitude
-                lng = dernier_ev.longitude
-                adresse = dernier_ev.adresse or v.last_adresse
-                maj = dernier_ev.horodatage
-                vitesse = dernier_ev.vitesse or 0.0
-                moteur = False if vitesse <= 1 else v.moteur_on
+            try:
+                dernier_ev = db.execute(
+                    select(EvenementGPS.latitude, EvenementGPS.longitude, EvenementGPS.adresse,
+                           EvenementGPS.horodatage, EvenementGPS.vitesse)
+                    .where(EvenementGPS.vehicule_id == v.id, EvenementGPS.latitude.isnot(None))
+                    .order_by(EvenementGPS.horodatage.desc())
+                    .limit(1)
+                ).first()
+                if dernier_ev:
+                    lat = dernier_ev.latitude
+                    lng = dernier_ev.longitude
+                    adresse = dernier_ev.adresse or v.last_adresse
+                    maj = dernier_ev.horodatage
+                    vitesse = dernier_ev.vitesse or 0.0
+                    moteur = False if (vitesse or 0.0) <= 1 else bool(v.moteur_on)
+            except Exception:
+                log.debug("Fallback position pour %s ignoré", v.plaque)
 
         # Si toujours None, positionner par défaut à la Base Tana LSS (stationné)
         if lat is None or lng is None:
