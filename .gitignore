@@ -10,7 +10,7 @@ archive/
 
 # Node & Build
 node_modules/
-frontend/dist/
+
 
 # Divers
 .env
