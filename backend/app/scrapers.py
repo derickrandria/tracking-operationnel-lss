@@ -953,7 +953,11 @@ class CollectorBase:
             # chaque passe (idempotent).
             inseres += _reparer_debuts_sans_trajet(db, list(vus.values()),
                                                    self.source)
+            db.commit()
             return inseres
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
