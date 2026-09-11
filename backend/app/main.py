@@ -691,6 +691,58 @@ def sante(db: Session = Depends(get_db)):
         }
 
 
+@app.get("/api/sante/sync")
+@app.post("/api/sante/sync")
+def sante_sync():
+    """Déclenche manuellement un cycle de collecte N1 + N2 et renvoie le diagnostic détaillé."""
+    from .scrapers import (
+        MZoneXApiCollector, _collecter_camtrackpro_n1,
+        synchroniser_trajets_valides, _mzonex_api_active
+    )
+    from .api_wialon import jeton_configure
+    from .engine import retard_collecte_s
+    from .models import EvenementGPS
+    
+    res = {
+        "debut": now_local().isoformat(),
+        "mzonex_n1_points": 0,
+        "camtrackpro_n1_points": 0,
+        "n2_sync": {},
+        "erreurs": []
+    }
+    
+    if _mzonex_api_active():
+        try:
+            res["mzonex_n1_points"] = MZoneXApiCollector().run()
+        except Exception as e:
+            res["erreurs"].append(f"MZoneX N1: {e}")
+            
+    if jeton_configure():
+        try:
+            res["camtrackpro_n1_points"] = _collecter_camtrackpro_n1()
+        except Exception as e:
+            res["erreurs"].append(f"CamtrackPro N1: {e}")
+            
+    try:
+        res["n2_sync"] = synchroniser_trajets_valides("MIXTE")
+    except Exception as e:
+        res["erreurs"].append(f"N2 Trajets: {e}")
+        
+    db = SessionLocal()
+    try:
+        now = now_local()
+        retard_s = retard_collecte_s(db, now)
+        dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
+        res["dernier_evenement_gps"] = dernier_ev.isoformat() if dernier_ev else None
+        res["retard_collecte_min"] = round(retard_s / 60, 1) if retard_s is not None else None
+        res["statut_collecte"] = "OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE"
+    finally:
+        db.close()
+        
+    res["fin"] = now_local().isoformat()
+    return res
+
+
 @app.get("/api/sante/portails")
 def sante_portails():
     """Diagnostic direct et public de la connectivité API MZoneX et CamtrackPro."""

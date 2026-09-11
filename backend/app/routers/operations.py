@@ -299,6 +299,60 @@ def prefill_gps(date: str | None = None, db: Session = Depends(get_db),
     return {"positions_remplies": nb}
 
 
+@router.post("/suivi/sync-gps")
+def sync_gps_immediat(db: Session = Depends(get_db),
+                      user=Depends(require_roles(*ECRITURE))):
+    """Déclenche immédiatement une synchronisation complète Niveau 1 + Niveau 2
+    des portails GPS (MZoneX et CamtrackPro) et actualise le suivi."""
+    from ..scrapers import (
+        MZoneXApiCollector, _collecter_camtrackpro_n1,
+        synchroniser_trajets_valides, _mzonex_api_active
+    )
+    from ..api_wialon import jeton_configure
+    from ..engine import rattraper_ouvertures, auto_positions_horaires
+    
+    resultat = {
+        "mzonex_n1_points": 0,
+        "camtrackpro_n1_points": 0,
+        "n2_trajets": {},
+        "statut": "OK",
+        "erreurs": []
+    }
+    
+    # 1. Niveau 1 MZoneX
+    if _mzonex_api_active():
+        try:
+            resultat["mzonex_n1_points"] = MZoneXApiCollector().run()
+        except Exception as e:
+            resultat["erreurs"].append(f"MZoneX N1: {str(e)}")
+            log.warning("Sync GPS manuelle MZoneX N1 en échec : %s", e)
+            
+    # 2. Niveau 1 CamtrackPro
+    if jeton_configure():
+        try:
+            resultat["camtrackpro_n1_points"] = _collecter_camtrackpro_n1()
+        except Exception as e:
+            resultat["erreurs"].append(f"CamtrackPro N1: {str(e)}")
+            log.warning("Sync GPS manuelle CamtrackPro N1 en échec : %s", e)
+            
+    # 3. Niveau 2 (Trajets officiels MIXTE)
+    try:
+        resultat["n2_trajets"] = synchroniser_trajets_valides("MIXTE")
+    except Exception as e:
+        resultat["erreurs"].append(f"Niveau 2 Trajets: {str(e)}")
+        log.warning("Sync GPS manuelle N2 en échec : %s", e)
+        
+    # 4. Rattrapages
+    try:
+        rattraper_ouvertures()
+        auto_positions_horaires(db)
+    except Exception:
+        pass
+        
+    audit(db, user, "suivi.sync_gps_manuel", "suivi", str(now_local().date()), resultat)
+    return resultat
+
+
 # ============================== MISSIONS ==============================
 class MissionCreate(BaseModel):
     vehicule_id: str
