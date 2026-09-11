@@ -625,8 +625,10 @@ for r in (auth.router, referentiels.router, operations.router, surveillance.rout
 def sante(db: Session = Depends(get_db)):
     """Diagnostic de santé complet de l'instance Uvicorn en cours d'exécution."""
     try:
+        from .api_wialon import jeton_configure
         from .engine import retard_collecte_s
         from .models import EvenementGPS
+        from .scrapers import _mzonex_api_active
         now = now_local()
         retard_s = retard_collecte_s(db, now)
         dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
@@ -642,6 +644,8 @@ def sante(db: Session = Depends(get_db)):
             "mode_collecte": os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper(),
             "sim_enable": SIM_ENABLE,
             "wialon_session_partagee": os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1",
+            "wialon_token_present": jeton_configure(),
+            "mzonex_api_active": _mzonex_api_active(),
             "dernier_evenement_gps": dernier_ev.isoformat() if dernier_ev else None,
             "retard_collecte_min": round(retard_s / 60, 1) if retard_s is not None else None,
             "vehicules_actifs": nb_vehicules_actifs,

@@ -910,6 +910,14 @@ class CollectorBase:
                 if p.get("conducteur"):
                     creer_conducteur_auto(db, p["conducteur"])   # §0quater D2
                 vus[vehicule.id] = vehicule
+
+                # Garantie fraîcheur position : maintien du dernier état connu
+                if vehicule.last_event_at is None or p["horodatage"] >= vehicule.last_event_at:
+                    vehicule.last_lat, vehicule.last_lng = p["lat"], p["lng"]
+                    vehicule.last_vitesse = p["vitesse"]
+                    vehicule.last_event_at = p["horodatage"]
+                    vehicule.moteur_on = (p["moteur"] == "ON")
+
                 # anti-rejeu : même événement déjà collecté à la passe
                 # précédente → ignoré (collecte périodique idempotente)
                 deja = db.scalar(select(func.count(EvenementGPS.id)).where(
@@ -1564,13 +1572,16 @@ class MZoneXTrajetsApiCollector:
 
 
 def _collecter_mzonex_n1_avec_repli(classe_ecran) -> int:
-    """§0sexies A2 : API d'abord ; à TOUT échec, lecteur d'écran pour ce cycle."""
+    """§0sexies A2 : API d'abord ; à TOUT échec, tentative lecteur d'écran sans blocage."""
     try:
         return MZoneXApiCollector().run()
-    except Exception:
-        log.exception("MZoneX API indisponible — REPLI lecteur d'écran "
-                      "(§0sexies A2) pour ce cycle")
-        return classe_ecran().run()
+    except Exception as e:
+        log.warning("MZoneX API (Événements) indisponible (%s) — tentative repli écran", e)
+        try:
+            return classe_ecran().run()
+        except Exception as e_scr:
+            log.warning("MZoneX lecteur d'écran également indisponible (%s) — cycle reporté", e_scr)
+            return 0
 
 
 def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
