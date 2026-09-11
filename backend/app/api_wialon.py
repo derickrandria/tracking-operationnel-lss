@@ -51,18 +51,48 @@ _TIMEOUT = 60
 # réutiliser UNE session Wialon unique par le processus (plus d'invalidation de
 # session à chaque cycle — cause mesurée de la dégradation CamtrackPro du
 # 04/09/2026 : 2-15 pts/h au lieu de 150-220). Le portail web reste utilisable.
-SESSION_PARTAGEE = os.getenv("WIALON_SESSION_PARTAGEE", "0") == "1"
+SESSION_PARTAGEE = os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1"
 _sid_partage: dict = {"sid": None}
 NOM_RAPPORT = os.getenv("CAMTRACKPRO_API_RAPPORT_NOM", "Detail Trajet Vehicule")
 RESSOURCE_ID = os.getenv("CAMTRACKPRO_API_RESSOURCE_ID", "").strip()
 GABARIT_ID = os.getenv("CAMTRACKPRO_API_GABARIT_ID", "").strip()
-# colonnes du tableau « Detail Trajet » (validées en direct le 20/08/2026) :
+# colonnes du tableau « Detail Trajet » (détection dynamique avec repli par défaut) :
 # 0 Début · 1 Emplacement initial · 2 Fin · 3 Emplacement final ·
 # 4 Heures moteur · 5 Ralenti moteur · 6 En mouvement · 7 Distance parcourue ·
 # 8 Vitesse moyenne · 9 Vitesse max · 10 Durée depuis trajet · 11 Conducteur
 COL_DEBUT, COL_FIN, COL_DISTANCE, COL_CONDUCTEUR = 0, 2, 7, 11
-# §0septies B3 (20/08/2026) — carnet de conduite : ralenti moteur + vitesse max
 COL_RALENTI, COL_VMAX = 5, 9
+
+
+def detecter_colonnes_wialon(headers: list[str] | None = None) -> dict[str, int]:
+    """Détecte les index des colonnes à partir des libellés du gabarit Wialon.
+    Supporte les gabarits 9 colonnes (standard), 10, 11 ou 12 colonnes avec repli robuste."""
+    mapping = {
+        "debut": COL_DEBUT,
+        "fin": COL_FIN,
+        "distance": COL_DISTANCE,
+        "ralenti": COL_RALENTI,
+        "v_max": COL_VMAX,
+        "conducteur": COL_CONDUCTEUR,
+    }
+    if not headers:
+        return mapping
+
+    for i, h in enumerate(headers):
+        hl = (str(h) or "").strip().lower()
+        if "debut" in hl or "début" in hl or "start" in hl:
+            mapping["debut"] = i
+        elif "fin" in hl or "end" in hl:
+            mapping["fin"] = i
+        elif "distance" in hl or "km" in hl or "parcour" in hl:
+            mapping["distance"] = i
+        elif "ralenti" in hl or "idle" in hl:
+            mapping["ralenti"] = i
+        elif "max" in hl and ("vitesse" in hl or "speed" in hl or "v_max" in hl):
+            mapping["v_max"] = i
+        elif "conducteur" in hl or "driver" in hl or "chauffeur" in hl:
+            mapping["conducteur"] = i
+    return mapping
 
 
 class ErreurApiWialon(RuntimeError):
@@ -167,25 +197,60 @@ def _parse_duree(texte: str) -> int | None:
     return None
 
 
-def item_depuis_ligne_rapport(nom_unite: str, cellules: list) -> dict | None:
+def item_depuis_ligne_rapport(nom_unite: str, cellules: list, col_map: dict[str, int] | None = None) -> dict | None:
     """Ligne « Detail Trajet » Wialon → item du contrat réconciliation.
 
+    Supporte dynamiquement les gabarits Wialon à 9, 10, 11 ou 12 colonnes.
     §0septies B3 : la vitesse max et le ralenti moteur de la ligne officielle
-    accompagnent le conducteur (compteurs d'infractions détaillés : gabarits
-    5/17, extension ultérieure possible — §0septies B3 in fine)."""
+    accompagnent le conducteur lorsqu'ils sont disponibles."""
     plaque = plaque_unite(nom_unite)
-    if plaque is None or len(cellules) <= COL_CONDUCTEUR:
+    if plaque is None or not cellules or len(cellules) < 3:
         return None
-    debut = _parse_instant(cellules[COL_DEBUT])
+
+    col = col_map or {
+        "debut": COL_DEBUT,
+        "fin": COL_FIN,
+        "distance": COL_DISTANCE,
+        "ralenti": COL_RALENTI,
+        "v_max": COL_VMAX,
+        "conducteur": COL_CONDUCTEUR,
+    }
+    idx_deb = col.get("debut", COL_DEBUT)
+    idx_fin = col.get("fin", COL_FIN)
+    idx_dist = col.get("distance", COL_DISTANCE)
+    idx_ral = col.get("ralenti", COL_RALENTI)
+    idx_vmax = col.get("v_max", COL_VMAX)
+    idx_cond = col.get("conducteur", COL_CONDUCTEUR)
+
+    if idx_deb >= len(cellules):
+        return None
+    debut = _parse_instant(cellules[idx_deb])
     if debut is None:
         return None
-    return {"plaque": plaque, "debut": debut,
-            "fin": _parse_instant(cellules[COL_FIN]),
-            "distance_km": _parse_distance(_texte(cellules[COL_DISTANCE])),
-            "conducteur": (_texte(cellules[COL_CONDUCTEUR]).strip() or None),
-            "v_max": _parse_distance(_texte(cellules[COL_VMAX])),
-            "ralenti_s": _parse_duree(_texte(cellules[COL_RALENTI])),
-            "source": "CAMTRACKPRO"}
+
+    fin = _parse_instant(cellules[idx_fin]) if idx_fin < len(cellules) else None
+    dist_txt = _texte(cellules[idx_dist]) if idx_dist < len(cellules) else ""
+    distance_km = _parse_distance(dist_txt)
+
+    cond_txt = _texte(cellules[idx_cond]).strip() if idx_cond < len(cellules) else ""
+    conducteur = cond_txt or None
+
+    vmax_txt = _texte(cellules[idx_vmax]) if idx_vmax < len(cellules) else ""
+    v_max = _parse_distance(vmax_txt)
+
+    ral_txt = _texte(cellules[idx_ral]) if idx_ral < len(cellules) else ""
+    ralenti_s = _parse_duree(ral_txt)
+
+    return {
+        "plaque": plaque,
+        "debut": debut,
+        "fin": fin,
+        "distance_km": distance_km,
+        "conducteur": conducteur,
+        "v_max": v_max,
+        "ralenti_s": ralenti_s,
+        "source": "CAMTRACKPRO",
+    }
 
 
 class ApiWialon:
@@ -327,6 +392,8 @@ class ApiWialon:
                 tables = (r.get("reportResult") or {}).get("tables", [])
                 if not tables:
                     continue
+                headers = tables[0].get("header") or []
+                col_map = detecter_colonnes_wialon(headers)
                 n_lig = int(tables[0].get("rows") or 0)
                 if n_lig <= 0:
                     continue
@@ -335,7 +402,7 @@ class ApiWialon:
                 if not isinstance(lignes, list):
                     continue
                 bruts = [it for it in (
-                    item_depuis_ligne_rapport(nom, lig.get("c") or [])
+                    item_depuis_ligne_rapport(nom, lig.get("c") or [], col_map=col_map)
                     for lig in lignes) if it]
                 items.extend(bruts)
                 if bruts:

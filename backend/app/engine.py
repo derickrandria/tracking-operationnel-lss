@@ -129,7 +129,11 @@ def get_seuils(db) -> dict:
         return _cache_seuils["valeurs"]
     valeurs = {cle: v[0] for cle, v in SEUILS_DEFAUT.items()}
     for row in db.scalars(select(ParametrageSeuil)):
-        valeurs[row.cle] = row.valeur
+        val = row.valeur
+        # Sécurité d'unité : si un seuil de durée (ex: SEUIL_TCJ_MAX) a été saisi en heures (<= 24) au lieu de secondes
+        if row.type_valeur == "DUREE_S" and val is not None and 0 < val <= 24:
+            val = val * 3600
+        valeurs[row.cle] = val
     _cache_seuils.update(valeurs=valeurs, charge_le=now)
     return valeurs
 

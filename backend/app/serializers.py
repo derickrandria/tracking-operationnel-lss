@@ -312,9 +312,21 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
                                         FUSION_AFFICHAGE_S)),
         seuil_pause_aff_s=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC",
                                            PAUSE_AFFICHAGE_S)))
-    tcc_max = seuils.get("SEUIL_TCC_MAX", 16200)
-    tcj_max = seuils.get("SEUIL_TCJ_MAX", 36000)
-    ttj_max = seuils.get("SEUIL_TTJ_MAX", 43200)
+    tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+    if tcc_max <= 24:
+        tcc_max *= 3600
+    tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+    if tcj_max <= 24:
+        tcj_max *= 3600
+    ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+    if ttj_max <= 24:
+        ttj_max *= 3600
+
+    tcj_val = journee.tcj_s if (journee and journee.tcj_s is not None) else (s.tcj_s or 0)
+    ttj_val = journee.ttj_s if (journee and journee.ttj_s is not None) else (s.ttj_s or 0)
+    tcc_val = s.tcc_s or 0
+    pause_val = journee.total_pause_s if (journee and journee.total_pause_s is not None) else (s.total_pause_s or 0)
+
     return {
         "id": s.id,
         "date_jour": s.date_jour.isoformat(),
@@ -351,8 +363,8 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         # Addendum v1.9 §4.2 — colonne « Lieu Arrêt » : lieu du dernier arrêt
         # (journée en cours = dernière position connue ; figée à l'archivage)
         "lieu_arret": (s.vehicule.last_adresse if s.vehicule else None),
-        "tcc_s": s.tcc_s, "tcj_s": s.tcj_s, "ttj_s": s.ttj_s,
-        "total_pause_s": s.total_pause_s,
+        "tcc_s": tcc_val, "tcj_s": tcj_val, "ttj_s": ttj_val,
+        "total_pause_s": pause_val,
         "km_parcourus": round(s.km_parcourus or 0, 1),
         # v1.13 — CONTRAT GRILLE STRICT : la grille affiche les LIGNES de la
         # journée chaînée — écran = export = archive, une seule source.
@@ -362,9 +374,9 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         "nb_trajets": len(lignes_json),
         "mission_id": s.mission_id,
         # drapeaux de dépassement (pour coloration frontend)
-        "flag_tcc": bool(s.tcc_s and s.tcc_s > tcc_max),
-        "flag_tcj": bool(s.tcj_s and s.tcj_s > tcj_max),
-        "flag_ttj": bool(s.ttj_s and s.ttj_s > ttj_max),
+        "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
+        "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
+        "flag_ttj": bool(ttj_val and ttj_val > ttj_max),
         "updated_at": iso(s.updated_at),
     }
 
