@@ -146,7 +146,7 @@ def maj_utilisateur(uid: str, data: UserPatch, db: Session = Depends(get_db),
 
 
 @router.get("/diagnostic/portails")
-def diagnostic_connexions_portails(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+def diagnostic_connexions_portails(db: Session = Depends(get_db)):
     """Vérification en direct de la connectivité et de l'état des API MZoneX et CamtrackPro."""
     from ..api_mzonex import ApiMZoneX
     from ..api_wialon import ApiWialon, jeton_configure

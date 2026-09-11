@@ -661,6 +661,46 @@ def sante(db: Session = Depends(get_db)):
         }
 
 
+@app.get("/api/sante/portails")
+def sante_portails():
+    """Diagnostic direct et public de la connectivité API MZoneX et CamtrackPro."""
+    from .api_mzonex import ApiMZoneX
+    from .api_wialon import ApiWialon, jeton_configure
+
+    diag = {
+        "heure": now_local().isoformat(),
+        "mzonex": {"actif": False, "erreur": None, "flotte_recensee": 0, "token_ok": False},
+        "camtrackpro": {"actif": False, "erreur": None, "unites_trouvees": 0, "token_ok": False},
+    }
+
+    try:
+        mz = ApiMZoneX()
+        flotte = mz.recenser_flotte()
+        diag["mzonex"]["actif"] = True
+        diag["mzonex"]["token_ok"] = True
+        diag["mzonex"]["flotte_recensee"] = len(flotte)
+    except Exception as e:
+        diag["mzonex"]["erreur"] = f"{type(e).__name__}: {str(e)}"
+
+    try:
+        if jeton_configure():
+            api_w = ApiWialon()
+            try:
+                sid = api_w.connecter()
+                diag["camtrackpro"]["token_ok"] = bool(sid)
+                unites = api_w.unites()
+                diag["camtrackpro"]["actif"] = True
+                diag["camtrackpro"]["unites_trouvees"] = len(unites)
+            finally:
+                api_w.fermer()
+        else:
+            diag["camtrackpro"]["erreur"] = "CAMTRACKPRO_TOKEN absent ou non configuré dans .env"
+    except Exception as e:
+        diag["camtrackpro"]["erreur"] = f"{type(e).__name__}: {str(e)}"
+
+    return diag
+
+
 # ------------------------------------------------------------------ WebSocket (§9)
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
