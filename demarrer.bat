@@ -5,12 +5,14 @@ REM ============================================================
 chcp 65001 >nul
 cd /d "%~dp0"
 
-REM v1.10.1 — un ancien serveur reste parfois en route en arriere-plan :
-REM il garde le port 8000 et continue de servir l'ANCIENNE version meme
-REM apres mise a jour des fichiers. On le ferme proprement avant de partir.
-echo ==^> [0/4] Fermeture d'un eventuel ancien serveur (port 8000)...
-powershell -NoProfile -Command "try { Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction Stop; Write-Host ('   Ancien serveur arrete (PID ' + $_.OwningProcess + ')') } } catch { }"
-timeout /t 2 /nobreak >nul
+REM P0 — un seul serveur autorisé sur le port 8000. Arrêter l'ancien
+REM processus explicitement avant de relancer ce script.
+echo ==^> [0/4] Verification du port 8000...
+powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue; if ($c) { Write-Host ('ERREUR : port 8000 deja utilise par PID ' + $c[0].OwningProcess); exit 2 }"
+if errorlevel 1 (
+    echo Arretez le serveur existant avant de relancer demarrer.bat.
+    exit /b 2
+)
 
 echo ==^> [1/4] Verification de Python...
 python --version >nul 2>&1

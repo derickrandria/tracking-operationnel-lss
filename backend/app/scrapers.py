@@ -63,6 +63,7 @@ unités à 60 s (N1 CamtrackPro enfin possible, borne §5 levée par A4), rappor
 """
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -71,16 +72,112 @@ from sqlalchemy import func, select
 from .config import (normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
-from .engine import (creer_conducteur_auto, creer_vehicule_auto,
-                     ingest_event, verifier_alertes_conduite)
+from .engine import (cle_idempotence_evenement, creer_conducteur_auto,
+                     creer_vehicule_auto, ingest_event, verifier_alertes_conduite)
 from .geozones import charger_zones, en_geozone
-from .models import EvenementGPS, SourceEvenement, Vehicule
+from .models import (CollecteCheckpoint, EvenementGPS, SourceEvenement,
+                      TypeEvenement, Vehicule)
 from .api_mzonex import (ApiMZoneX, point_depuis_evenement_api,
                          trajet_depuis_api)
 from .api_wialon import (ApiWialon, jeton_configure,
                          point_depuis_position_wialon)
 
 log = logging.getLogger("lss.scraper")
+
+COLLECTE_LOCK = threading.Lock()
+_ETAT_COLLECTE_LOCK = threading.Lock()
+_ETAT_COLLECTE = {
+    "orchestrateur": "ASYNCIO",
+    "pid": os.getpid(),
+    "dernier_cycle_debut": None,
+    "dernier_cycle_fin": None,
+    "derniere_erreur": None,
+    "sources": {},
+}
+
+
+def _etat_collecte_debut(source: str):
+    with _ETAT_COLLECTE_LOCK:
+        instant = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_debut"] = instant
+        _ETAT_COLLECTE["sources"].setdefault(source, {})["dernier_debut"] = instant
+
+
+def _etat_collecte_fin(source: str, nombre: int):
+    with _ETAT_COLLECTE_LOCK:
+        instant = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_fin"] = instant
+        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
+            {"derniere_reussite": instant, "dernier_nombre": nombre,
+             "derniere_erreur": None})
+
+
+def _etat_collecte_erreur(source: str, exc: Exception):
+    with _ETAT_COLLECTE_LOCK:
+        erreur = f"{type(exc).__name__}: {exc}"
+        _ETAT_COLLECTE["derniere_erreur"] = erreur
+        _ETAT_COLLECTE["sources"].setdefault(source, {})["derniere_erreur"] = erreur
+
+
+def etat_collecte_memoire() -> dict:
+    with _ETAT_COLLECTE_LOCK:
+        return {
+            **_ETAT_COLLECTE,
+            "sources": {k: dict(v) for k, v in _ETAT_COLLECTE["sources"].items()},
+            "verrou_occupe": COLLECTE_LOCK.locked(),
+        }
+
+
+def _collecte_protegee(source: str, action) -> int:
+    """Exécute une passe de source sans chevauchement dans le processus."""
+    if not COLLECTE_LOCK.acquire(blocking=False):
+        log.warning("Collecte %s ignorée : une autre passe est en cours", source)
+        return 0
+    _etat_collecte_debut(source)
+    try:
+        nombre = int(action() or 0)
+        _etat_collecte_fin(source, nombre)
+        return nombre
+    except Exception as exc:
+        _etat_collecte_erreur(source, exc)
+        log.exception("Échec collecte protégée %s", source)
+        return 0
+    finally:
+        COLLECTE_LOCK.release()
+
+
+def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str:
+    db = SessionLocal()
+    try:
+        cp = db.scalar(select(CollecteCheckpoint).where(
+            CollecteCheckpoint.source == source,
+            CollecteCheckpoint.fenetre_debut == debut,
+            CollecteCheckpoint.fenetre_fin == fin))
+        if cp is None:
+            cp = CollecteCheckpoint(source=source, fenetre_debut=debut,
+                                   fenetre_fin=fin, statut="EN_COURS",
+                                   tentatives=1)
+            db.add(cp)
+        else:
+            cp.statut = "EN_COURS"
+            cp.tentatives = (cp.tentatives or 0) + 1
+            cp.derniere_erreur = None
+        db.commit()
+        return cp.id
+    finally:
+        db.close()
+
+
+def _checkpoint_ferme(checkpoint_id: str, statut: str, erreur: str | None = None):
+    db = SessionLocal()
+    try:
+        cp = db.get(CollecteCheckpoint, checkpoint_id)
+        if cp is not None:
+            cp.statut = statut
+            cp.derniere_erreur = erreur
+            db.commit()
+    finally:
+        db.close()
 
 
 def _mzonex_api_active() -> bool:
@@ -882,7 +979,7 @@ class CollectorBase:
         propres.sort(key=lambda p: p["horodatage"])   # rejeu chronologique
         return propres
 
-    def inserer(self, points: list[dict]) -> int:
+    def inserer(self, points: list[dict], historique: bool = False) -> int:
         db = SessionLocal()
         inseres = 0
         try:
@@ -910,6 +1007,14 @@ class CollectorBase:
                 if p.get("conducteur"):
                     creer_conducteur_auto(db, p["conducteur"])   # §0quater D2
                 vus[vehicule.id] = vehicule
+
+                # Garantie fraîcheur position : maintien du dernier état connu
+                if vehicule.last_event_at is None or p["horodatage"] >= vehicule.last_event_at:
+                    vehicule.last_lat, vehicule.last_lng = p["lat"], p["lng"]
+                    vehicule.last_vitesse = p["vitesse"]
+                    vehicule.last_event_at = p["horodatage"]
+                    vehicule.moteur_on = (p["moteur"] == "ON")
+
                 # anti-rejeu : même événement déjà collecté à la passe
                 # précédente → ignoré (collecte périodique idempotente)
                 deja = db.scalar(select(func.count(EvenementGPS.id)).where(
@@ -918,6 +1023,22 @@ class CollectorBase:
                     EvenementGPS.type_evenement == p.get("type_evenement")
                     if p.get("type_evenement") else True)) or 0
                 if deja:
+                    continue
+                if historique:
+                    cle = cle_idempotence_evenement(
+                        vehicule.id, p["horodatage"], p["lat"], p["lng"], self.source)
+                    if db.scalar(select(EvenementGPS.id).where(
+                            EvenementGPS.idempotence_key == cle)):
+                        continue
+                    db.add(EvenementGPS(
+                        vehicule_id=vehicule.id, horodatage=p["horodatage"],
+                        latitude=p["lat"], longitude=p["lng"],
+                        adresse=p.get("adresse"), vitesse=p["vitesse"],
+                        etat_moteur=p["moteur"],
+                        type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
+                        source=self.source, idempotence_key=cle,
+                        received_at=now_local(), historique=True))
+                    inseres += 1
                     continue
                 ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
                              p.get("adresse"), p["vitesse"], p["moteur"],
@@ -945,7 +1066,11 @@ class CollectorBase:
             # chaque passe (idempotent).
             inseres += _reparer_debuts_sans_trajet(db, list(vus.values()),
                                                    self.source)
+            db.commit()
             return inseres
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
@@ -1513,17 +1638,33 @@ class MZoneXApiCollector(CollectorBase):
             db.close()
         maintenant = now_local()
         debut_utc, fin_utc = self.api.fenetre_incrementale(derniere, maintenant)
-        lignes = self.api.evenements(debut_utc, fin_utc)
+        checkpoint_id = _checkpoint_ouvre("MZONEX_N1", debut_utc, fin_utc)
+        try:
+            lignes = self.api.evenements(debut_utc, fin_utc)
+        except Exception as exc:
+            _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+            raise
+        _checkpoint_ferme(checkpoint_id, "TERMINE")
         log.info("MZoneX API (Événements) : %d événement(s), fenêtre %s → %s UTC",
                  len(lignes), debut_utc.strftime("%H:%M:%S"),
                  fin_utc.strftime("%H:%M:%S"))
         return lignes
 
     def normaliser(self, brut: list[dict]) -> list[dict]:
-        points = [p for p in (point_depuis_evenement_api(v) for v in brut)
+        map_vehs = {}
+        try:
+            map_vehs = self.api.map_vehicules()
+        except Exception:
+            pass
+        points = [p for p in (point_depuis_evenement_api(v, map_vehicules=map_vehs) for v in brut)
                   if p is not None]
+        try:
+            derniers = self.api.dernieres_positions()
+            points.extend(derniers)
+        except Exception:
+            pass
         nq = len(brut) - len(points)
-        if nq:
+        if nq > 0:
             log.info("MZoneX API (Événements) : %d ligne(s) sans plaque/GPS "
                      "exploitable (%d conservée(s))", nq, len(points))
         return super().normaliser(points)
@@ -1550,10 +1691,15 @@ class MZoneXTrajetsApiCollector:
         if not jours:
             jours = [now_local().date()]
         self.recensement = self.api.recenser_flotte()
+        map_vehs = {}
+        try:
+            map_vehs = self.api.map_vehicules()
+        except Exception:
+            pass
         items: list[dict] = []
         for jour in sorted(set(jours)):
             bruts = self.api.trajets_jour_local(jour)
-            items.extend(it for it in (trajet_depuis_api(t) for t in bruts)
+            items.extend(it for it in (trajet_depuis_api(t, map_vehicules=map_vehs) for t in bruts)
                          if it)
             log.info("MZoneX API (Trajets) : %d ligne(s) API du %s",
                      len(bruts), jour.isoformat())
@@ -1564,28 +1710,33 @@ class MZoneXTrajetsApiCollector:
 
 
 def _collecter_mzonex_n1_avec_repli(classe_ecran) -> int:
-    """§0sexies A2 : API d'abord ; à TOUT échec, lecteur d'écran pour ce cycle."""
+    """§0sexies A2 : API d'abord ; repli écran uniquement si activé."""
     try:
         return MZoneXApiCollector().run()
-    except Exception:
-        log.exception("MZoneX API indisponible — REPLI lecteur d'écran "
-                      "(§0sexies A2) pour ce cycle")
-        return classe_ecran().run()
+    except Exception as e:
+        log.warning("MZoneX API (Événements) indisponible (%s)", e)
+        if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
+            try:
+                return classe_ecran().run()
+            except Exception as e_scr:
+                log.warning("MZoneX lecteur d'écran également indisponible (%s) — cycle reporté", e_scr)
+        return 0
 
 
 def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
-    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran sur échec.
-    §0nonies decies M1 : relit `jours` via l'API (le repli écran, jour courant
-    seul, est historiquement inchangé)."""
+    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran si demandé."""
     if _mzonex_api_active():
         try:
             c = MZoneXTrajetsApiCollector()
             return c.collecter_valides(jours), list(c.recensement or [])
         except Exception:
-            log.exception("MZoneX API (Trajets) en échec — REPLI lecteur "
-                          "d'écran (§0sexies A2) pour ce cycle (jour courant)")
-    c = MZoneXTrajetsCollector()
-    return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+            log.exception("MZoneX API (Trajets) en échec")
+            if os.getenv("MZONEX_REPLI_ECRAN", "0") != "1":
+                return [], []
+    if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
+        c = MZoneXTrajetsCollector()
+        return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+    return [], []
 
 
 class CamtrackProApiCollector(CollectorBase):
@@ -1723,6 +1874,16 @@ VALIDATEURS_TRAJETS = {
 
 
 def synchroniser_trajets_valides(source: str | None = None) -> dict:
+    if not COLLECTE_LOCK.acquire(blocking=False):
+        log.warning("Synchronisation Niveau 2 ignorée : une collecte est déjà en cours")
+        return {"occupee": True}
+    try:
+        return _synchroniser_trajets_valides(source)
+    finally:
+        COLLECTE_LOCK.release()
+
+
+def _synchroniser_trajets_valides(source: str | None = None) -> dict:
     """Addendum v1.4 §2.4 — Collecte l'onglet Trajets / rapport trajets de la
     plateforme `source` puis réconcilie (remplacement PROVISOIRE → VALIDÉ,
     recalcul TCC/TCJ/TTJ, propagation §9, audits §11).
@@ -1905,12 +2066,107 @@ def synchroniser_trajets_valides(source: str | None = None) -> dict:
     return totaux
 
 
+# ═══════════ Correctif v1.46 — RELECTURE N1 (Événements MZoneX) ═══════════
+# Constats du 04/09/2026 : (a) le plafond de pagination tronquait silencieusement
+# des fenêtres larges ; (b) toute panne de collecte > 3 h était PERDUE à jamais
+# (fenêtre incrémentale FENETRE_MAX_S) ; (c) la relecture M1 ne couvre que les
+# TRAJETS (N2), jamais les ÉVÉNEMENTS (N1). Or le fil « Events » de l'API OData
+# est rejouable à la demande, et l'anti-rejeu de CollectorBase.inserer rend le
+# rejeu IDOMPOTENT (zéro doublon). On rejoue donc les J derniers jours en
+# tranches horaires (le découpage v1.46 d'evenements() garantit < 9 000/tranche).
+RELECTURE_N1_ACTIVE = os.getenv("RELECTURE_N1_ACTIVE", "1") == "1"
+RELECTURE_N1_JOURS = int(os.getenv("RELECTURE_N1_JOURS", "7"))
+RELECTURE_N1_PERIODE_S = int(os.getenv("RELECTURE_N1_PERIODE_S", "3600"))
+_relecture_n1_memo: dict = {"mono": 0.0}
+
+
+def _fenetres_manquantes_mzonex(db, jours: int, maintenant: datetime) -> list[tuple]:
+    """Détecte les TROUS de la base MZoneX : fenêtres locales [debut, fin]
+    (bornées 04h00 → 23h30, hors nuit — le serveur est éteint le soir, §8)
+    sans aucun événement pendant > FENETRE_MAX_S. Ciblé : on ne relit
+    QUE ce qui manque, jamais des journées complètes déjà en base (leçon du
+    04/09 : la relecture intégrale de 8 jours ~200 000 points sature le GIL
+    et fige le serveur). Une journée ENTIÈREMENT vide (ex. 30/08/2026) donne
+    une seule fenêtre couvrant le jour → rattrapée elle aussi."""
+    from .api_mzonex import FENETRE_MAX_S
+    fenetres: list[tuple[datetime, datetime]] = []
+    for k in range(jours, -1, -1):
+        jour = maintenant.date() - timedelta(days=k)
+        debut_j = max(datetime.combine(jour, datetime.min.time()).replace(hour=4),
+                      datetime.combine(jour, datetime.min.time()))
+        fin_j = min(datetime.combine(jour, datetime.min.time()).replace(hour=23, minute=30),
+                    maintenant)
+        if fin_j <= debut_j:
+            continue
+        hords = db.scalars(select(EvenementGPS.horodatage).where(
+            EvenementGPS.source == SourceEvenement.MZONEX,
+            EvenementGPS.horodatage >= debut_j,
+            EvenementGPS.horodatage < fin_j).order_by(
+                EvenementGPS.horodatage)).all()
+        prev = debut_j
+        for h in hords:
+            if (h - prev).total_seconds() > FENETRE_MAX_S:
+                fenetres.append((prev, h))
+            prev = max(prev, h)
+        # trou de queue : jour passé clos à 23h30 → la fenêtre 23h30→minuit
+        # n'est pas chassée ; jour courant → rattrape jusqu'à maintenant
+        if (fin_j - prev).total_seconds() > FENETRE_MAX_S:
+            fin_t = fin_j if k == 0 else min(fin_j, prev + timedelta(days=1))
+            fenetres.append((prev, fin_t))
+    return fenetres
+
+
+def relecture_n1_mzonex(jours: int | None = None) -> int:
+    """Rattrape les TROUS de la base en rejouant les Événements MZoneX des
+    fenêtres manquantes uniquement (J-7 → J, découpage horaire v1.46) et les
+    insère par le MÊME pipeline. Idempotent (anti-rejeu : zéro doublon).
+    Retourne le nombre de points insérés. Jamais d'exception propagée (§10)."""
+    if not RELECTURE_N1_ACTIVE or not _mzonex_api_active():
+        return 0
+    jours = RELECTURE_N1_JOURS if jours is None else max(0, jours)
+    maintenant = now_local()
+    db = SessionLocal()
+    try:
+        fenetres = _fenetres_manquantes_mzonex(db, jours, maintenant)
+    finally:
+        db.close()
+    if not fenetres:
+        return 0
+    coll = MZoneXApiCollector()
+    total = 0
+    try:
+        for debut_local, fin_local in fenetres:
+            debut_utc = coll.api._utc_naive(debut_local)
+            fin_utc = coll.api._utc_naive(fin_local)
+            checkpoint_id = _checkpoint_ouvre("MZONEX_N1_RELECTURE",
+                                              debut_utc, fin_utc)
+            try:
+                brut = coll.api.evenements(debut_utc, fin_utc)
+            except Exception as exc:
+                _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+                raise
+            points = coll.normaliser(brut)
+            n = 0
+            if points:
+                n = coll.inserer(points, historique=True)
+                total += n
+            _checkpoint_ferme(checkpoint_id, "TERMINE")
+            log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
+                     "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
+                     fin_local.strftime("%H:%M"), len(brut), n)
+            time.sleep(0.5)   # laisser respirer la boucle d'événements (GIL)
+    except Exception:
+        log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
+                      "passage)")
+    return total
+
+
 def boucle_collecte():
     """Collecte planifiée Niveau 1 en continu (période COLLECTOR_PERIODE_S, §10).
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
     borne §5 : pas de flux temps réel fiable côté Camtrack)."""
     source = os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper()
-    periode = _env_int("COLLECTOR_PERIODE_S", 420)
+    periode = _env_int("COLLECTOR_PERIODE_S", 10)
     noms = SOURCES_NIVEAU1_MIXTE if source == "MIXTE" else [source]
     classes = [(nom, SOURCES.get(nom)) for nom in noms]
     classes = [(nom, c) for nom, c in classes if c is not None]
@@ -1944,23 +2200,34 @@ def boucle_collecte():
         except Exception:
             pass
         for nom, classe in classes:
-            try:
-                if nom == "MZONEX" and _mzonex_api_active():
-                    n = _collecter_mzonex_n1_avec_repli(classe)
-                else:
-                    n = classe().run()
-                log.info("Collecte %s : %d points insérés", nom, n)
-            except Exception:
-                # gestion des pannes : journalisation, pas de plantage (§10)
-                log.exception("Échec collecte %s", nom)
+            n = _collecte_protegee(
+                nom,
+                (lambda c=classe: _collecter_mzonex_n1_avec_repli(c)
+                 if nom == "MZONEX" and _mzonex_api_active()
+                 else c().run()))
+            log.info("Collecte %s : %d points insérés", nom, n)
         # §0sexies A4 (arbitrage 20/08/2026) — N1 CamtrackPro via l'API Wialon
         # à la même cadence (dernier message par unité ; échec → cycle reporté,
         # aucun flux écran fiable §5)
-        if jeton_configure():
-            n_ctp = _collecter_camtrackpro_n1()
+        if source != "CAMTRACKPRO" and jeton_configure():
+            n_ctp = _collecte_protegee("CAMTRACKPRO", _collecter_camtrackpro_n1)
             if n_ctp:
                 log.info("Collecte CAMTRACKPRO (API) : %d points insérés",
                          n_ctp)
+        # Correctif v1.46 — relecture N1 (Événements MZoneX) : au démarrage puis
+        # toutes les RELECTURE_N1_PERIODE_S (défaut 1 h) — rattrape les trous
+        # > 3 h laissés par une panne de collecte (idempotent, anti-rejeu).
+        mono_n1 = time.monotonic()
+        if (_relecture_n1_memo["mono"] == 0.0
+                or mono_n1 - _relecture_n1_memo["mono"] >= RELECTURE_N1_PERIODE_S):
+            _relecture_n1_memo["mono"] = mono_n1
+            try:
+                n_n1 = _collecte_protegee("MZONEX_RELECTURE", relecture_n1_mzonex)
+                if n_n1:
+                    log.info("Relecture N1 (Événements MZoneX, %d jours) : "
+                             "%d point(s) rattrapé(s)", RELECTURE_N1_JOURS, n_n1)
+            except Exception:
+                log.exception("Relecture N1 MZoneX — échec (retraité)")
         # §0quater R2 (arbitrage 14/08/2026) — jamais un camion en route sans
         # ligne : (ré)ouverture des lignes manquantes d'après le dernier signal
         try:

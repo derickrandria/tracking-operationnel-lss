@@ -10,14 +10,17 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import CORS_ORIGINS, FRONTEND_DIST, SIM_ENABLE, SIM_TICK_S, now_local
-from .database import SessionLocal
+from .database import SessionLocal, get_db
+from .models import StatutVehicule, Vehicule
 from . import daily, engine, event_bus, seed
 from .security import decode_token
 
@@ -79,7 +82,7 @@ async def _boucle_collecteur_reel():
         log.warning("SIMULATEUR et COLLECTEUR %s actifs ensemble — "
                     "mettez SIM_ENABLE=0 pour la production réelle", source)
     log.info("Collecteur réel %s activé (période %ss)",
-             source, os.getenv("COLLECTOR_PERIODE_S", "60"))
+             source, os.getenv("COLLECTOR_PERIODE_S", "10"))
     await asyncio.to_thread(boucle_collecte)
 
 
@@ -88,16 +91,47 @@ def migrer_schema():
     """Migrations additives sans Alembic (base démo SQLite / prod PostgreSQL) :
     colonnes ajoutées par les addendums sur une base EXISTANTE. `create_all`
     (seed) suffit pour une base neuve ; ici on complète les bases déjà livrées."""
+    import hashlib
     from sqlalchemy import inspect, text
     from .database import engine as _engine
     from .seed import VEHICULES_CAMTRACKPRO
     insp = inspect(_engine)
     tables = set(insp.get_table_names())
-    if "trajets" not in tables or "vehicules" not in tables:
+    required_tables = {"trajets", "vehicules", "suivi_journalier", "infractions", "conducteurs"}
+    if not required_tables.issubset(tables):
         return
     cols_t = {c["name"] for c in insp.get_columns("trajets")}
     cols_v = {c["name"] for c in insp.get_columns("vehicules")}
     with _engine.begin() as cx:
+        # SQLite ne peut pas réfléchir via une seconde connexion pendant que
+        # cette transaction détient le verrou d'écriture.
+        insp_cx = inspect(cx)
+        # P1 — événement brut : heure de réception distincte de l'heure GPS,
+        # mode historique explicite et clé d'idempotence imposée par SQL.
+        if "evenements_gps" in tables:
+            cols_e = {c["name"] for c in insp_cx.get_columns("evenements_gps")}
+            if "idempotence_key" not in cols_e:
+                cx.execute(text("ALTER TABLE evenements_gps ADD COLUMN idempotence_key VARCHAR(128)"))
+            if "received_at" not in cols_e:
+                cx.execute(text("ALTER TABLE evenements_gps ADD COLUMN received_at DATETIME"))
+                cx.execute(text("UPDATE evenements_gps SET received_at = created_at "
+                                "WHERE received_at IS NULL"))
+            if "historique" not in cols_e:
+                cx.execute(text("ALTER TABLE evenements_gps ADD COLUMN historique BOOLEAN DEFAULT 0"))
+            rows = cx.execute(text(
+                "SELECT id, vehicule_id, horodatage, latitude, longitude, source "
+                "FROM evenements_gps ORDER BY created_at, id")).mappings()
+            vus = set()
+            for row in rows:
+                brut = "|".join(str(row.get(c) or "") for c in (
+                    "vehicule_id", "horodatage", "latitude", "longitude", "source"))
+                cle = hashlib.sha256(brut.encode("utf-8")).hexdigest()
+                valeur = cle if cle not in vus else None
+                vus.add(cle)
+                cx.execute(text("UPDATE evenements_gps SET idempotence_key = :cle "
+                                "WHERE id = :id"), {"cle": valeur, "id": row["id"]})
+            cx.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS "
+                            "ux_evenement_idempotence ON evenements_gps (idempotence_key)"))
         # Addendum v1.4 §3.1 (table trajets)
         if "statut_source" not in cols_t:
             cx.execute(text("ALTER TABLE trajets ADD COLUMN statut_source VARCHAR(40)"))
@@ -127,7 +161,7 @@ def migrer_schema():
             if col not in cols_t:
                 cx.execute(text(f"ALTER TABLE trajets ADD COLUMN {col} {typ}"))
                 log.info("Migration : trajets.%s ajouté (§0septies)", col)
-        cols_s = {c["name"] for c in insp.get_columns("suivi_journalier")}
+        cols_s = {c["name"] for c in insp_cx.get_columns("suivi_journalier")}
         if "conducteur_origine" not in cols_s:
             cx.execute(text("ALTER TABLE suivi_journalier ADD COLUMN conducteur_origine VARCHAR(10)"))
             log.info("Migration : suivi_journalier.conducteur_origine ajouté (§0septies)")
@@ -138,13 +172,42 @@ def migrer_schema():
         if "position_22h" not in cols_s:
             cx.execute(text("ALTER TABLE suivi_journalier ADD COLUMN position_22h VARCHAR(200)"))
             log.info("Migration v1.44 : suivi_journalier.position_22h ajouté (§0vicies decies N2)")
+
+        # Migration automatique et exhaustive de la table missions
+        if "missions" in tables:
+            cols_m = {c["name"] for c in insp_cx.get_columns("missions")}
+            cols_missions_ajouts = [
+                ("code_mission", "VARCHAR(50)"),
+                ("statut_camion_actuel", "VARCHAR(20) DEFAULT 'VIDE'"),
+                ("heure_chargement", "DATETIME"),
+                ("depot_prevu", "VARCHAR(50)"),
+                ("depot_effectif", "VARCHAR(50)"),
+                ("est_deviee", "BOOLEAN DEFAULT 0"),
+                ("motif_deviation", "VARCHAR(200)"),
+                ("validation_chargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+                ("validation_dechargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+                ("motif_invalidation", "VARCHAR(200)"),
+                ("est_repositionnement", "BOOLEAN DEFAULT 0"),
+                ("distributeur", "VARCHAR(30)"),
+                ("km_vide", "FLOAT DEFAULT 0.0"),
+                ("km_charge", "FLOAT DEFAULT 0.0"),
+                ("kilometrage_total", "FLOAT DEFAULT 0.0"),
+                ("origine", "VARCHAR(200)"),
+                ("etapes", "TEXT"),
+                ("created_at", "DATETIME"),
+                ("updated_at", "DATETIME"),
+            ]
+            for col, typ in cols_missions_ajouts:
+                if col not in cols_m:
+                    cx.execute(text(f"ALTER TABLE missions ADD COLUMN {col} {typ}"))
+                    log.info("Migration table missions : colonne %s ajoutée", col)
         # v3 AM-5 / C3 (22/08/2026) : vitre Infractions = lecture externe seule
-        cols_i = {c["name"] for c in insp.get_columns("infractions")}
+        cols_i = {c["name"] for c in insp_cx.get_columns("infractions")}
         if "exterieure" not in cols_i:
             cx.execute(text(
                 "ALTER TABLE infractions ADD COLUMN exterieure BOOLEAN DEFAULT 0"))
             log.info("Migration : infractions.exterieure ajouté (§0nonies AM-5)")
-        cols_i = {c["name"] for c in insp.get_columns("infractions")}
+        cols_i = {c["name"] for c in insp_cx.get_columns("infractions")}
         # §0quinquies decies I1→I4 (25/08/2026) — source Ym@ne + validation
         # + I5 exécution (26/08/2026, v1.36) : seuil_texte (verbatim du portail)
         for col, typ in (("niveau", "VARCHAR(20)"), ("nom_ymane", "VARCHAR(160)"),
@@ -163,7 +226,7 @@ def migrer_schema():
         # §0octies decies L2 (27/08/2026, v1.41) — période de l'infraction
         # (enddatetime verbatim Ym@ne) ; les lignes existantes sont
         # rattrapées seules par l'upsert I5 à la prochaine relecture J-8→J.
-        cols_i = {c["name"] for c in insp.get_columns("infractions")}
+        cols_i = {c["name"] for c in insp_cx.get_columns("infractions")}
         for col, typ in (("date_fin", "DATE"), ("heure_fin", "TIME")):
             if col not in cols_i:
                 cx.execute(text(f"ALTER TABLE infractions ADD COLUMN {col} {typ}"))
@@ -171,7 +234,8 @@ def migrer_schema():
         # §0sexies decies J1 (27/08/2026) : forme canonique anti-doublon
         # chauffeur. L'index UNIQUE est volontairement posé PLUS TARD, par la
         # réparation v1.38 (§J3), une fois les doublons hérités résorbés.
-        cols_c = {c["name"] for c in insp.get_columns("conducteurs")}
+        cols_c_raw = {c["name"]: c for c in insp_cx.get_columns("conducteurs")}
+        cols_c = set(cols_c_raw.keys())
         if "nom_normalise" not in cols_c:
             cx.execute(text(
                 "ALTER TABLE conducteurs ADD COLUMN nom_normalise VARCHAR(170)"))
@@ -179,6 +243,86 @@ def migrer_schema():
                      "(§0sexies decies J1)")
         cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_nom_normalise "
                         "ON conducteurs (nom_normalise)"))
+        if "tokens_set" not in cols_c:
+            cx.execute(text(
+                "ALTER TABLE conducteurs ADD COLUMN tokens_set VARCHAR(170)"))
+            log.info("Migration : conducteurs.tokens_set ajouté")
+        cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_tokens_set "
+                        "ON conducteurs (tokens_set)"))
+        if "code_badge_mzonex" not in cols_c:
+            cx.execute(text(
+                "ALTER TABLE conducteurs ADD COLUMN code_badge_mzonex INTEGER"))
+            log.info("Migration : conducteurs.code_badge_mzonex ajouté")
+        cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_code_badge_mzonex "
+                        "ON conducteurs (code_badge_mzonex)"))
+
+        # Rendre conducteurs.matricule nullable sous SQLite si créé avec contrainte NOT NULL héritée
+        if cols_c_raw.get("matricule", {}).get("nullable") is False:
+            try:
+                cx.execute(text("PRAGMA foreign_keys=OFF"))
+                cx.execute(text("""
+                    CREATE TABLE IF NOT EXISTS conducteurs_migr_tmp (
+                        id VARCHAR(36) PRIMARY KEY,
+                        nom_prenom VARCHAR(160) NOT NULL,
+                        code_badge_mzonex INTEGER,
+                        prenom_usuel VARCHAR(60) NOT NULL,
+                        matricule VARCHAR(40),
+                        telephone VARCHAR(40),
+                        statut VARCHAR(30) DEFAULT 'ACTIF',
+                        date_creation DATETIME,
+                        nom_normalise VARCHAR(170),
+                        tokens_set VARCHAR(170)
+                    )
+                """))
+                champs_sel = [
+                    "id", "nom_prenom",
+                    "code_badge_mzonex" if "code_badge_mzonex" in cols_c else "NULL AS code_badge_mzonex",
+                    "prenom_usuel",
+                    "CASE WHEN matricule LIKE 'CH%' OR matricule LIKE 'AUTO-%' THEN NULL ELSE matricule END AS matricule",
+                    "telephone" if "telephone" in cols_c else "NULL AS telephone",
+                    "statut" if "statut" in cols_c else "'ACTIF' AS statut",
+                    "date_creation" if "date_creation" in cols_c else "CURRENT_TIMESTAMP AS date_creation",
+                    "nom_normalise" if "nom_normalise" in cols_c else "NULL AS nom_normalise",
+                    "tokens_set" if "tokens_set" in cols_c else "NULL AS tokens_set"
+                ]
+                cx.execute(text(f"""
+                    INSERT INTO conducteurs_migr_tmp (id, nom_prenom, code_badge_mzonex, prenom_usuel, matricule, telephone, statut, date_creation, nom_normalise, tokens_set)
+                    SELECT {', '.join(champs_sel)} FROM conducteurs
+                """))
+                cx.execute(text("DROP TABLE conducteurs"))
+                cx.execute(text("ALTER TABLE conducteurs_migr_tmp RENAME TO conducteurs"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_nom_prenom ON conducteurs (nom_prenom)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_prenom_usuel ON conducteurs (prenom_usuel)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_matricule ON conducteurs (matricule)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_nom_normalise ON conducteurs (nom_normalise)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_tokens_set ON conducteurs (tokens_set)"))
+                cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteurs_code_badge_mzonex ON conducteurs (code_badge_mzonex)"))
+                cx.execute(text("PRAGMA foreign_keys=ON"))
+                log.info("Migration SQLite : conducteurs.matricule converti en NULLABLE avec succès")
+            except Exception as e:
+                log.warning("Impossible de convertir conducteurs.matricule en nullable : %s", e)
+
+        # Table conducteur_aliases
+        cx.execute(text("""
+            CREATE TABLE IF NOT EXISTS conducteur_aliases (
+                id VARCHAR(36) PRIMARY KEY,
+                conducteur_id VARCHAR(36) NOT NULL REFERENCES conducteurs(id) ON DELETE CASCADE,
+                alias_brut VARCHAR(160) NOT NULL,
+                alias_normalise VARCHAR(170) NOT NULL UNIQUE,
+                source VARCHAR(30) DEFAULT 'MANUEL',
+                date_creation DATETIME
+            )
+        """))
+        cx.execute(text("CREATE INDEX IF NOT EXISTS ix_conducteur_aliases_conducteur_id "
+                        "ON conducteur_aliases (conducteur_id)"))
+        cx.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_conducteur_aliases_normalise "
+                        "ON conducteur_aliases (alias_normalise)"))
+        # Purge des préfixes hérités 'CH...' ou 'AUTO-...' : seuls les driverKeyCode MZoneX sont conservés
+        try:
+            cx.execute(text("UPDATE conducteurs SET matricule = NULL WHERE matricule LIKE 'CH%' OR matricule LIKE 'AUTO-%'"))
+            cx.execute(text("UPDATE conducteurs SET matricule = CAST(code_badge_mzonex AS TEXT) WHERE code_badge_mzonex IS NOT NULL AND (matricule IS NULL OR matricule = '')"))
+        except Exception as e:
+            log.warning("Avertissement purge matricules: %s", e)
         # §0decies (24/08/2026) : marqueur segment B d'un trajet franchissant
         # minuit (revérification portail sans faux « sans source »)
         if "suite_minuit" not in cols_t:
@@ -393,6 +537,17 @@ async def _am4_puis_reparation_v130():
         log.exception("§0sexies decies J1-J4 : réparation dédoublonnage "
                       "chauffeurs v1.38 en échec — reprise au prochain "
                       "démarrage")
+    try:
+        await asyncio.to_thread(reparation.reparer_historique_conducteurs_passes)
+    except Exception:
+        log.exception("Réparation historique conducteurs passés en échec")
+    try:
+        # v146 — garde d'intégrité des heures de fin (fin < début → « en
+        # cours » / jumeau REJETÉ). Idempotente, exécutée à CHAQUE démarrage.
+        await asyncio.to_thread(reparation.reparer_fins_incoherentes)
+    except Exception:
+        log.exception("v146 : réparation fins incohérentes en échec — reprise "
+                      "au prochain démarrage")
 
 
 def _rattrapage_j1():
@@ -405,6 +560,13 @@ def _rattrapage_j1():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if os.getenv("TESTING") == "1":
+        # Mode Test : initialisation base minimale, sans boucles réseau d'arrière-plan
+        seed.seed_si_vide()
+        migrer_schema()
+        yield
+        return
+
     log.info("Démarrage — initialisation base + seed")
     seed.seed_si_vide()
     migrer_schema()
@@ -420,6 +582,24 @@ async def lifespan(app: FastAPI):
                       "démarrage")
     reparer_identifiants()
     reparer_conducteurs_non_personnes()    # §0quinquies D5 (14/08/2026)
+    try:
+        from . import reparation
+        reparation.migrer_schema_missions()
+        reparation.reparer_historique_conducteurs_passes()
+    except Exception:
+        log.exception("Réparation initiale historique / missions en échec")
+    
+    # Réconciliation et persistance des alertes missions non traitées des jours passés
+    try:
+        db_a = SessionLocal()
+        try:
+            reparation.reinitialiser_donnees_missions(db_a)
+            reparation.nettoyer_alertes_missions_invalides(db_a)
+        finally:
+            db_a.close()
+    except Exception:
+        log.exception("Réconciliation des alertes missions au démarrage en échec")
+
     daily.rattraper_au_demarrage()
     event_bus.attacher_boucle(asyncio.get_running_loop())
 
@@ -463,17 +643,144 @@ app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS,
                    allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # ------------------------------------------------------------------ routeurs API
-from .routers import admin, auth, conduite, dashboard, historique, operations, referentiels, surveillance
+from .routers import admin, auth, conduite, dashboard, historique, operations, referentiels, surveillance, temps_conduite
 
 for r in (auth.router, referentiels.router, operations.router, surveillance.router,
-          dashboard.router, historique.router, admin.router, conduite.router):
+          dashboard.router, historique.router, admin.router, conduite.router,
+          temps_conduite.router):
     app.include_router(r)
 
 
 @app.get("/api/sante")
-def sante():
-    return {"statut": "OK", "heure_serveur": now_local().isoformat(),
-            "version": APP_VERSION}
+def sante(db: Session = Depends(get_db)):
+    """Diagnostic de santé complet de l'instance Uvicorn en cours d'exécution."""
+    try:
+        from .api_wialon import jeton_configure
+        from .engine import retard_collecte_s
+        from .models import EvenementGPS
+        from .scrapers import _mzonex_api_active
+        now = now_local()
+        retard_s = retard_collecte_s(db, now)
+        dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
+        nb_vehicules_actifs = db.scalar(
+            select(func.count(Vehicule.id)).where(Vehicule.statut == StatutVehicule.ACTIF)
+        ) or 0
+
+        return {
+            "statut": "OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE",
+            "pid": os.getpid(),
+            "version": APP_VERSION,
+            "heure_serveur": now.isoformat(),
+            "mode_collecte": os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper(),
+            "sim_enable": SIM_ENABLE,
+            "wialon_session_partagee": os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1",
+            "wialon_token_present": jeton_configure(),
+            "mzonex_api_active": _mzonex_api_active(),
+            "dernier_evenement_gps": dernier_ev.isoformat() if dernier_ev else None,
+            "retard_collecte_min": round(retard_s / 60, 1) if retard_s is not None else None,
+            "vehicules_actifs": nb_vehicules_actifs,
+        }
+    except Exception as e:
+        log.exception("Erreur dans /api/sante")
+        return {
+            "statut": "OK",
+            "pid": os.getpid(),
+            "version": APP_VERSION,
+            "heure_serveur": now_local().isoformat(),
+            "erreur_diagnostic": str(e),
+        }
+
+
+@app.get("/api/sante/sync")
+@app.post("/api/sante/sync")
+def sante_sync():
+    """Déclenche manuellement un cycle de collecte N1 + N2 et renvoie le diagnostic détaillé."""
+    from .scrapers import (
+        MZoneXApiCollector, _collecter_camtrackpro_n1,
+        synchroniser_trajets_valides, _mzonex_api_active
+    )
+    from .api_wialon import jeton_configure
+    from .engine import retard_collecte_s
+    from .models import EvenementGPS
+    
+    res = {
+        "debut": now_local().isoformat(),
+        "mzonex_n1_points": 0,
+        "camtrackpro_n1_points": 0,
+        "n2_sync": {},
+        "erreurs": []
+    }
+    
+    if _mzonex_api_active():
+        try:
+            res["mzonex_n1_points"] = MZoneXApiCollector().run()
+        except Exception as e:
+            res["erreurs"].append(f"MZoneX N1: {e}")
+            
+    if jeton_configure():
+        try:
+            res["camtrackpro_n1_points"] = _collecter_camtrackpro_n1()
+        except Exception as e:
+            res["erreurs"].append(f"CamtrackPro N1: {e}")
+            
+    try:
+        res["n2_sync"] = synchroniser_trajets_valides("MIXTE")
+    except Exception as e:
+        res["erreurs"].append(f"N2 Trajets: {e}")
+        
+    db = SessionLocal()
+    try:
+        now = now_local()
+        retard_s = retard_collecte_s(db, now)
+        dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
+        res["dernier_evenement_gps"] = dernier_ev.isoformat() if dernier_ev else None
+        res["retard_collecte_min"] = round(retard_s / 60, 1) if retard_s is not None else None
+        res["statut_collecte"] = "OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE"
+    finally:
+        db.close()
+        
+    res["fin"] = now_local().isoformat()
+    return res
+
+
+@app.get("/api/sante/portails")
+def sante_portails():
+    """Diagnostic direct et public de la connectivité API MZoneX et CamtrackPro."""
+    from .api_mzonex import ApiMZoneX
+    from .api_wialon import ApiWialon, jeton_configure
+
+    diag = {
+        "heure": now_local().isoformat(),
+        "mzonex": {"actif": False, "erreur": None, "flotte_recensee": 0, "token_ok": False},
+        "camtrackpro": {"actif": False, "erreur": None, "unites_trouvees": 0, "token_ok": False},
+    }
+
+    try:
+        mz = ApiMZoneX()
+        flotte = mz.recenser_flotte()
+        diag["mzonex"]["actif"] = True
+        diag["mzonex"]["token_ok"] = True
+        diag["mzonex"]["flotte_recensee"] = len(flotte)
+    except Exception as e:
+        diag["mzonex"]["erreur"] = f"{type(e).__name__}: {str(e)}"
+
+    try:
+        if jeton_configure():
+            api_w = ApiWialon()
+            try:
+                sid = api_w.connecter()
+                diag["camtrackpro"]["token_ok"] = bool(sid)
+                unites = api_w.unites()
+                diag["camtrackpro"]["actif"] = True
+                diag["camtrackpro"]["unites_trouvees"] = len(unites)
+            finally:
+                api_w.fermer()
+        else:
+            diag["camtrackpro"]["erreur"] = "CAMTRACKPRO_TOKEN absent ou non configuré dans .env"
+    except Exception as e:
+        diag["camtrackpro"]["erreur"] = f"{type(e).__name__}: {str(e)}"
+
+    return diag
 
 
 # ------------------------------------------------------------------ WebSocket (§9)
@@ -497,12 +804,12 @@ async def websocket_endpoint(websocket: WebSocket):
 
 # ------------------------------------------------------------------ SPA frontend
 class SPAStaticFiles(StaticFiles):
-    """Sert le build React et renvoie index.html pour les routes inconnues."""
+    """Sert le build React et renvoie index.html pour les routes inconnues hors API."""
     async def get_response(self, path: str, scope):
         try:
             return await super().get_response(path, scope)
         except StarletteHTTPException as e:
-            if e.status_code == 404:
+            if e.status_code == 404 and not path.startswith("api/") and not path.startswith("api"):
                 return await super().get_response("index.html", scope)
             raise
 

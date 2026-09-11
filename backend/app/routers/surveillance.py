@@ -1,4 +1,5 @@
 """Modules 4 & 5 — Infractions (100 % automatiques) et Alertes (temps réel)."""
+import os
 from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Response
@@ -9,11 +10,68 @@ from sqlalchemy.orm import Session
 from ..config import now_local
 from ..database import get_db
 from ..exporters import export_excel, export_pdf
-from ..models import (Alerte, AuditLog, GraviteAlerte, Infraction, StatutAlerte)
+from ..models import (Alerte, AuditLog, EvenementGPS, GraviteAlerte,
+                      Infraction, SourceEvenement, StatutAlerte, Vehicule)
 from ..security import ECRITURE, TOUS, require_roles
 from ..serializers import s_alerte, s_infraction
 
 router = APIRouter(prefix="/api", tags=["surveillance"])
+
+
+@router.get("/sante/collecte")
+def sante_collecte(db: Session = Depends(get_db)):
+    """État opérationnel de la collecte, par source et par camion."""
+    from ..config import now_local
+    from ..scrapers import etat_collecte_memoire
+
+    maintenant = now_local()
+    seuil = 900
+    sources = []
+    for source in (SourceEvenement.MZONEX, SourceEvenement.CAMTRACKPRO):
+        dernier = db.scalar(select(func.max(EvenementGPS.horodatage)).where(
+            EvenementGPS.source == source))
+        age = ((maintenant - dernier).total_seconds() if dernier else None)
+        sources.append({
+            "source": source.value,
+            "configuree": (source == SourceEvenement.MZONEX
+                            or bool(os.getenv("CAMTRACKPRO_TOKEN", "").strip())),
+            "dernier_evenement": dernier.isoformat() if dernier else None,
+            "age_s": int(age) if age is not None else None,
+            "evenements_aujourd_hui": db.scalar(select(func.count(EvenementGPS.id)).where(
+                EvenementGPS.source == source,
+                EvenementGPS.horodatage >= datetime.combine(maintenant.date(), datetime.min.time()))) or 0,
+            "statut": ("AUCUNE_DONNEE" if dernier is None else
+                        "RETARD" if age > seuil else "OK"),
+        })
+
+    camions = []
+    for vehicule in db.scalars(select(Vehicule).where(
+            Vehicule.statut == "ACTIF").order_by(Vehicule.plaque)).all():
+        age = ((maintenant - vehicule.last_event_at).total_seconds()
+               if vehicule.last_event_at else None)
+        dernier = db.scalar(select(EvenementGPS).where(
+            EvenementGPS.vehicule_id == vehicule.id).order_by(
+                EvenementGPS.horodatage.desc()).limit(1))
+        camions.append({
+            "plaque": vehicule.plaque,
+            "source_attendue": vehicule.plateforme_gps,
+            "gps_associe": vehicule.gps_associe,
+            "dernier_evenement": (vehicule.last_event_at.isoformat()
+                                   if vehicule.last_event_at else None),
+            "source_dernier_evenement": (dernier.source.value if dernier else None),
+            "age_s": int(age) if age is not None else None,
+            "vitesse": vehicule.last_vitesse,
+            "statut": ("AUCUNE_DONNEE" if age is None else
+                        "RETARD" if age > seuil else "OK"),
+        })
+    return {
+        "heure_serveur": maintenant.isoformat(),
+        "orchestrateur": "ASYNCIO",
+        "pid": os.getpid(),
+        "sources": sources,
+        "camions": camions,
+        "collecteur": etat_collecte_memoire(),
+    }
 
 TYPES_INFRACTION = {
     "EXCES_VITESSE": "Excès de vitesse",
@@ -40,6 +98,16 @@ TYPES_ALERTE = {
     "SANS_BADGE": "Camion qui roule sans badge chauffeur",
     "REPARATION_DONNEES": "Réparation de données (§0decies)",
     "COLLECTE_YMANE": "Collecte Ym@ne en échec (§0septies decies K1)",
+    "COLLECTE_RETARD": "Collecte GPS en retard",
+    "TCH_PROCHE_LIMITE": "TCH proche de la limite (≥ 46h)",
+    "TCH_LIMITE_ATTEINTE": "TCH limite atteinte (≥ 56h)",
+    "CONFLIT_AFFECTATION": "Conflit d'affectation chauffeur (manuel vs portail)",
+    "DOUBLON_CONDUCTEUR": "Doublon chauffeur sur la journée",
+    "CHANGEMENT_CONDUCTEUR_DETECTE": "Changement de conducteur détecté (arbitrage requis)",
+    "MISSION_SANS_OT": "Mission sans OT à GRT",
+    "VALIDATION_CHARGEMENT": "Validation chargement requise",
+    "VALIDATION_DECHARGEMENT": "Validation déchargement requise",
+    "DEVIATION_DETECTEE": "Déviation détectée",
 }
 
 

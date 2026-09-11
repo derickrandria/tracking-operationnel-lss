@@ -5,7 +5,7 @@ from .chaines import (ETAT_OFFICIEL, LigneJournee, Segment,
                       construire_journee)
 from .config import jour_attribution, now_local
 from .models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
-                     Mission, StatutValidationTrajet, SuiviJournalier, Trajet,
+                     Mission, StatutMission, StatutValidationTrajet, SuiviJournalier, Trajet,
                      Vehicule)
 
 
@@ -31,9 +31,16 @@ def s_conducteur(c: Conducteur | None, court=False):
         "nom_prenom": c.nom_prenom,
         "prenom_usuel": c.prenom_usuel,
         "matricule": c.matricule,
+        "nom_normalise": getattr(c, "nom_normalise", None),
+        "tokens_set": getattr(c, "tokens_set", None),
+        "code_badge_mzonex": getattr(c, "code_badge_mzonex", None),
         "telephone": c.telephone,
         "statut": c.statut.value if c.statut else None,
     }
+    if hasattr(c, "aliases") and c.aliases:
+        d["aliases"] = [{"id": a.id, "alias_brut": a.alias_brut} for a in c.aliases]
+    else:
+        d["aliases"] = []
     if not court:
         d["date_creation"] = iso(c.date_creation)
     return d
@@ -74,6 +81,8 @@ def s_trajet(t: Trajet):
         # Addendum v1.5 §7.1 — validité métier (REJETE = jamais dans TCC/TCJ/TTJ)
         "statut_validation": (t.statut_validation.value
                               if t.statut_validation else "EN_ATTENTE"),
+        "conducteur_badge": t.conducteur_badge,
+        "conducteur_badge_id": t.conducteur_badge_id,
     }
 
 
@@ -159,6 +168,8 @@ def s_ligne(lg: LigneJournee, numero: int):
         "source_plateforme": getattr(ref, "source_plateforme", None),
         "distance_km": lg.distance_km,
         "statut_validation": "VALIDE" if officielle else "EN_ATTENTE",
+        "conducteur_badge": getattr(ref, "conducteur_badge", None),
+        "conducteur_badge_id": getattr(ref, "conducteur_badge_id", None),
         # information de transparence (modale « tous les trajets »)
         "segments": lg.nb_segments,
     }
@@ -193,7 +204,7 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     """§0undecies E1, amendée §0tricies decies G1/G2 (E3 abrogée le 25/08/2026)
     — deux lignes séparées par un arrêt STRICTEMENT < `seuil_fusion_s`
     (désormais 30 min) sont affichées comme UNE seule ligne (« sans bonder
-    les colonnes ») :
+    les colonnes ») pour un MÊME chauffeur :
 
     début = début de la 1re composante ; fin = fin de la dernière (vide si
     en cours) ; statut/couleur = ceux de la dernière composante ; distance =
@@ -210,12 +221,41 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     for t in (trajets or []):
         nt = dict(t)
         deb, fin = _dt_iso(nt.get("heure_debut")), _dt_iso(nt.get("heure_fin"))
+        # Correctif v1.46 (constat 4866TBU du 04/09/2026) : un badge ABSENT d'un
+        # côté ne prouve PAS un changement de chauffeur (trou d'attribution N1) —
+        # il ne doit pas empêcher la fusion G1 (rupture < 30 min → UNE ligne).
+        # Avant : `meme_chauffeur` exigeait l'égalité des deux badges → deux
+        # lignes séparées par une case pause vide, contre la règle G1.
+        b1 = res[-1].get("conducteur_badge_id") if res else None
+        b2 = nt.get("conducteur_badge_id")
+        meme_chauffeur = bool(res and (b1 is None or b2 is None or b1 == b2))
+        # §0undecies E1 FIX v147 — un même camion ne peut pas rouler 2 trajets
+        # en même temps : un chevauchement temporel (début < fin de la ligne
+        # précédente) est fusionné MÊME si le badge chauffeur diffère (le badge
+        # est une attribution, pas une preuve de 2 trajets simultanés).
+        chevauche = bool(
+            res and deb is not None and res[-1]["_fin_dt"] is not None
+            and deb < res[-1]["_fin_dt"]
+        )
         if (res and deb is not None and res[-1]["_fin_dt"] is not None
-                and (deb - res[-1]["_fin_dt"]).total_seconds() < seuil_fusion_s):
-            # rupture courte → absorbée dans la ligne précédente
+                and (chevauche
+                     or (meme_chauffeur
+                         and (deb - res[-1]["_fin_dt"]).total_seconds()
+                         < seuil_fusion_s))):
+            # fusion : rupture courte (même chauffeur) OU chevauchement
+            # temporel (règle AM-6 : un même instant ne peut pas être deux
+            # trajets d'un même camion — on fusionne même si le badge diffère).
             m = res[-1]
-            m["heure_fin"] = nt.get("heure_fin")
-            m["_fin_dt"] = fin
+            # fin = UNION des deux (la plus tardive ; vide si une ligne en
+            # cours) — on conserve la CHAÎNE ISO d'origine, jamais un datetime.
+            if fin is not None and m["_fin_dt"] is not None:
+                if fin > m["_fin_dt"]:
+                    m["_fin_dt"] = fin
+                    m["heure_fin"] = nt.get("heure_fin")
+                # sinon la ligne précédente est déjà la plus tardive → intacte
+            elif fin is None:
+                m["heure_fin"] = None
+                m["_fin_dt"] = None
             m["statut_source"] = nt.get("statut_source")
             m["statut_validation"] = nt.get("statut_validation")
             d1, d2 = m.get("distance_km"), nt.get("distance_km")
@@ -272,9 +312,21 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
                                         FUSION_AFFICHAGE_S)),
         seuil_pause_aff_s=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC",
                                            PAUSE_AFFICHAGE_S)))
-    tcc_max = seuils.get("SEUIL_TCC_MAX", 16200)
-    tcj_max = seuils.get("SEUIL_TCJ_MAX", 36000)
-    ttj_max = seuils.get("SEUIL_TTJ_MAX", 43200)
+    tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+    if tcc_max <= 24:
+        tcc_max *= 3600
+    tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+    if tcj_max <= 24:
+        tcj_max *= 3600
+    ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+    if ttj_max <= 24:
+        ttj_max *= 3600
+
+    tcj_val = journee.tcj_s if (journee and journee.tcj_s is not None) else (s.tcj_s or 0)
+    ttj_val = journee.ttj_s if (journee and journee.ttj_s is not None) else (s.ttj_s or 0)
+    tcc_val = s.tcc_s or 0
+    pause_val = journee.total_pause_s if (journee and journee.total_pause_s is not None) else (s.total_pause_s or 0)
+
     return {
         "id": s.id,
         "date_jour": s.date_jour.isoformat(),
@@ -284,6 +336,7 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         "description": s.vehicule.description if s.vehicule else None,
         "conducteur_id": s.conducteur_id,
         "conducteur": s_conducteur(s.conducteur, court=True),
+        "conducteur_origine": getattr(s, "conducteur_origine", None),
         # Partie B
         "situation": s.situation,
         "statut_camion": s.statut_camion.value if s.statut_camion else None,
@@ -310,8 +363,8 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         # Addendum v1.9 §4.2 — colonne « Lieu Arrêt » : lieu du dernier arrêt
         # (journée en cours = dernière position connue ; figée à l'archivage)
         "lieu_arret": (s.vehicule.last_adresse if s.vehicule else None),
-        "tcc_s": s.tcc_s, "tcj_s": s.tcj_s, "ttj_s": s.ttj_s,
-        "total_pause_s": s.total_pause_s,
+        "tcc_s": tcc_val, "tcj_s": tcj_val, "ttj_s": ttj_val,
+        "total_pause_s": pause_val,
         "km_parcourus": round(s.km_parcourus or 0, 1),
         # v1.13 — CONTRAT GRILLE STRICT : la grille affiche les LIGNES de la
         # journée chaînée — écran = export = archive, une seule source.
@@ -321,33 +374,89 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         "nb_trajets": len(lignes_json),
         "mission_id": s.mission_id,
         # drapeaux de dépassement (pour coloration frontend)
-        "flag_tcc": bool(s.tcc_s and s.tcc_s > tcc_max),
-        "flag_tcj": bool(s.tcj_s and s.tcj_s > tcj_max),
-        "flag_ttj": bool(s.ttj_s and s.ttj_s > ttj_max),
+        "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
+        "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
+        "flag_ttj": bool(ttj_val and ttj_val > ttj_max),
         "updated_at": iso(s.updated_at),
     }
 
 
-def s_mission(m: Mission):
+def s_mission(m: Mission, nb_infractions: int | None = None):
+    code = getattr(m, "code_mission", None)
+    if not code:
+        if m.numero_ot and m.numero_ot.strip():
+            ot = m.numero_ot.strip()
+            if ot.upper().startswith("OT-") or ot.upper().startswith("OT_"):
+                code = f"MIS-{ot.upper()}"
+            elif ot.upper().startswith("MIS-"):
+                code = ot.upper()
+            else:
+                code = f"MIS-OT-{ot}"
+        else:
+            d_str = m.date_jour.strftime("%Y%m%d") if m.date_jour else "20260903"
+            code = f"MIS-{d_str}-{m.numero_mission_du_jour:02d}"
+
+    km_v = getattr(m, "km_vide", 0.0) or 0.0
+    km_c = getattr(m, "km_charge", 0.0) or 0.0
+    km_tot = getattr(m, "kilometrage_total", 0.0) or (m.kilometrage or 0.0) or (km_v + km_c)
+    if km_tot > 0 and km_v == 0.0 and km_c == 0.0:
+        if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE":
+            km_c = km_tot
+        else:
+            km_v = km_tot
+
+    if nb_infractions is None:
+        if hasattr(m, "infractions") and m.infractions:
+            nb_infractions = len([i for i in m.infractions if getattr(i, "validation", "") != "INVALIDE"])
+        else:
+            nb_infractions = 0
+
+    depot_prev = getattr(m, "depot_prevu", None) or m.depot
+    depot_eff = getattr(m, "depot_effectif", None) or depot_prev
+
+    duree = m.duree_s or 0
+    if duree == 0 and m.heure_debut and not m.heure_fin and m.statut in (StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE):
+        duree = max(0, int((now_local() - m.heure_debut).total_seconds()))
+
     return {
         "id": m.id,
-        "date_jour": m.date_jour.isoformat(),
+        "code_mission": code,
+        "date_jour": m.date_jour.isoformat() if m.date_jour else None,
         "conducteur_id": m.conducteur_id,
-        "conducteur": s_conducteur(m.conducteur, court=True),
+        "conducteur": s_conducteur(m.conducteur, court=True) if m.conducteur else None,
         "vehicule_id": m.vehicule_id,
         "plaque": m.vehicule.plaque if m.vehicule else None,
         "numero_mission_du_jour": m.numero_mission_du_jour,
-        "statut": m.statut.value if m.statut else None,
+        "statut": m.statut.value if hasattr(m.statut, "value") else str(m.statut),
+        "statut_camion_actuel": getattr(m, "statut_camion_actuel", "LIBRE") or "LIBRE",
         "heure_debut": iso(m.heure_debut),
+        "date_debut": iso(m.heure_debut),
+        "heure_chargement": iso(getattr(m, "heure_chargement", None)),
+        "date_chargement": iso(getattr(m, "heure_chargement", None)),
         "heure_fin": iso(m.heure_fin),
-        "duree_s": m.duree_s,
+        "date_fin": iso(m.heure_fin),
+        "duree_s": duree,
         "numero_ot": m.numero_ot,
         "produit": m.produit,
-        "depot": m.depot,
+        "depot": depot_prev,
+        "depot_prevu": depot_prev,
+        "depot_effectif": depot_eff,
+        "est_deviee": bool(getattr(m, "est_deviee", False)),
+        "motif_deviation": getattr(m, "motif_deviation", None),
+        "validation_chargement": getattr(m, "validation_chargement", "EN_ATTENTE") or "EN_ATTENTE",
+        "validation_dechargement": getattr(m, "validation_dechargement", "EN_ATTENTE") or "EN_ATTENTE",
+        "motif_invalidation": getattr(m, "motif_invalidation", None),
+        "est_repositionnement": bool(getattr(m, "est_repositionnement", False)),
         "distributeur": m.distributeur,
-        "kilometrage": round(m.kilometrage or 0, 1),
+        "km_vide": round(km_v, 1),
+        "km_charge": round(km_c, 1),
+        "kilometrage": round(km_tot, 1),
+        "kilometrage_total": round(km_tot, 1),
+        "nb_infractions": nb_infractions,
         "origine": m.origine,
         "etapes": m.etapes or [],
+        "created_at": iso(m.created_at),
+        "updated_at": iso(m.updated_at),
     }
 
 
@@ -466,6 +575,7 @@ def s_historique(h: HistoriqueJournalier, detail=False):
         "arret_final": d.get("arret_final"),
         "km_parcourus": d.get("km_parcourus"),
         "tcc_s": d.get("tcc_s"), "tcj_s": d.get("tcj_s"), "ttj_s": d.get("ttj_s"),
+        "trajets": d.get("trajets") or [],
         "nb_trajets": d.get("nb_trajets"),
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,
