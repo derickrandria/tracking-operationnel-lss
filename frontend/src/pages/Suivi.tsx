@@ -192,6 +192,27 @@ export default function Suivi() {
     return () => { off(); off2(); };
   }, [charger]);
 
+  const [syncing, setSyncing] = useState(false);
+
+  async function syncGPS() {
+    setSyncing(true);
+    try {
+      const r = await api("/api/suivi/sync-gps", { method: "POST" });
+      const totalPoints = (r.mzonex_n1_points || 0) + (r.camtrackpro_n1_points || 0);
+      const recusN2 = r.n2_trajets?.recus || 0;
+      addToast({
+        type: "succes",
+        titre: "Synchronisation GPS effectuée",
+        message: `${totalPoints} point(s) N1 collecté(s), ${recusN2} trajet(s) N2 actualisé(s).`
+      });
+      charger(true);
+    } catch (e: any) {
+      addToast({ type: "erreur", titre: "Synchronisation impossible", message: e.message });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   async function prefillGPS() {
     try {
       const r = await api(`/api/suivi/prefill?date=${date}`, { method: "POST" });
@@ -279,9 +300,14 @@ export default function Suivi() {
             className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-[13px]" />
           <Btn variante="secondaire" onClick={() => { setDate(todayISO()); setParams({}); }}>Aujourd'hui</Btn>
           {!lectureSeule && (
-            <Btn variante="secondaire" onClick={prefillGPS} title="Remplit la Partie C depuis les positions GPS">
-              <Icon nom="localisation" /> Pré-remplir (GPS)
-            </Btn>
+            <>
+              <Btn variante="primaire" onClick={syncGPS} disabled={syncing} title="Force la synchronisation immédiate avec les serveurs GPS MZoneX et CamtrackPro">
+                {syncing ? <Spinner className="h-3.5 w-3.5" /> : <Icon nom="rafraichir" />} Sync GPS
+              </Btn>
+              <Btn variante="secondaire" onClick={prefillGPS} title="Remplit la Partie C depuis les positions GPS">
+                <Icon nom="localisation" /> Pré-remplir (GPS)
+              </Btn>
+            </>
           )}
           <Btn variante={modeDetail ? "primaire" : "secondaire"} title="27 colonnes trajets (exigence audit) : Heure de départ, Fin T1, Pause 1, Début/Fin/Pause T2→T9"
             onClick={() => { const v = !modeDetail; setModeDetail(v); localStorage.setItem(CLE_MODE, v ? "1" : "0"); }}>
