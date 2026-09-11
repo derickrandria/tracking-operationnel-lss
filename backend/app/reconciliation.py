@@ -200,6 +200,22 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
     if change_pos:
         donnees.update(pos_apres)
         change = True
+    champs_suivi = (
+        "situation", "statut_camion", "depot_recepteur", "distributeur",
+        "produit", "numero_ot", "emplacement_j_moins_1", "arret_final",
+        "km_parcourus", "mission_id")
+    champs_apres = {}
+    for champ in champs_suivi:
+        valeur = getattr(suivi, champ, None)
+        if hasattr(valeur, "value"):
+            valeur = valeur.value
+        champs_apres[champ] = valeur
+    if any(donnees.get(c) != v for c, v in champs_apres.items()):
+        donnees.update(champs_apres)
+        change = True
+    if h.conducteur_id != suivi.conducteur_id:
+        h.conducteur_id = suivi.conducteur_id
+        h.conducteur = suivi.conducteur
     if change:
         _audit(db, "archive.raffraichie", None, {
             "plaque": suivi.vehicule.plaque if suivi.vehicule else None,
@@ -424,6 +440,26 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                 trajets.remove(t)
             epures += 1
             continue
+        # Un ouvert N1 provisoire peut commencer au milieu d'une ligne N2
+        # publiée après coup. Il s'agit du même trajet observé en direct :
+        # l'officiel couvre l'ouvert, même si sa fin officielle est plus tard.
+        if (t.heure_fin is None
+            and (t.statut_source == StatutSourceTrajet.PROVISOIRE
+                 or t.source_plateforme == "CAMTRACKPRO")
+                and any(d <= t.heure_debut <= (f or d)
+                        for d, f in intervalles)):
+            _audit(db, "trajet.orphelin_purge", t.id, {
+                "plaque": vehicule.plaque, "jour": jour.isoformat(),
+                "debut": iso(t.heure_debut), "fin": None,
+                "raison": "ouvert_recouvert",
+                "regle": "ouvert N1 provisoire recouvert par une ligne N2 "
+                         "officielle : l'officiel fait foi"})
+            log.info("Ligne ouverte recouverte purgée — %s %s",
+                     vehicule.plaque, iso(t.heure_debut))
+            db.delete(t)
+            trajets.remove(t)
+            epures += 1
+            continue
         fin_affichee = t.heure_fin or maintenant
         # un trajet MOTEUR (Niveau 1) vraiment vivant — fin provisoire fraîche
         # (< pause_min) ou pas encore de fin — n'est jamais touché ici
@@ -448,6 +484,17 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                     # lignes officielles ne se chevauchent jamais → fantôme
                     raison = "contenu"
                     break
+            # Règle d'épuration stricte : si le suivi possède des lignes officielles
+            # certifiées (conserves) et qu'un trajet PROVISOIRE terminé ne figure dans
+            # aucun intervalle officiel, il est qualifié de fantôme non officiel et purgé.
+            if (raison is None and conserves
+                    and t.statut_source == StatutSourceTrajet.PROVISOIRE
+                    and t.heure_fin is not None):
+                signal_recent = (vehicule.last_event_at is not None
+                                 and (maintenant - vehicule.last_event_at).total_seconds() <= 900
+                                 and (maintenant - t.heure_fin).total_seconds() < pause_min)
+                if not signal_recent:
+                    raison = "fantome_non_officiel"
         if raison is None:
             continue
         _audit(db, "trajet.orphelin_purge", t.id, {
@@ -942,11 +989,12 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 mapping[str(v.id).strip().upper()] = v
                 if v.gps_associe:
                     mapping[str(v.gps_associe).strip().upper()] = v
-        if it.get("conducteur"):
+        if it.get("conducteur") or it.get("badge_code"):
             # §0septies B2 (20/08/2026) : les clés de SERVICE (« Nouveau
             # conducteur », « garage LSS ») ne créent JAMAIS de fiche — la
             # saisie manuelle fait le travail sur ces lignes-là
-            resoudre_badge(db, it["conducteur"])
+            resoudre_badge(db, it.get("conducteur"), badge_code=it.get("badge_code"),
+                           plateforme=it.get("source"))
 
     suivi_touches: set[str] = set()
 
@@ -1023,6 +1071,12 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
     for it in items:
         try:
             debut, fin = it["debut"], it.get("fin")
+            # v146 — GARDE D'INTÉGRITÉ : une `fin` antérieure au `debut` est
+            # toujours impossible (ex. fin recopiée d'un voisin par un mauvais
+            # rapprochement). On n'écrit jamais une telle heure : la ligne est
+            # traitée « en cours » (fin None). Non destructif (AM-2/R2).
+            if fin is not None and fin < debut:
+                fin = None
             # Référence v2 §8.2/§8.3 — jour d'ATTRIBUTION du trajet (début
             # < 01h00 → veille ; la journée logistique court de 01h00 à 01h00)
             jour = jour_attribution(debut)
@@ -1042,6 +1096,11 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 stats["ignores"] += 1
                 log.info("Trajet validé sans véhicule connu (%r) — ignoré",
                          it.get("gps_associe") or it.get("plaque"))
+                continue
+            if vehicule.statut != "ACTIF":
+                stats["ignores"] += 1
+                log.info("Trajet validé pour véhicule non actif %s — ignoré",
+                         vehicule.plaque)
                 continue
 
             suivi = ensure_suivi(db, vehicule, jour)
