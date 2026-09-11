@@ -1651,10 +1651,20 @@ class MZoneXApiCollector(CollectorBase):
         return lignes
 
     def normaliser(self, brut: list[dict]) -> list[dict]:
-        points = [p for p in (point_depuis_evenement_api(v) for v in brut)
+        map_vehs = {}
+        try:
+            map_vehs = self.api.map_vehicules()
+        except Exception:
+            pass
+        points = [p for p in (point_depuis_evenement_api(v, map_vehicules=map_vehs) for v in brut)
                   if p is not None]
+        try:
+            derniers = self.api.dernieres_positions()
+            points.extend(derniers)
+        except Exception:
+            pass
         nq = len(brut) - len(points)
-        if nq:
+        if nq > 0:
             log.info("MZoneX API (Événements) : %d ligne(s) sans plaque/GPS "
                      "exploitable (%d conservée(s))", nq, len(points))
         return super().normaliser(points)
@@ -1681,10 +1691,15 @@ class MZoneXTrajetsApiCollector:
         if not jours:
             jours = [now_local().date()]
         self.recensement = self.api.recenser_flotte()
+        map_vehs = {}
+        try:
+            map_vehs = self.api.map_vehicules()
+        except Exception:
+            pass
         items: list[dict] = []
         for jour in sorted(set(jours)):
             bruts = self.api.trajets_jour_local(jour)
-            items.extend(it for it in (trajet_depuis_api(t) for t in bruts)
+            items.extend(it for it in (trajet_depuis_api(t, map_vehicules=map_vehs) for t in bruts)
                          if it)
             log.info("MZoneX API (Trajets) : %d ligne(s) API du %s",
                      len(bruts), jour.isoformat())
@@ -1695,31 +1710,33 @@ class MZoneXTrajetsApiCollector:
 
 
 def _collecter_mzonex_n1_avec_repli(classe_ecran) -> int:
-    """§0sexies A2 : API d'abord ; à TOUT échec, tentative lecteur d'écran sans blocage."""
+    """§0sexies A2 : API d'abord ; repli écran uniquement si activé."""
     try:
         return MZoneXApiCollector().run()
     except Exception as e:
-        log.warning("MZoneX API (Événements) indisponible (%s) — tentative repli écran", e)
-        try:
-            return classe_ecran().run()
-        except Exception as e_scr:
-            log.warning("MZoneX lecteur d'écran également indisponible (%s) — cycle reporté", e_scr)
-            return 0
+        log.warning("MZoneX API (Événements) indisponible (%s)", e)
+        if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
+            try:
+                return classe_ecran().run()
+            except Exception as e_scr:
+                log.warning("MZoneX lecteur d'écran également indisponible (%s) — cycle reporté", e_scr)
+        return 0
 
 
 def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
-    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran sur échec.
-    §0nonies decies M1 : relit `jours` via l'API (le repli écran, jour courant
-    seul, est historiquement inchangé)."""
+    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran si demandé."""
     if _mzonex_api_active():
         try:
             c = MZoneXTrajetsApiCollector()
             return c.collecter_valides(jours), list(c.recensement or [])
         except Exception:
-            log.exception("MZoneX API (Trajets) en échec — REPLI lecteur "
-                          "d'écran (§0sexies A2) pour ce cycle (jour courant)")
-    c = MZoneXTrajetsCollector()
-    return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+            log.exception("MZoneX API (Trajets) en échec")
+            if os.getenv("MZONEX_REPLI_ECRAN", "0") != "1":
+                return [], []
+    if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
+        c = MZoneXTrajetsCollector()
+        return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+    return [], []
 
 
 class CamtrackProApiCollector(CollectorBase):

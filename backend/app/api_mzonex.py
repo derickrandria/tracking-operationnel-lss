@@ -81,7 +81,7 @@ def plaque_depuis_ligne_api(libelle: str | None) -> str | None:
     return plaque or None
 
 
-def point_depuis_evenement_api(v: dict) -> dict | None:
+def point_depuis_evenement_api(v: dict, map_vehicules: dict[str, str] | None = None) -> dict | None:
     """Événement API → point brut du contrat CollectorBase (§0sexies A2).
 
     Type laissé à None : ``ingest_event`` (§7.1) déroule lui-même la machine à
@@ -90,6 +90,8 @@ def point_depuis_evenement_api(v: dict) -> dict | None:
     """
     plaque = plaque_depuis_ligne_api(
         v.get("vehicle_Registration") or v.get("vehicle_Description"))
+    if not plaque and map_vehicules and v.get("vehicle_Id"):
+        plaque = map_vehicules.get(str(v.get("vehicle_Id")))
     ts = depuis_utc(v.get("utcTimestamp"))
     lat, lng = v.get("latitude"), v.get("longitude")
     if plaque is None or ts is None or lat is None or lng is None:
@@ -114,7 +116,7 @@ def _entier(t: dict, cle: str) -> int | None:
         return None
 
 
-def trajet_depuis_api(t: dict) -> dict | None:
+def trajet_depuis_api(t: dict, map_vehicules: dict[str, str] | None = None) -> dict | None:
     """Trajet officiel API → item du contrat réconciliation (§2.4).
 
     Même forme que les lignes de l'onglet « Trajets » lu à l'écran : début/fin
@@ -126,6 +128,8 @@ def trajet_depuis_api(t: dict) -> dict | None:
     """
     plaque = plaque_depuis_ligne_api(
         t.get("vehicle_Registration") or t.get("vehicle_Description"))
+    if not plaque and map_vehicules and t.get("vehicle_Id"):
+        plaque = map_vehicules.get(str(t.get("vehicle_Id")))
     debut = depuis_utc(t.get("startUtcTimestamp"))
     if plaque is None or debut is None:
         return None
@@ -157,6 +161,47 @@ class ApiMZoneX:
     def __init__(self, jetons=None):
         self._jetons = jetons or gestionnaire()
         self._groupe_id: str | None = None
+        self._cache_map_vehicules: dict[str, str] = {}
+
+    def map_vehicules(self) -> dict[str, str]:
+        """Dictionnaire guid vehicle_Id -> plaque normalisée (avec cache interne)."""
+        if self._cache_map_vehicules:
+            return self._cache_map_vehicules
+        vehs = self._pages("Vehicles?$orderby=description")
+        res = {}
+        for v in vehs:
+            plaque = plaque_depuis_ligne_api(v.get("description") or v.get("registration"))
+            vid = v.get("id")
+            if vid and plaque:
+                res[str(vid)] = plaque
+        self._cache_map_vehicules = res
+        return res
+
+    def dernieres_positions(self) -> list[dict]:
+        """Positions récentes des véhicules MZoneX issues de Vehicles (si publiées)."""
+        vehs = self._pages("Vehicles?$orderby=description")
+        points = []
+        for v in vehs:
+            plaque = plaque_depuis_ligne_api(v.get("description") or v.get("registration"))
+            if not plaque:
+                continue
+            lat = v.get("lastKnownLatitude") or v.get("latitude")
+            lng = v.get("lastKnownLongitude") or v.get("longitude")
+            ts_str = v.get("lastEventUtcTimestamp") or v.get("utcTimestamp")
+            ts = depuis_utc(ts_str) if ts_str else None
+            if lat is not None and lng is not None and ts is not None:
+                points.append({
+                    "gps_associe": plaque,
+                    "horodatage": ts,
+                    "lat": float(lat),
+                    "lng": float(lng),
+                    "adresse": None,
+                    "vitesse": max(0.0, float(v.get("speed") or 0.0)),
+                    "moteur": "ON",
+                    "type_evenement": None,
+                    "badge_code": _entier(v, "driverKeyCode")
+                })
+        return points
 
     # ---------------------------------------------------------------- bas
     def _get(self, chemin_requete: str, reessai: bool = True) -> dict:
