@@ -1714,13 +1714,16 @@ def _collecter_mzonex_n1_avec_repli(classe_ecran) -> int:
     try:
         return MZoneXApiCollector().run()
     except Exception as e:
+        _etat_collecte_erreur("MZONEX", e)
         log.warning("MZoneX API (Événements) indisponible (%s)", e)
         if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
             try:
                 return classe_ecran().run()
             except Exception as e_scr:
+                _etat_collecte_erreur("MZONEX", e_scr)
                 log.warning("MZoneX lecteur d'écran également indisponible (%s) — cycle reporté", e_scr)
-        return 0
+                raise
+        raise
 
 
 def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
@@ -1809,10 +1812,11 @@ def _collecter_camtrackpro_n1() -> int:
     Un échec reporte au cycle suivant (comportement antérieur : aucun N1)."""
     try:
         return CamtrackProApiCollector().run()
-    except Exception:
+    except Exception as e:
+        _etat_collecte_erreur("CAMTRACKPRO", e)
         log.exception("CamtrackPro API (positions) en échec — cycle reporté "
                       "(§5, aucun flux écran de secours)")
-        return 0
+        raise
 
 
 def _collecter_n2_camtrackpro(jours: list | None = None) -> tuple:

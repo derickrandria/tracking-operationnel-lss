@@ -278,10 +278,17 @@ class ApiWialon:
             raise ErreurApiWialon(f"svc={svc} injoignable : "
                                   f"{type(e).__name__}") from e
         if isinstance(data, dict) and data.get("error"):
-            if int(data["error"]) == 1 and reessai:      # session expirée
+            code_err = int(data["error"])
+            if code_err == 1 and reessai:      # session expirée
                 self._sid = None
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = None
                 self.connecter()
                 return self._appel(svc, params, reessai=False)
+            if code_err in (1, 4, 7, 8):
+                self._sid = None
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = None
             raise ErreurApiWialon(f"svc={svc} → erreur Wialon "
                                   f"{data.get('error')} : "
                                   f"{str(data.get('reason'))[:120]}")
@@ -289,16 +296,25 @@ class ApiWialon:
 
     def connecter(self) -> str:
         with self._verrou:
-            r = self._appel("token/login", {"token": self._jeton},
-                            reessai=False)
-            if "eid" not in r:
-                raise ErreurApiWialon(f"jeton refusé : {r}")
-            self._sid = r["eid"]
-            if SESSION_PARTAGEE:
-                _sid_partage["sid"] = self._sid
-            log.info("CamtrackPro API : session Wialon ouverte (%s)",
-                     r.get("user", {}).get("nm"))
-            return self._sid
+            try:
+                r = self._appel("token/login", {"token": self._jeton},
+                                reessai=False)
+                if not isinstance(r, dict) or "eid" not in r:
+                    self._sid = None
+                    if SESSION_PARTAGEE:
+                        _sid_partage["sid"] = None
+                    raise ErreurApiWialon(f"jeton refusé : {r}")
+                self._sid = r["eid"]
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = self._sid
+                log.info("CamtrackPro API : session Wialon ouverte (%s)",
+                         r.get("user", {}).get("nm"))
+                return self._sid
+            except Exception:
+                self._sid = None
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = None
+                raise
 
     def _exiger_session(self) -> None:
         if not self._sid:

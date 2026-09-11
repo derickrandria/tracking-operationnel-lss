@@ -658,7 +658,7 @@ def sante(db: Session = Depends(get_db)):
         from .api_wialon import jeton_configure
         from .engine import retard_collecte_s
         from .models import EvenementGPS
-        from .scrapers import _mzonex_api_active
+        from .scrapers import _mzonex_api_active, etat_collecte_memoire
         now = now_local()
         retard_s = retard_collecte_s(db, now)
         dernier_ev = db.scalar(select(func.max(EvenementGPS.horodatage)))
@@ -666,8 +666,11 @@ def sante(db: Session = Depends(get_db)):
             select(func.count(Vehicule.id)).where(Vehicule.statut == StatutVehicule.ACTIF)
         ) or 0
 
+        statut_str = "COLLECTE_OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE"
+
         return {
-            "statut": "OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE",
+            "statut": statut_str,
+            "statut_collecte": statut_str,
             "pid": os.getpid(),
             "version": APP_VERSION,
             "heure_serveur": now.isoformat(),
@@ -679,11 +682,12 @@ def sante(db: Session = Depends(get_db)):
             "dernier_evenement_gps": dernier_ev.isoformat() if dernier_ev else None,
             "retard_collecte_min": round(retard_s / 60, 1) if retard_s is not None else None,
             "vehicules_actifs": nb_vehicules_actifs,
+            "etat_collecteur": etat_collecte_memoire(),
         }
     except Exception as e:
         log.exception("Erreur dans /api/sante")
         return {
-            "statut": "OK",
+            "statut": "COLLECTE_OK",
             "pid": os.getpid(),
             "version": APP_VERSION,
             "heure_serveur": now_local().isoformat(),

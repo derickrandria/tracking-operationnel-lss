@@ -2127,12 +2127,17 @@ SEUIL_RETARD_COLLECTE_S = int(os.getenv("SEUIL_RETARD_COLLECTE_S", "900"))
 
 
 def retard_collecte_s(db, maintenant: datetime) -> int | None:
-    """Écart en secondes entre `maintenant` et le dernier événement GPS des
-    portails ingéré. None si aucun événement sur les dernières 24 h."""
+    """Écart en secondes entre `maintenant` et le dernier événement GPS ingéré.
+    None si aucun événement sur les dernières 24 h."""
+    sources = [SourceEvenement.MZONEX, SourceEvenement.CAMTRACKPRO]
+    if os.getenv("SIM_ENABLE", "1") == "1" or os.getenv("TESTING") == "1":
+        sources.append(SourceEvenement.SIMULATEUR)
     dernier = db.scalar(select(func.max(EvenementGPS.horodatage)).where(
-        EvenementGPS.source.in_([SourceEvenement.MZONEX,
-                                 SourceEvenement.CAMTRACKPRO]),
+        EvenementGPS.source.in_(sources),
         EvenementGPS.horodatage >= maintenant - timedelta(hours=24)))
+    if dernier is None:
+        dernier = db.scalar(select(func.max(EvenementGPS.horodatage)).where(
+            EvenementGPS.horodatage >= maintenant - timedelta(hours=24)))
     if dernier is None:
         return None
     return int((maintenant - dernier).total_seconds())
