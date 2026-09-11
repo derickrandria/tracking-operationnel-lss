@@ -2170,7 +2170,7 @@ def boucle_collecte():
     """Collecte planifiée Niveau 1 en continu (période COLLECTOR_PERIODE_S, §10).
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
     borne §5 : pas de flux temps réel fiable côté Camtrack)."""
-    source = os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper()
+    source = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
     periode = _env_int("COLLECTOR_PERIODE_S", 10)
     noms = SOURCES_NIVEAU1_MIXTE if source == "MIXTE" else [source]
     classes = [(nom, SOURCES.get(nom)) for nom in noms]

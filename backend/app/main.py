@@ -75,7 +75,7 @@ async def _boucle_collecteur_reel():
     Les points insérés transitent par le même `ingest_event()` (§7) : missions,
     temps réglementaires, infractions, alertes et temps réel s'enchaînent tels quels."""
     from .scrapers import SOURCES, boucle_collecte
-    source = os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper()
+    source = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
     if source not in SOURCES and source != "MIXTE":
         return
     if SIM_ENABLE:
@@ -478,7 +478,7 @@ async def _boucle_reconciliation_reelle():
     rapport CamtrackPro) en production réelle, à la fréquence paramétrable
     FREQUENCE_SYNC_TRAJETS_VALIDES (éditable dans Paramètres, §7.4)."""
     from . import scrapers
-    source = os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper()
+    source = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
     if SIM_ENABLE or (source not in scrapers.VALIDATEURS_TRAJETS and source != "MIXTE"):
         return
     log.info("Synchronisation Niveau 2 activée pour %s", source)
@@ -674,7 +674,7 @@ def sante(db: Session = Depends(get_db)):
             "pid": os.getpid(),
             "version": APP_VERSION,
             "heure_serveur": now.isoformat(),
-            "mode_collecte": os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper(),
+            "mode_collecte": os.getenv("COLLECTOR_SOURCE", "MIXTE").upper(),
             "sim_enable": SIM_ENABLE,
             "wialon_session_partagee": os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1",
             "wialon_token_present": jeton_configure(),

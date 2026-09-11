@@ -206,8 +206,9 @@ TOKEN_TTL_MIN = int(os.getenv("TOKEN_TTL_MIN", "10080"))  # 7 jours (choix méti
 # ---------------------------------------------------------------- simulateur
 # Le simulateur remplace le scraping MZoneX/CamtrackPro tant que les identifiants
 # ne sont pas fournis. SIM_ENABLE=0 pour le désactiver (mode production réelle).
-SIM_ENABLE = os.getenv("SIM_ENABLE", "1") == "1"
+SIM_ENABLE = os.getenv("SIM_ENABLE", "0") == "1"
 SIM_TICK_S = int(os.getenv("SIM_TICK_S", "20"))       # cadence de remontée live (s)
+COLLECTOR_SOURCE = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
 
 # ---------------------------------------------------------------- frontend
 FRONTEND_DIST = os.getenv("FRONTEND_DIST", str(ROOT_DIR.parent / "frontend" / "dist"))
