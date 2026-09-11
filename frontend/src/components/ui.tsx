@@ -24,11 +24,12 @@ export function Card({ children, className, titre, actions, contenuClasse }: {
   );
 }
 
-export function Badge({ children, couleur }: { children: ReactNode; couleur?: string }) {
+export function Badge({ children, couleur, className }: { children: ReactNode; couleur?: string; className?: string }) {
   return (
     <span className={cls(
       "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-semibold whitespace-nowrap",
-      couleur || "bg-slate-500/10 text-slate-600 dark:text-slate-300 border-slate-400/30")}>
+      couleur || "bg-slate-500/10 text-slate-600 dark:text-slate-300 border-slate-400/30",
+      className)}>
       {children}
     </span>
   );

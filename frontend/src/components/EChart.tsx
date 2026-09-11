@@ -10,19 +10,33 @@ export default function EChart({ option, height = 260 }: { option: any; height?:
 
   useEffect(() => {
     if (!ref.current) return;
-    const chart = echarts.init(ref.current, theme === "dark" ? "dark" : undefined, { renderer: "canvas" });
-    chartRef.current = chart;
-    const ro = new ResizeObserver(() => chart.resize());
-    ro.observe(ref.current);
-    return () => {
-      ro.disconnect();
-      chart.dispose();
-      chartRef.current = null;
-    };
+    try {
+      const existing = echarts.getInstanceByDom(ref.current);
+      if (existing) {
+        existing.dispose();
+      }
+      const chart = echarts.init(ref.current, theme === "dark" ? "dark" : undefined, { renderer: "canvas" });
+      chartRef.current = chart;
+      const ro = new ResizeObserver(() => {
+        try { chart.resize(); } catch {}
+      });
+      ro.observe(ref.current);
+      return () => {
+        ro.disconnect();
+        try { chart.dispose(); } catch {}
+        chartRef.current = null;
+      };
+    } catch (err) {
+      console.warn("Erreur initialisation ECharts:", err);
+    }
   }, [theme]);
 
   useEffect(() => {
-    chartRef.current?.setOption({ backgroundColor: "transparent", ...option }, true);
+    try {
+      chartRef.current?.setOption({ backgroundColor: "transparent", ...option }, true);
+    } catch (err) {
+      console.warn("Erreur setOption ECharts:", err);
+    }
   }, [option, theme]);
 
   return <div ref={ref} style={{ height, width: "100%" }} />;

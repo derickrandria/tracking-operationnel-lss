@@ -12,12 +12,21 @@ const COULEURS_STATUT: Record<string, string> = {
   "CHARGÉ": "#f59e0b", "VIDE": "#3b82f6", "LIBRE": "#22c55e",
 };
 
-function iconeCamion(statut: string | null) {
+function iconeCamion(statut: string | null, moteur?: boolean, vitesse?: number) {
   const c = COULEURS_STATUT[statut || ""] || "#94a3b8";
+  const estEnMouvement = (vitesse || 0) > 3;
+  const estMoteurOn = Boolean(moteur);
+
+  const bordure = estEnMouvement
+    ? "border-emerald-500 shadow-emerald-500/50"
+    : estMoteurOn
+    ? "border-amber-500 shadow-amber-500/40"
+    : "border-slate-400 opacity-90";
+
   return L.divIcon({
     className: "",
-    html: `<div class="marqueur-camion" style="width:14px;height:14px;background:${c}"></div>`,
-    iconSize: [14, 14], iconAnchor: [7, 7], popupAnchor: [0, -8],
+    html: `<div class="marqueur-camion ${bordure}" style="width:16px;height:16px;border-radius:50%;background:${c};border:2.5px solid white;box-shadow:0 2px 5px rgba(0,0,0,0.4);"></div>`,
+    iconSize: [16, 16], iconAnchor: [8, 8], popupAnchor: [0, -10],
   });
 }
 
@@ -29,55 +38,94 @@ function CarteFlotte({ positions, suivre }: { positions: any[]; suivre: Map<stri
   const theme = useTheme();
 
   useEffect(() => {
-    if (!el.current || mapRef.current) return;
-    const map = L.map(el.current, { zoomControl: true, attributionControl: true })
-      .setView([-18.9, 47.9], 8);
-    mapRef.current = map;
-    return () => { map.remove(); mapRef.current = null; marqueurs.current.clear(); };
+    if (!el.current) return;
+    if (mapRef.current) {
+      try { mapRef.current.remove(); } catch {}
+      mapRef.current = null;
+    }
+    if ((el.current as any)._leaflet_id) {
+      delete (el.current as any)._leaflet_id;
+    }
+    try {
+      const map = L.map(el.current, { zoomControl: true, attributionControl: true })
+        .setView([-18.9, 47.9], 8);
+      mapRef.current = map;
+    } catch (err) {
+      console.warn("Erreur init Leaflet:", err);
+    }
+    return () => {
+      if (mapRef.current) {
+        try { mapRef.current.remove(); } catch {}
+        mapRef.current = null;
+      }
+      marqueurs.current.clear();
+    };
   }, []);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    map.eachLayer((l) => { if (l instanceof L.TileLayer) map.removeLayer(l); });
-    const sombre = theme === "dark";
-    L.tileLayer(
-      sombre
-        ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-        : "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-      { attribution: "© OpenStreetMap · © CARTO", maxZoom: 18 },
-    ).addTo(map);
-    setTimeout(() => map.invalidateSize(), 100);
+    try {
+      map.eachLayer((l) => { if (l instanceof L.TileLayer) map.removeLayer(l); });
+      const sombre = theme === "dark";
+      L.tileLayer(
+        sombre
+          ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+          : "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        { attribution: "© OpenStreetMap · © CARTO", maxZoom: 18 },
+      ).addTo(map);
+      setTimeout(() => {
+        try { map.invalidateSize(); } catch {}
+      }, 100);
+    } catch (err) {
+      console.warn("Erreur mise à jour tuiles Leaflet:", err);
+    }
   }, [theme]);
 
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    const presents = new Set<string>();
-    (positions || []).forEach((p) => {
-      if (p.lat == null || p.lng == null) return;
-      presents.add(p.vehicule_id);
-      const html = `<b>${p.plaque}</b> — ${p.conducteur || "sans chauffeur"}<br/>` +
-        `${p.adresse || "position inconnue"}<br/>` +
-        `Vitesse : ${Math.round(p.vitesse || 0)} km/h · ${p.statut_camion || "—"}<br/>` +
-        `<span style="color:#94a3b8">MAJ ${p.maj ? p.maj.slice(11, 16) : "—"}</span>`;
-      let m = marqueurs.current.get(p.vehicule_id);
-      if (!m) {
-        m = L.marker([p.lat, p.lng], { icon: iconeCamion(p.statut_camion) }).addTo(map);
-        marqueurs.current.set(p.vehicule_id, m);
-      } else {
-        m.setLatLng([p.lat, p.lng]);
-        m.setIcon(iconeCamion(p.statut_camion));
+    try {
+      const presents = new Set<string>();
+      (positions || []).forEach((p) => {
+        if (p.lat == null || p.lng == null) return;
+        presents.add(p.vehicule_id);
+        const contactTxt = p.vitesse > 3
+          ? `<span style="color:#22c55e;font-weight:bold;">🟢 En mouvement (${Math.round(p.vitesse)} km/h)</span>`
+          : p.moteur
+          ? `<span style="color:#f59e0b;font-weight:bold;">🟠 Moteur ON (À l'arrêt)</span>`
+          : `<span style="color:#64748b;">⚪ Stationné / Moteur OFF</span>`;
+
+        const html = `<div style="font-size:12px;min-width:180px;line-height:1.4;">` +
+          `<div style="font-weight:bold;font-size:13px;border-bottom:1px solid #e2e8f0;padding-bottom:3px;margin-bottom:4px;">` +
+          `${p.plaque} <span style="font-weight:normal;color:#64748b;">(${p.conducteur || "Sans chauffeur"})</span>` +
+          `</div>` +
+          `<div style="color:#334155;margin-bottom:3px;">📍 ${p.adresse || "Position enregistrée"}</div>` +
+          `<div style="margin-bottom:2px;"><b>Statut :</b> <span style="color:${COULEURS_STATUT[p.statut_camion] || '#64748b'};font-weight:bold;">${p.statut_camion || '—'}</span></div>` +
+          `<div style="margin-bottom:3px;">${contactTxt}</div>` +
+          `<div style="color:#94a3b8;font-size:11px;">🕒 ${p.maj ? p.maj.slice(0, 16).replace('T', ' ') : 'Dernière position connue'}</div>` +
+          `</div>`;
+
+        let m = marqueurs.current.get(p.vehicule_id);
+        if (!m) {
+          m = L.marker([p.lat, p.lng], { icon: iconeCamion(p.statut_camion, p.moteur, p.vitesse) }).addTo(map);
+          marqueurs.current.set(p.vehicule_id, m);
+        } else {
+          m.setLatLng([p.lat, p.lng]);
+          m.setIcon(iconeCamion(p.statut_camion, p.moteur, p.vitesse));
+        }
+        m.bindPopup(html);
+      });
+      marqueurs.current.forEach((m, id) => {
+        if (!presents.has(id)) { m.remove(); marqueurs.current.delete(id); }
+      });
+      if (!cadre.current && presents.size > 2) {
+        const groupe = L.featureGroup([...marqueurs.current.values()]);
+        map.fitBounds(groupe.getBounds().pad(0.25));
+        cadre.current = true;
       }
-      m.bindPopup(html);
-    });
-    marqueurs.current.forEach((m, id) => {
-      if (!presents.has(id)) { m.remove(); marqueurs.current.delete(id); }
-    });
-    if (!cadre.current && presents.size > 2) {
-      const groupe = L.featureGroup([...marqueurs.current.values()]);
-      map.fitBounds(groupe.getBounds().pad(0.25));
-      cadre.current = true;
+    } catch (err) {
+      console.warn("Erreur mise à jour marqueurs Leaflet:", err);
     }
   }, [positions]);
 
@@ -97,6 +145,7 @@ function Kpi({ label, valeur, sous, accent }: { label: string; valeur: any; sous
 
 export default function Dashboard() {
   const [data, setData] = useState<any | null>(null);
+  const [erreur, setErreur] = useState<string | null>(null);
   const [maj, setMaj] = useState("");
   const theme = useTheme();
   const timer = useRef<number>();
@@ -105,8 +154,12 @@ export default function Dashboard() {
     try {
       const d = await api("/api/dashboard");
       setData(d);
+      setErreur(null);
       setMaj(new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
-    } catch { /* géré globalement */ }
+    } catch (e: any) {
+      console.error("Erreur chargement dashboard:", e);
+      setErreur(e?.message || "Erreur de chargement des données");
+    }
   }
 
   useEffect(() => {
@@ -121,6 +174,21 @@ export default function Dashboard() {
       .map((t) => on(t, rafraichir));
     return () => offs.forEach((f) => f());
   }, []);
+
+  if (erreur && !data) {
+    return (
+      <div className="flex h-64 flex-col items-center justify-center gap-3 text-slate-500">
+        <p className="text-red-500 font-medium">{erreur}</p>
+        <button
+          type="button"
+          onClick={() => charger()}
+          className="px-3 py-1.5 text-xs font-semibold rounded bg-blue-600 hover:bg-blue-700 text-white"
+        >
+          Réessayer
+        </button>
+      </div>
+    );
+  }
 
   if (!data) return <div className="flex h-64 items-center justify-center gap-2 text-slate-400"><Spinner /> Chargement du dashboard…</div>;
 
@@ -138,13 +206,13 @@ export default function Dashboard() {
         <Kpi label="Libres / Vides / Chargés" valeur={`${k.libres} · ${k.vides} · ${k.charges}`} sous={`${k.non_renseignes} non renseignés`} />
         <Kpi label="Missions du jour"
           valeur={<span>{k.missions_en_cours}<span className="text-[13px] font-semibold text-slate-400"> / {k.missions_terminees}</span></span>}
-          sous={`en cours / terminées${k.missions_retardees ? ` · ${k.missions_retardees} retardées` : ""}`} />
+          sous={`en cours / terminées${k.missions_deviees ? ` · ${k.missions_deviees} déviée${k.missions_deviees > 1 ? "s" : ""}` : ""}${k.missions_retardees ? ` · ${k.missions_retardees} retardée${k.missions_retardees > 1 ? "s" : ""}` : ""}`} />
         <Kpi label="Infractions" valeur={k.infractions_jour} sous={`${k.infractions_mois} ce mois`}
           accent={k.infractions_jour > 0 ? "border-red-500/50" : undefined} />
         <Kpi label="Alertes non vues" valeur={k.alertes_non_vues}
           accent={k.alertes_non_vues > 0 ? "border-amber-500/50" : undefined} />
         <Kpi label="Kilométrage du jour" valeur={`${Math.round(k.km_total_jour)} km`}
-          sous={`TCJ moy. ${fmtDuree(k.tcj_moyen_s)} · pauses ${fmtDuree(k.pause_moyenne_s)}`} />
+          sous={`${Math.round(k.km_vide_jour || 0)} km vide · ${Math.round(k.km_charge_jour || 0)} km chargé`} />
       </div>
 
       {/* Carte + colonnes */}

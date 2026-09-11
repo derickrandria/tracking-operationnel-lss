@@ -17,9 +17,17 @@ function versSaisie(p: any): string {
 }
 function depuisSaisie(p: any, s: string): number | null {
   if (p.type_valeur === "DUREE_S") {
-    const m = s.trim().match(/^(\d{1,3})\s*[:h]\s*(\d{1,2})?$/);
+    const txt = s.trim();
+    // Supporte "10", "10h", "10h30", "10:30", "10:30:00" ou secondes directes "36000"
+    const m = txt.match(/^(\d{1,5})(?:\s*[:h]\s*(\d{1,2})?(?:\s*[:m]\s*(\d{1,2}))?)?$/i);
     if (!m) return null;
-    return parseInt(m[1]) * 3600 + (parseInt(m[2] || "0") * 60);
+    const h = parseInt(m[1], 10);
+    const min = parseInt(m[2] || "0", 10);
+    const sec = parseInt(m[3] || "0", 10);
+    if (h > 100 && !m[2] && !m[3]) {
+      return h; // valeur déjà en secondes brutes
+    }
+    return h * 3600 + min * 60 + sec;
   }
   const n = parseFloat(s);
   return isNaN(n) ? null : n;
@@ -66,12 +74,10 @@ export default function Parametres() {
   const [formUser, setFormUser] = useState<any | null>(null);
 
   async function charger() {
-    try {
-      setParams(await api("/api/parametres"));
-      setSituations(await api("/api/situations"));
-      setUsers(await api("/api/utilisateurs"));
-      setAudit(await api("/api/audit?limite=60"));
-    } catch { /* RBAC géré par route */ }
+    api("/api/parametres").then(setParams).catch(() => setParams([]));
+    api("/api/situations").then(setSituations).catch(() => setSituations([]));
+    api("/api/utilisateurs").then(setUsers).catch(() => setUsers([]));
+    api("/api/audit?limite=60").then(setAudit).catch(() => setAudit([]));
   }
   useEffect(() => { charger(); }, []);
 

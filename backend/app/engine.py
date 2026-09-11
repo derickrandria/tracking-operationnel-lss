@@ -9,23 +9,32 @@ Déclenché à chaque nouvel événement GPS (collecte §10). Il :
 Aucune valeur seuil n'est codée en dur : tout vient de `ParametrageSeuil` (§5.8).
 """
 import logging
+import hashlib
 import math
-from datetime import date, datetime, timedelta
+import os
+from datetime import date, datetime, time, timedelta
 from threading import RLock
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, jour_attribution,
-                     mots_ignores_badge, mots_ignores_conducteur,
-                     normaliser_ident, normaliser_libelle, now_local,
+from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, calculer_tokens_set,
+                     est_libelle_service_ou_garage, jour_attribution, mots_ignores_badge,
+                     mots_ignores_conducteur, normaliser_ident, normaliser_libelle, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
 from .event_bus import publish
-from .models import (Alerte, AuditLog, EvenementGPS, GraviteAlerte,
-                     GraviteInfraction, Infraction, Mission, ParametrageSeuil,
-                     SourceEvenement, StatutAlerte, StatutCamion, StatutMission,
-                     StatutValidationTrajet, StatutVehicule, SuiviJournalier,
-                     Trajet, TypeAlerte, TypeEvenement, TypeInfraction, Vehicule)
+from .geozones import (DEPOT_OFFICIEL_CHARGEMENT, DEPOTS_DECHARGEMENT_CODES,
+                       DEPOTS_OFFICIELS_DECHARGEMENT, DEPOTS_SUD_CODES,
+                       detecter_zone_logistique, nom_officiel_depot,
+                       normaliser_code_depot, extraire_depot_portail,
+                       detecter_checkpoint_rn2)
+from .models import (Alerte, AuditLog, Conducteur, ConducteurAlias, EvenementGPS,
+                     GraviteAlerte, GraviteInfraction, HistoriqueJournalier, Infraction, Mission,
+                     ParametrageSeuil, SourceEvenement, StatutAlerte,
+                     StatutCamion, StatutConducteur, StatutMission, StatutValidationTrajet,
+                     StatutVehicule, SuiviJournalier, Trajet, TypeAlerte,
+                     TypeEvenement, TypeInfraction, Vehicule, uid)
 from .serializers import iso, s_alerte, s_infraction, s_mission, s_suivi
 
 log = logging.getLogger("lss.engine")
@@ -101,6 +110,14 @@ SEUILS_DEFAUT = {
     "CONDUITE_BADGE_FENETRE_S": (600, "DUREE_S",
         "Alerte « roule sans badge » (MZoneX) : véhicule > 3 km/h sans clé "
         "chauffeur vue depuis plus de cette fenêtre (§0septies B5)"),
+    # --- Module Temps de Conduite (TCH) ---
+    "SEUIL_TCH_ALERTE": (165600, "DUREE_S",
+        "Seuil d'alerte TCH proche de la limite — avertissement (46h)"),
+    "SEUIL_TCH_MAX": (201600, "DUREE_S",
+        "Temps de conduite hebdomadaire maximal (56h)"),
+    # --- Module Missions & Cycles Logistiques (Règle 1) ---
+    "SEUIL_DUREE_DEPART_RN2": (3600, "DUREE_S",
+        "Durée minimale de conduite sur RN2 hors Base Tana pour valider le début effectif de mission (1h00 — Règle 1)"),
 }
 
 _cache_seuils: dict = {"valeurs": None, "charge_le": None}
@@ -113,7 +130,11 @@ def get_seuils(db) -> dict:
         return _cache_seuils["valeurs"]
     valeurs = {cle: v[0] for cle, v in SEUILS_DEFAUT.items()}
     for row in db.scalars(select(ParametrageSeuil)):
-        valeurs[row.cle] = row.valeur
+        val = row.valeur
+        # Sécurité d'unité : si un seuil de durée (ex: SEUIL_TCJ_MAX) a été saisi en heures (<= 24) au lieu de secondes
+        if row.type_valeur == "DUREE_S" and val is not None and 0 < val <= 24:
+            val = val * 3600
+        valeurs[row.cle] = val
     _cache_seuils.update(valeurs=valeurs, charge_le=now)
     return valeurs
 
@@ -175,13 +196,18 @@ def libelle_derniere_position(db, vehicule_id: str, jour: date) -> str | None:
         or f"{ev.latitude:.4f}, {ev.longitude:.4f}"
 
 
-def ensure_suivi(db, vehicule: Vehicule, jour: date) -> SuiviJournalier:
+def ensure_suivi(db, vehicule: Vehicule | str, jour: date) -> SuiviJournalier:
     """Retourne la ligne du jour (créée si besoin).
 
     À la création (§8) : Partie A synchronisée du référentiel, Partie B
     recopiée de la veille (aucune ressaisie), emplacement J-1 repris de
     l'arrêt final précédent ; Parties C et D restent vides.
     """
+    if isinstance(vehicule, str):
+        vehicule = db.get(Vehicule, vehicule)
+        if not vehicule:
+            raise ValueError("Véhicule introuvable")
+
     s = db.scalar(select(SuiviJournalier).where(
         SuiviJournalier.date_jour == jour, SuiviJournalier.vehicule_id == vehicule.id))
     if s:
@@ -189,13 +215,16 @@ def ensure_suivi(db, vehicule: Vehicule, jour: date) -> SuiviJournalier:
     precedent = db.scalar(select(SuiviJournalier).where(
         SuiviJournalier.vehicule_id == vehicule.id,
         SuiviJournalier.date_jour < jour).order_by(SuiviJournalier.date_jour.desc()))
+    conducteur_id = (precedent.conducteur_id if precedent is not None
+                     else vehicule.conducteur_actuel_id)
     s = SuiviJournalier(
         date_jour=jour,
         vehicule_id=vehicule.id,
-        conducteur_id=vehicule.conducteur_actuel_id or (precedent.conducteur_id if precedent else None),
+        conducteur_id=conducteur_id,
+        conducteur_origine=(precedent.conducteur_origine if precedent else None),
         # Partie B — report de la veille (§8.3)
         situation=precedent.situation if precedent else None,
-        statut_camion=precedent.statut_camion if precedent else None,
+        statut_camion=precedent.statut_camion if precedent else StatutCamion.LIBRE,
         depot_recepteur=precedent.depot_recepteur if precedent else None,
         distributeur=precedent.distributeur if precedent else None,
         produit=precedent.produit if precedent else None,
@@ -219,7 +248,7 @@ def ensure_suivi(db, vehicule: Vehicule, jour: date) -> SuiviJournalier:
 
 def ensure_suivis_du_jour(db, jour: date | None = None):
     jour = jour or now_local().date()
-    vehicules = db.scalars(select(Vehicule).where(Vehicule.statut != "INACTIF")).all()
+    vehicules = db.scalars(select(Vehicule).where(Vehicule.statut == StatutVehicule.ACTIF)).all()
     for v in vehicules:
         ensure_suivi(db, v, jour)
     db.commit()
@@ -308,6 +337,9 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
              manœuvre ≥ 30 min coupe aussi, AM-6) ; 0 si le camion est
              actuellement dans une pause coupante ; arrêt court EN COURS :
              le chrono continue (H2) ;
+             v1.46 : mini-manœuvres CUMULÉES ≥ 30 min dans la session
+             → TCC = 0 (AM-6 étendu) ; ligne ouverte + camion arrêté
+             ≥ 30 min → TCC = 0 (arbitrage LSS du 04/09/2026) ;
              R1 (v3) : le TCC traverse minuit — si la première ligne du jour
              est le segment B d'un split (début 00:00) et que la veille
              s'est close à 23:59:59 avec un TCC ouvert, la session s'amorce
@@ -334,10 +366,11 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
 
     vehicule = db.get(Vehicule, suivi.vehicule_id)
     roule, fin_sub = etat_roulage(vehicule, maintenant, seuils)
+    segs_tous = [Segment(debut=t.heure_debut, fin=t.heure_fin, distance_km=t.distance_km,
+                         rejete=(t.statut_validation == StatutValidationTrajet.REJETE), ref=t)
+                 for t in tous if t.heure_debut is not None]
     journee = construire_journee(
-        [Segment(debut=t.heure_debut, fin=t.heure_fin, distance_km=t.distance_km,
-                 rejete=(t.statut_validation == StatutValidationTrajet.REJETE), ref=t)
-         for t in tous if t.heure_debut is not None],
+        segs_tous,
         maintenant=maintenant, pause_min=pause_min, seuil_km=seuil_km,
         roule=roule, fin_substitution=fin_sub,
         pause_affichee_min=pause_tcc)
@@ -416,6 +449,34 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
     if (derniere.fin is not None
             and (maintenant - derniere.fin).total_seconds() >= pause_tcc):
         tcc = 0.0
+
+    # ── Correctif v1.46 (arbitrage LSS du 04/09/2026) — deux garde-fous qui
+    # ramènent le chrono à ZÉRO, demandés par l'exploitant :
+    # (a) MINI-MANŒUVRES CUMULÉES : la durée TOTALE des trajets invalides
+    #     (manœuvres < 0,3 km, rejetées) de la session courante atteint
+    #     SEUIL_PAUSE_COUPURE_TCC (30 min) → le camion est en réalité à l'arrêt
+    #     depuis une pause coupante → TCC = 0 (AM-6 étendu : avant, une
+    #     manœuvre ne coupait que si ELLE SEULE faisait ≥ 30 min).
+    # (b) LIGNE OUVERTE + CAMION ARRÊTÉ : une ligne « en cours » (GPS muet ou
+    #     signal de roulage absent) faisait courir le chrono INDÉFINIMENT —
+    #     même camion garé depuis des heures. Si le camion ne roule PAS
+    #     (etat_roulage, signal > 15 min ou vitesse ≤ 3 km/h) et que le
+    #     dernier signal connu date de ≥ 30 min → TCC = 0 (H2 honoré :
+    #     en dessous de 30 min le chrono continue de s'écouler).
+    if session:
+        debut_session = session[0].debut
+        fin_session_ref = fin_session
+        manoeuvres_s = sum(
+            (s.fin - s.debut).total_seconds()
+            for s in segs_tous
+            if s.rejete and s.debut is not None and s.fin is not None
+            and debut_session <= s.debut <= fin_session_ref)
+        if manoeuvres_s >= pause_tcc:
+            tcc = 0.0
+    if (session and session[-1].fin is None
+            and not roule and fin_sub is not None
+            and (maintenant - fin_sub).total_seconds() >= pause_tcc):
+        tcc = 0.0
     suivi.tcc_s = int(max(0.0, tcc))
 
 
@@ -435,6 +496,81 @@ def _alerte_recente(db, type_alerte, vehicule_id, minutes) -> bool:
         Alerte.type == type_alerte, Alerte.vehicule_id == vehicule_id,
         Alerte.date_heure >= borne)
     return (db.scalar(q) or 0) > 0
+
+
+def _alerte_recente_conducteur(db, type_alerte, conducteur_id, minutes) -> bool:
+    borne = now_local() - timedelta(minutes=minutes)
+    q = select(func.count(Alerte.id)).where(
+        Alerte.type == type_alerte, Alerte.conducteur_id == conducteur_id,
+        Alerte.date_heure >= borne)
+    return (db.scalar(q) or 0) > 0
+
+
+def verifier_alertes_tch(db, conducteur_id: str | None, seuils: dict, ts: datetime):
+    """Contrôle des seuils TCH (Temps de Conduite Hebdomadaire) pour un chauffeur.
+
+    - Seuil d'avertissement : TCH cumulé ≥ 46h00 (165 600 s)
+      Message : « TCH proche de la limite — [Nom chauffeur] — [Cumul TCH] — [TCH restant] »
+    - Seuil limite : TCH cumulé ≥ 56h00 (201 600 s)
+      Message : « TCH limite atteinte — [Nom chauffeur] »
+    """
+    if not conducteur_id:
+        return
+
+    from .routers.temps_conduite import (
+        SEUIL_TCH_ALERTE_S, SEUIL_TCH_MAX_S, calculer_tch_seul_conducteur)
+
+    seuil_alerte = float(seuils.get("SEUIL_TCH_ALERTE", SEUIL_TCH_ALERTE_S))
+    seuil_max = float(seuils.get("SEUIL_TCH_MAX", SEUIL_TCH_MAX_S))
+
+    try:
+        tch_info = calculer_tch_seul_conducteur(db, conducteur_id, maintenant=ts)
+    except Exception:
+        log.exception("Erreur calcul TCH pour alerte chauffeur %s", conducteur_id)
+        return
+
+    tch_cumul = tch_info.get("tch_cumul_s") or 0
+    tch_restant = max(0, int(seuil_max - tch_cumul))
+
+    flag_max = ("tch_max", conducteur_id)
+    flag_warn = ("tch_warn", conducteur_id)
+
+    conducteur = db.get(Conducteur, conducteur_id)
+    nom = (conducteur.nom_prenom or conducteur.prenom_usuel) if conducteur else "Chauffeur"
+
+    if tch_cumul >= seuil_max:
+        with _lock:
+            leve_max = flag_max in _flags
+        if not leve_max and not _alerte_recente_conducteur(db, TypeAlerte.TCH_LIMITE_ATTEINTE, conducteur_id, minutes=120):
+            alerte = creer_alerte(
+                db, TypeAlerte.TCH_LIMITE_ATTEINTE, GraviteAlerte.CRITIQUE,
+                f"TCH limite atteinte — {nom}",
+                ts=ts, conducteur_id=conducteur_id, lien_module="/temps-conduite")
+            if PUBLISH_ENABLED["on"]:
+                publish("alerte.new", s_alerte(alerte))
+            with _lock:
+                _flags[flag_max] = True
+                _flags[flag_warn] = True
+    elif tch_cumul >= seuil_alerte:
+        with _lock:
+            leve_warn = flag_warn in _flags
+            _flags.pop(flag_max, None)
+        if not leve_warn and not _alerte_recente_conducteur(db, TypeAlerte.TCH_PROCHE_LIMITE, conducteur_id, minutes=120):
+            from .serializers import fmt_hms
+            cumul_txt = fmt_hms(tch_cumul) or "46:00"
+            restant_txt = fmt_hms(tch_restant) or "00:00"
+            alerte = creer_alerte(
+                db, TypeAlerte.TCH_PROCHE_LIMITE, GraviteAlerte.MOYENNE,
+                f"TCH proche de la limite — {nom} — {cumul_txt} — {restant_txt}",
+                ts=ts, conducteur_id=conducteur_id, lien_module="/temps-conduite")
+            if PUBLISH_ENABLED["on"]:
+                publish("alerte.new", s_alerte(alerte))
+            with _lock:
+                _flags[flag_warn] = True
+    else:
+        with _lock:
+            _flags.pop(flag_warn, None)
+            _flags.pop(flag_max, None)
 
 
 def creer_infraction(db, suivi, vehicule, type_inf, gravite, ts,
@@ -563,6 +699,10 @@ def _verifier_temps(db, suivi, vehicule, seuils, ts):
         with _lock:
             _flags.pop(flag_p, None)
 
+    # --- Contrôle TCH (Temps de Conduite Hebdomadaire par chauffeur) ---
+    if suivi.conducteur_id:
+        verifier_alertes_tch(db, suivi.conducteur_id, seuils, ts)
+
 
 def _hmm(secondes) -> str:
     s = int(secondes or 0)
@@ -581,6 +721,14 @@ def _auditer(db, action: str, entite_id: str | None, details: dict):
     """Journal d'audit système (Addendum v1.5 §7.3 : REJET_TRAJET traçable)."""
     db.add(AuditLog(username="moteur", action=action, entite="trajet",
                     entite_id=entite_id, details=details))
+
+
+def cle_idempotence_evenement(vehicule_id: str, ts: datetime, lat: float,
+                              lon: float, source: SourceEvenement) -> str:
+    """Clé stable d'un événement brut, indépendante de sa passe de collecte."""
+    brut = "|".join((str(vehicule_id), ts.isoformat(), f"{float(lat):.6f}",
+                     f"{float(lon):.6f}", str(getattr(source, "value", source))))
+    return hashlib.sha256(brut.encode("utf-8")).hexdigest()
 
 
 def _finaliser_trajet(db, trajet: "Trajet", vehicule: Vehicule, seuils: dict,
@@ -608,13 +756,16 @@ def _finaliser_trajet(db, trajet: "Trajet", vehicule: Vehicule, seuils: dict,
     return True
 
 
-def _statut_initial_trajet(plateforme: str) -> "StatutSourceTrajet":
+def _statut_initial_trajet(plateforme: str, source: SourceEvenement = SourceEvenement.SIMULATEUR) -> "StatutSourceTrajet":
     """Addendum v1.4 §2.2/§5 : MZoneX publie les trajets clôturés en différé →
     reconstruction temps réel PROVISOIRE en attendant l'onglet Trajets.
     CamtrackPro « Detail Trajet groupe de véhicules » restitue le calcul natif
     plateforme → VALIDÉ directement (point à re-vérifier avec le métier, §5)."""
     from .models import StatutSourceTrajet
-    if plateforme == "CAMTRACKPRO":
+    # Une position N1 CamtrackPro est une observation temps réel, pas encore
+    # le trajet officiel du rapport N2. Elle doit donc pouvoir être remplacée
+    # par ce rapport au cycle suivant, comme une ligne MZoneX provisoire.
+    if plateforme == "CAMTRACKPRO" and source != SourceEvenement.CAMTRACKPRO:
         return StatutSourceTrajet.VALIDE
     return StatutSourceTrajet.PROVISOIRE
 
@@ -623,7 +774,7 @@ def _nouveau_trajet(suivi: SuiviJournalier, numero: int, debut: datetime,
                     vehicule: Vehicule, source: SourceEvenement) -> "Trajet":
     plateforme = _plateforme_trajet(vehicule, source)
     return Trajet(suivi_id=suivi.id, numero=numero, heure_debut=debut,
-                  statut_source=_statut_initial_trajet(plateforme),
+                  statut_source=_statut_initial_trajet(plateforme, source),
                   source_plateforme=plateforme)
 
 
@@ -631,13 +782,26 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                  adresse: str | None, vitesse: float, moteur: str,
                  type_force: TypeEvenement | None = None,
                  source: SourceEvenement = SourceEvenement.SIMULATEUR,
-                 publier: bool = True) -> dict | None:
+                 publier: bool = True, historique: bool = False) -> dict | None:
     """Point d'entrée unique d'un événement GPS (scraper ou simulateur).
 
     §7.1 : début de mouvement (vitesse > 0 après arrêt), arrêt (vitesse nulle
     persistante > bruit), pause (arrêt ≥ DUREE_MIN_PAUSE_VALIDE), reprise.
     """
     seuils = get_seuils(db)
+    idempotence_key = cle_idempotence_evenement(
+        vehicule.id, ts, lat, lon, source)
+    if db.scalar(select(EvenementGPS.id).where(
+            EvenementGPS.idempotence_key == idempotence_key)):
+        return None
+    if historique:
+        db.add(EvenementGPS(
+            vehicule_id=vehicule.id, horodatage=ts, latitude=lat,
+            longitude=lon, adresse=adresse, vitesse=round(float(vitesse or 0), 1),
+            etat_moteur=moteur, type_evenement=type_force or TypeEvenement.POSITION,
+            source=source, idempotence_key=idempotence_key,
+            received_at=now_local(), historique=True))
+        return {"historique": True, "idempotence_key": idempotence_key}
     # Addendum v1.5 : le seuil « bruit GPS » (2 min) est englobé par la règle
     # de fusion des pauses < 20 min — plus de rôle distinct ici.
     pause_min = seuils["DUREE_MIN_PAUSE_VALIDE"]
@@ -682,7 +846,12 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                 if suivi.mission_id:
                     m = db.get(Mission, suivi.mission_id)
                     if m:
-                        m.kilometrage = (m.kilometrage or 0) + dist
+                        if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE":
+                            m.km_charge = round((m.km_charge or 0.0) + dist, 3)
+                        else:
+                            m.km_vide = round((m.km_vide or 0.0) + dist, 3)
+                        m.kilometrage_total = round((m.km_vide or 0.0) + (m.km_charge or 0.0), 3)
+                        m.kilometrage = m.kilometrage_total
 
         if not trajets:
             trajets = [_nouveau_trajet(suivi, 1, ts, vehicule, source)]
@@ -740,17 +909,25 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
     ev = EvenementGPS(
         vehicule_id=vehicule.id, horodatage=ts, latitude=lat, longitude=lon,
         adresse=adresse, vitesse=round(float(vitesse or 0), 1), etat_moteur=moteur,
-        type_evenement=type_ev, source=source)
+        type_evenement=type_ev or TypeEvenement.POSITION, source=source,
+        idempotence_key=idempotence_key, received_at=now_local(),
+        historique=historique)
     db.add(ev)
 
-    vehicule.last_lat, vehicule.last_lng = lat, lon
-    vehicule.last_vitesse = vitesse
-    vehicule.last_adresse = adresse
-    vehicule.last_event_at = ts
-    vehicule.moteur_on = (moteur == "ON")
+    # Une relecture historique peut ingérer un événement dont l'heure est
+    # antérieure au dernier signal déjà reçu. Elle ne doit jamais faire
+    # reculer l'état temps réel du véhicule ni créer un faux retard GPS.
+    if (not historique and
+            (vehicule.last_event_at is None or ts >= vehicule.last_event_at)):
+        vehicule.last_lat, vehicule.last_lng = lat, lon
+        vehicule.last_vitesse = vitesse
+        vehicule.last_adresse = adresse
+        vehicule.last_event_at = ts
+        vehicule.moteur_on = (moteur == "ON")
 
-    recalculer_temps(db, suivi, ts)
-    _verifier_temps(db, suivi, vehicule, seuils, ts)
+    if not historique:
+        recalculer_temps(db, suivi, ts)
+        _verifier_temps(db, suivi, vehicule, seuils, ts)
 
     # --- événements de conduite (source boîtier OBC) — v3 AM-5/C3 : plus
     # AUCUNE écriture locale dans `Infraction` ; l'excès de vitesse dont le
@@ -800,6 +977,354 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
             with _lock:
                 _flags[flag_h] = ts
 
+    # --- Détection automatique logistique & transitions géographiques (§3) ---
+    z_info = detecter_zone_logistique(lat, lon, adresse)
+    z_type, z_code, z_nom = z_info["type"], z_info["code"], z_info["nom"]
+    seuil_rn2_s = float(seuils.get("SEUIL_DUREE_DEPART_RN2", 3600))
+    flag_sortie = ("sortie_base", vehicule.id)
+
+    # 0. Initialisation automatique de mission au départ de Base Tana vers RN2 (Règle 1 : départ validé après ≥ 1h de conduite RN2)
+    # RÈGLE ABSOLUE : Un déplacement au Sud (RN7), un retour vers la Base ou un déplacement local ne crée JAMAIS de mission.
+    est_sur_rn2_est = (lon is not None and lon > 47.53 and (lat is None or lat > -19.0)) or ("rn2" in (adresse or "").lower()) or (z_type == "GRT")
+    if not suivi.mission_id and (suivi.numero_ot or est_sur_rn2_est):
+        if prev_lat is not None and prev_lng is not None:
+            prev_z = detecter_zone_logistique(prev_lat, prev_lng, vehicule.last_adresse)
+            if prev_z["type"] == "BASETNR" and z_type != "BASETNR" and est_sur_rn2_est:
+                with _lock:
+                    _flags[flag_sortie] = ts
+
+        ts_cand = None
+        with _lock:
+            ts_cand = _flags.get(flag_sortie)
+
+        if ts_cand:
+            if z_type == "BASETNR" or not est_sur_rn2_est:
+                with _lock:
+                    _flags.pop(flag_sortie, None)
+            else:
+                duree_hors_base_s = (ts - ts_cand).total_seconds()
+                if (duree_hors_base_s >= seuil_rn2_s and (roule or (vitesse and vitesse > 3))) or z_type == "GRT":
+                    m_nouv = initialiser_ou_maj_mission(db, suivi, vehicule, None, None, None, None, ts_cand)
+                    m_nouv.heure_debut = ts_cand
+                    m_nouv.statut = StatutMission.EN_COURS
+                    m_nouv.statut_camion_actuel = "LIBRE"
+                    suivi.statut_camion = StatutCamion.LIBRE
+                    m_nouv.etapes = [{"etat": "DEPART_BASE", "ts": iso(ts_cand), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
+                    with _lock:
+                        _flags.pop(flag_sortie, None)
+                    log.info("Règle 1 validée : départ Base Tana confirmé après ≥1h RN2 pour %s -> Mission %s créée (LIBRE, heure_debut=%s)",
+                             vehicule.plaque, m_nouv.code_mission or m_nouv.id, ts_cand)
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.new", s_mission(m_nouv))
+
+    if suivi.mission_id:
+        m_actuelle = db.get(Mission, suivi.mission_id)
+        # Verrouillage de protection : si la mission est déjà terminée, aucun événement ne peut la modifier
+        if m_actuelle and m_actuelle.statut in (StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE):
+
+            # 1. Détection du départ physique (BASETNR ou Moramanga) -> Début réel de mission (heure_debut)
+            if m_actuelle.heure_debut is None:
+                if z_type == "BASETNR":
+                    with _lock:
+                        _flags.pop(flag_sortie, None)
+                    if not any(e.get("etat") == "PRESENCE_BASE" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "PRESENCE_BASE", "ts": iso(ts), "lieu": z_nom, "zone": "BASETNR"}]
+                else:
+                    ts_cand = None
+                    with _lock:
+                        ts_cand = _flags.get(flag_sortie)
+                        if not ts_cand:
+                            _flags[flag_sortie] = ts
+                            ts_cand = ts
+                    duree_hors_base_s = (ts - ts_cand).total_seconds()
+                    if (duree_hors_base_s >= seuil_rn2_s and (roule or (vitesse and vitesse > 3))) or z_type == "GRT" or m_actuelle.numero_ot:
+                        m_actuelle.heure_debut = ts_cand
+                        m_actuelle.statut = StatutMission.EN_COURS
+                        if m_actuelle.statut_camion_actuel not in ("CHARGE", "CHARGÉ"):
+                            if not m_actuelle.numero_ot:
+                                m_actuelle.statut_camion_actuel = "LIBRE"
+                                suivi.statut_camion = StatutCamion.LIBRE
+                            else:
+                                m_actuelle.statut_camion_actuel = "VIDE"
+                                suivi.statut_camion = StatutCamion.VIDE
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEPART_BASE", "ts": iso(ts_cand), "lieu": f"Sortie {z_nom}", "zone": "BASETNR"}]
+                        with _lock:
+                            _flags.pop(flag_sortie, None)
+                        log.info("Sortie physique Base confirmée pour %s -> Début réel mission %s à %s",
+                                 vehicule.plaque, m_actuelle.code_mission or m_actuelle.id, ts_cand)
+                        if PUBLISH_ENABLED["on"]:
+                            publish("mission.update", s_mission(m_actuelle))
+
+            # 2. Présence et Chargement au Dépôt GRT (Tamatave)
+            if z_type == "GRT":
+                if not any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
+                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ENTREE_GRT", "ts": iso(ts), "lieu": z_nom, "zone": "GRT"}]
+
+                # Calcul du temps passé à GRT
+                ts_entree_grt = None
+                for e in reversed(m_actuelle.etapes or []):
+                    if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
+                        try:
+                            ts_entree_grt = datetime.fromisoformat(e["ts"])
+                            break
+                        except Exception:
+                            pass
+                duree_grt_s = (ts - ts_entree_grt).total_seconds() if ts_entree_grt else 0
+
+                # Règle 2 : Présence GRT ≥ 15 min sans OT -> Alerte MISSION_SANS_OT (STRICTEMENT GRT UNIQUE)
+                if duree_grt_s >= 900 and (not m_actuelle.numero_ot or m_actuelle.statut_camion_actuel == "LIBRE"):
+                    if not _alerte_recente(db, TypeAlerte.MISSION_SANS_OT, vehicule.id, 60):
+                        a = creer_alerte(
+                            db, TypeAlerte.MISSION_SANS_OT, GraviteAlerte.MOYENNE,
+                            f"OT manquant — Le camion {vehicule.plaque} est à GRT (GALANA RAFINERIE TERMINALE) depuis {int(duree_grt_s // 60)} min sans Ordre de Transport enregistré",
+                            ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                            lien_module="/missions")
+                        if PUBLISH_ENABLED["on"]:
+                            publish("alerte.new", s_alerte(a))
+
+                # Règle 3 : Présence GRT ≥ 30 min -> Alerte VALIDATION_CHARGEMENT (STRICTEMENT GRT UNIQUE)
+                if duree_grt_s >= 1800 and m_actuelle.validation_chargement != "VALIDÉ":
+                    m_actuelle.validation_chargement = "EN_ATTENTE"
+                    if not _alerte_recente(db, TypeAlerte.VALIDATION_CHARGEMENT, vehicule.id, 60):
+                        a = creer_alerte(
+                            db, TypeAlerte.VALIDATION_CHARGEMENT, GraviteAlerte.INFORMATION,
+                            f"Validation requise : Chargement GRT (GALANA RAFINERIE TERMINALE) pour {vehicule.plaque} (durée présence : {int(duree_grt_s // 60)} min)",
+                            ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                            lien_module="/missions")
+                        if PUBLISH_ENABLED["on"]:
+                            publish("alerte.new", s_alerte(a))
+
+            elif any(e.get("etat") == "ENTREE_GRT" for e in (m_actuelle.etapes or [])):
+                # Sortie effective de la zone GRT -> Bascule automatique en CHARGÉ
+                if getattr(m_actuelle, "statut_camion_actuel", "VIDE") in ("VIDE", "LIBRE") or suivi.statut_camion in (StatutCamion.VIDE, StatutCamion.LIBRE):
+                    m_actuelle.statut_camion_actuel = "CHARGE"
+                    m_actuelle.heure_chargement = ts
+                    m_actuelle.validation_chargement = "VALIDÉ"
+                    suivi.statut_camion = StatutCamion.CHARGE
+                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": "GRT (GALANA RAFINERIE TERMINALE)", "zone": "GRT"}]
+                    # Auto-résolution alerte chargement
+                    db.query(Alerte).filter(
+                        Alerte.vehicule_id == vehicule.id,
+                        Alerte.type == TypeAlerte.VALIDATION_CHARGEMENT,
+                        Alerte.statut != StatutAlerte.TRAITEE
+                    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+                    log.info("Chargement GRT validé (sortie physique) pour %s (Mission %s) -> Statut Camion CHARGÉ",
+                             vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.update", s_mission(m_actuelle))
+                elif getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
+                    if not m_actuelle.heure_chargement or not any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.heure_chargement = ts
+                        m_actuelle.validation_chargement = "VALIDÉ"
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": "GRT (GALANA RAFINERIE TERMINALE)", "zone": "GRT"}]
+                        if PUBLISH_ENABLED["on"]:
+                            publish("mission.update", s_mission(m_actuelle))
+
+            # 3. Transit & Dépôts Récepteurs OFFICIELS STRICTS (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE) : Déviation & Déchargement
+            if getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
+                code_prevu = normaliser_code_depot(m_actuelle.depot_prevu)
+
+                # Tolérance Dépôts Sud / Réparations Tana : passage BASETNR conserve statut CHARGÉ
+                if z_type == "BASETNR" and (code_prevu in DEPOTS_SUD_CODES or z_info.get("est_depot_sud") or code_prevu in ("DABI", "DSNR")):
+                    pass
+                elif z_type == "DEPOT_RECEPTEUR" and z_code in DEPOTS_DECHARGEMENT_CODES:
+                    nom_depot_officiel = nom_officiel_depot(z_code) or z_nom
+                    
+                    if z_code == code_prevu or not code_prevu or m_actuelle.est_deviee:
+                        # 3.1 Camion dans son dépôt récepteur prévu (ou déviation déjà confirmée)
+                        if not any(e.get("etat") == "ARRIVEE_DEPOT_RECEPTEUR" and e.get("zone") == z_code for e in (m_actuelle.etapes or [])):
+                            m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "ARRIVEE_DEPOT_RECEPTEUR", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+                            if PUBLISH_ENABLED["on"]:
+                                publish("mission.update", s_mission(m_actuelle))
+                    else:
+                        # 3.2 Camion dans un AUTRE dépôt officiel récepteur
+                        # Corridor RN2 : Moramanga est sur l'axe obligatoire GRT <-> Tana/Sud.
+                        # Un camion à destination de Tana ou du Sud qui traverse Moramanga est en TRANSIT (Règle 4).
+                        est_transit_rn2_moramanga = (z_code == "DMMG" and code_prevu in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"))
+
+                        if est_transit_rn2_moramanga:
+                            # En transit RN2 Moramanga : déviation uniquement si arrêt avéré >= 2h (7200s)
+                            if not roule and (vitesse is None or vitesse <= 3):
+                                ts_presence_autre = None
+                                for e in reversed(m_actuelle.etapes or []):
+                                    if e.get("etat") == "PRESENCE_AUTRE_DEPOT" and e.get("zone") == z_code and e.get("ts"):
+                                        try:
+                                            ts_presence_autre = datetime.fromisoformat(e["ts"])
+                                            break
+                                        except Exception:
+                                            pass
+                                if not ts_presence_autre:
+                                    ts_presence_autre = ts
+                                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "PRESENCE_AUTRE_DEPOT", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+
+                                duree_autre_s = (ts - ts_presence_autre).total_seconds()
+                                if duree_autre_s >= 7200 and not m_actuelle.est_deviee:
+                                    m_actuelle.est_deviee = True
+                                    m_actuelle.statut = StatutMission.DEVIEE
+                                    m_actuelle.depot_effectif = nom_depot_officiel
+                                    m_actuelle.motif_deviation = f"Déviation constatée : arrêt ≥ 2h à {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})"
+                                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEVIATION_DETECTEE", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+                                    if not _alerte_recente(db, TypeAlerte.DEVIATION_DETECTEE, vehicule.id, 60):
+                                        a = creer_alerte(
+                                            db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
+                                            f"Déviation détectée pour {vehicule.plaque} : nouveau dépôt {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})",
+                                            ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                                            lien_module="/missions")
+                                        if PUBLISH_ENABLED["on"]:
+                                            publish("alerte.new", s_alerte(a))
+                                    if PUBLISH_ENABLED["on"]:
+                                        publish("mission.update", s_mission(m_actuelle))
+                        else:
+                            # Autre dépôt terminal (ex. Fianarantsoa au lieu d'Antsirabe) -> Déviation constatée
+                            if not m_actuelle.est_deviee:
+                                m_actuelle.est_deviee = True
+                                m_actuelle.statut = StatutMission.DEVIEE
+                                m_actuelle.depot_effectif = nom_depot_officiel
+                                m_actuelle.motif_deviation = f"Déviation constatée : réorienté vers {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})"
+                                m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DEVIATION_DETECTEE", "ts": iso(ts), "lieu": nom_depot_officiel, "zone": z_code}]
+                                if not _alerte_recente(db, TypeAlerte.DEVIATION_DETECTEE, vehicule.id, 60):
+                                    a = creer_alerte(
+                                        db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
+                                        f"Déviation détectée pour {vehicule.plaque} : nouveau dépôt {nom_depot_officiel} (prévu : {nom_officiel_depot(m_actuelle.depot_prevu) or m_actuelle.depot_prevu or '—'})",
+                                        ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                                        lien_module="/missions")
+                                    if PUBLISH_ENABLED["on"]:
+                                        publish("alerte.new", s_alerte(a))
+                                if PUBLISH_ENABLED["on"]:
+                                    publish("mission.update", s_mission(m_actuelle))
+
+                # Contrôle de déchargement (Règle 5) : arrêt ≥ 3h (10800 s) STRICTEMENT dans un des 7 dépôts récepteurs officiels ou sortie dépôt
+                est_dans_depot_officiel = (z_type == "DEPOT_RECEPTEUR" and z_code in DEPOTS_DECHARGEMENT_CODES)
+                a_arrivee_depot_officiel = any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in (m_actuelle.etapes or []))
+
+                # Si le camion est en transit RN2 Moramanga sans être dévié, pas de déchargement Moramanga
+                if est_dans_depot_officiel or a_arrivee_depot_officiel:
+                    code_actuel_dep = normaliser_code_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_code)
+                    if code_actuel_dep == "DMMG" and code_prevu in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR") and not m_actuelle.est_deviee:
+                        pass
+                    else:
+                        arret_depot_s = 0
+                        if not roule and trajets and trajets[-1].heure_fin is not None:
+                            arret_depot_s = (ts - trajets[-1].heure_fin).total_seconds()
+                        else:
+                            for e in reversed(m_actuelle.etapes or []):
+                                if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("ts"):
+                                    try:
+                                        arret_depot_s = (ts - datetime.fromisoformat(e["ts"])).total_seconds()
+                                        break
+                                    except Exception:
+                                        pass
+
+                        nom_depot_alerte = nom_officiel_depot(m_actuelle.depot_effectif or m_actuelle.depot_prevu or z_nom) or (z_nom if z_code in DEPOTS_DECHARGEMENT_CODES else None)
+
+                        # Règle 15 & 16 : Confirmation Dépotage Standard (4 conditions strictes)
+                        # 1. Dépôt prévu = Dépôt détecté
+                        # 2. Présence réelle dans le dépôt
+                        # 3. Durée STRICTEMENT > 3 heures (arret_depot_s > 10800)
+                        # 4. Sortie du dépôt détectée
+                        if not est_dans_depot_officiel and a_arrivee_depot_officiel and m_actuelle.validation_dechargement != "INVALIDÉ":
+                            if arret_depot_s > 10800:
+                                # Les 4 conditions sont réunies -> Dépotage CONFIRMÉ (§16)
+                                m_actuelle.validation_dechargement = "VALIDÉ"
+                                m_actuelle.statut = StatutMission.TERMINEE
+                                m_actuelle.statut_camion_actuel = "LIBRE"
+                                m_actuelle.heure_fin = ts
+                                if m_actuelle.heure_debut:
+                                    m_actuelle.duree_s = max(0, int((ts - m_actuelle.heure_debut).total_seconds()))
+                                if not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])):
+                                    m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts), "lieu": nom_depot_alerte or "Dépôt Récepteur", "zone": code_actuel_dep or "DEPOT"}]
+
+                                suivi.statut_camion = StatutCamion.LIBRE
+                                suivi.situation = f"Déchargé au {nom_depot_alerte or 'dépôt'} — Repositionnement"
+                                suivi.numero_ot = None
+                                suivi.distributeur = None
+                                suivi.produit = None
+                                suivi.depot_recepteur = None
+                                suivi.mission_id = None
+
+                                db.query(Alerte).filter(
+                                    Alerte.vehicule_id == vehicule.id,
+                                    Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+                                    Alerte.statut != StatutAlerte.TRAITEE
+                                ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+                                log.info("Dépotage standard confirmé après arrêt >3h et sortie de %s pour %s -> Mission %s TERMINÉE, camion LIBRE",
+                                         nom_depot_alerte, vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
+                                if PUBLISH_ENABLED["on"]:
+                                    publish("mission.update", s_mission(m_actuelle))
+                                    publish("suivi.update", {"suivi": s_suivi(suivi, seuils)})
+                            else:
+                                # Arrêt <= 3h puis sortie : incertitude / pas de dépotage automatique (§15, §41)
+                                if m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
+                                    m_actuelle.validation_dechargement = "EN_ATTENTE"
+                                    if not _alerte_recente(db, TypeAlerte.VALIDATION_DECHARGEMENT, vehicule.id, 120):
+                                        a = creer_alerte(
+                                            db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
+                                            f"Validation requise : Sortie de {nom_depot_alerte} pour {vehicule.plaque} avec durée arrêt ≤ 3h ({int(arret_depot_s // 60)} min)",
+                                            ts=ts, vehicule_id=vehicule.id, conducteur_id=suivi.conducteur_id,
+                                            lien_module="/missions")
+                                        if PUBLISH_ENABLED["on"]:
+                                            publish("alerte.new", s_alerte(a))
+
+                        elif arret_depot_s > 10800 and m_actuelle.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and nom_depot_alerte:
+                            # Toujours dans le dépôt après > 3h : en attente de sortie (§18)
+                            m_actuelle.validation_dechargement = "EN_ATTENTE"
+
+            # 4. Détection Checkpoints RN2 (DMMG - Preuve rétrospective / Invalidation §20-§25, §39)
+            if getattr(m_actuelle, "statut_camion_actuel", "VIDE") == "CHARGE":
+                cp = detecter_checkpoint_rn2(lat, lon, adresse)
+                if cp:
+                    if not any(e.get("etat") == f"CHECKPOINT_{cp}" for e in (m_actuelle.etapes or [])):
+                        m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": f"CHECKPOINT_{cp}", "ts": iso(ts), "lieu": adresse or cp, "zone": cp}]
+
+                    # Si le camion est passé par Moramanga (DMMG)
+                    a_visite_mmg = any(e.get("zone") == "DMMG" for e in (m_actuelle.etapes or []))
+                    if a_visite_mmg:
+                        if cp in ("ANDASIBE", "AMBATOSONEGALY"):
+                            # §21, §22 : Preuve rétrospective de dépotage à Moramanga
+                            ts_dechargement_mmg = ts
+                            for e in reversed(m_actuelle.etapes or []):
+                                if e.get("zone") == "DMMG" and e.get("ts"):
+                                    try:
+                                        ts_dechargement_mmg = datetime.fromisoformat(e["ts"])
+                                        break
+                                    except Exception:
+                                        pass
+
+                            m_actuelle.validation_dechargement = "VALIDÉ"
+                            m_actuelle.statut = StatutMission.TERMINEE
+                            m_actuelle.statut_camion_actuel = "LIBRE"
+                            m_actuelle.depot_effectif = nom_officiel_depot("DMMG")
+                            m_actuelle.heure_fin = ts_dechargement_mmg
+                            if m_actuelle.heure_debut:
+                                m_actuelle.duree_s = max(0, int((ts_dechargement_mmg - m_actuelle.heure_debut).total_seconds()))
+                            if not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m_actuelle.etapes or [])):
+                                m_actuelle.etapes = (m_actuelle.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts_dechargement_mmg), "lieu": nom_officiel_depot("DMMG"), "zone": "DMMG"}]
+
+                            suivi.statut_camion = StatutCamion.LIBRE
+                            suivi.situation = "Dépotage confirmé Moramanga (Preuve rétrospective) — Repositionnement"
+                            suivi.numero_ot = None
+                            suivi.distributeur = None
+                            suivi.produit = None
+                            suivi.depot_recepteur = None
+                            suivi.mission_id = None
+
+                            db.query(Alerte).filter(
+                                Alerte.vehicule_id == vehicule.id,
+                                Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+                                Alerte.statut != StatutAlerte.TRAITEE
+                            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+                            log.info("§21 Dépotage DMMG confirmé rétrospectivement (checkpoint %s) pour %s -> Mission %s TERMINÉE",
+                                     cp, vehicule.plaque, m_actuelle.code_mission or m_actuelle.id)
+                            if PUBLISH_ENABLED["on"]:
+                                publish("mission.update", s_mission(m_actuelle))
+                                publish("suivi.update", {"suivi": s_suivi(suivi, seuils)})
+
+                        elif cp in ("ANDRIAKA", "TANA"):
+                            # §24 : Invalidation de l'hypothèse de dépotage à Moramanga (transit RN2 vers Tana/Sud)
+                            pass
+
     db.commit()
 
     # Addendum v1.4 §2.3 — notification « trajet terminé » (hook : validation
@@ -826,64 +1351,149 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
 def _mission_ouverte(db, vehicule_id, jour) -> Mission | None:
     return db.scalar(select(Mission).where(
         Mission.vehicule_id == vehicule_id, Mission.date_jour == jour,
-        Mission.statut.in_([StatutMission.EN_COURS, StatutMission.RETARDEE])
+        Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE])
     ).order_by(Mission.numero_mission_du_jour.desc()))
+
+
+def _formater_code_mission(numero_ot: str | None, jour: date, numero: int = 1) -> str:
+    if numero_ot and numero_ot.strip():
+        ot = numero_ot.strip()
+        if ot.upper().startswith("OT-") or ot.upper().startswith("OT_"):
+            return f"MIS-{ot.upper()}"
+        elif ot.upper().startswith("MIS-"):
+            return ot.upper()
+        else:
+            return f"MIS-OT-{ot}"
+    return f"MIS-{jour.strftime('%Y%m%d')}-{numero:02d}"
+
+
+def initialiser_ou_maj_mission(db, suivi: SuiviJournalier, vehicule: Vehicule,
+                              numero_ot: str | None, distributeur: str | None,
+                              produit: str | None, depot_prevu: str | None,
+                              ts: datetime | None = None) -> Mission:
+    """Enregistre les informations administratives de l'OT (N° OT, Distributeur, Produit, Dépôt).
+    - Bascule le camion de LIBRE à VIDE si état = LIBRE.
+    - NE DÉCLENCHE PAS la date/heure de début de mission (réservée au départ physique réel de la base).
+    """
+    ts = ts or now_local()
+    jour = suivi.date_jour
+    ouverte = _mission_ouverte(db, vehicule.id, jour)
+    if ouverte:
+        if numero_ot:
+            ouverte.numero_ot = numero_ot
+            ouverte.code_mission = _formater_code_mission(numero_ot, jour, ouverte.numero_mission_du_jour)
+        if distributeur:
+            ouverte.distributeur = distributeur
+        if produit:
+            ouverte.produit = produit
+        if depot_prevu:
+            ouverte.depot = depot_prevu
+            ouverte.depot_prevu = depot_prevu
+            if not ouverte.depot_effectif:
+                ouverte.depot_effectif = depot_prevu
+        if not any(e.get("etat") == "INITIALISATION_OT" for e in (ouverte.etapes or [])):
+            ouverte.etapes = (ouverte.etapes or []) + [{"etat": "INITIALISATION_OT", "ts": iso(ts),
+                     "lieu": (vehicule.last_adresse if vehicule else None) or "Base LSS — Antananarivo",
+                     "zone": "BASETNR"}]
+        suivi.mission_id = ouverte.id
+        if suivi.statut_camion == StatutCamion.LIBRE:
+            suivi.statut_camion = StatutCamion.VIDE
+            ouverte.statut_camion_actuel = "VIDE"
+        if PUBLISH_ENABLED["on"]:
+            publish("mission.update", s_mission(ouverte))
+        return ouverte
+
+    numero = (db.scalar(select(func.count(Mission.id)).where(
+        Mission.vehicule_id == vehicule.id, Mission.date_jour == jour)) or 0) + 1
+    code = _formater_code_mission(numero_ot, jour, numero)
+
+    # Note : heure_debut reste None à la saisie administrative de l'OT
+    # si le véhicule n'est pas encore sorti physiquement de BASETNR
+    m = Mission(
+        id=uid(),
+        code_mission=code,
+        date_jour=jour,
+        conducteur_id=suivi.conducteur_id or (vehicule.conducteur_actuel_id if vehicule else None),
+        vehicule_id=vehicule.id,
+        numero_mission_du_jour=numero,
+        statut=StatutMission.EN_COURS,
+        statut_camion_actuel="VIDE",
+        heure_debut=None,  # Début réel télématique au départ physique de la base
+        numero_ot=numero_ot,
+        distributeur=distributeur,
+        produit=produit,
+        depot=depot_prevu,
+        depot_prevu=depot_prevu,
+        depot_effectif=depot_prevu,
+        est_deviee=False,
+        km_vide=0.0,
+        km_charge=0.0,
+        kilometrage=0.0,
+        kilometrage_total=0.0,
+        origine=vehicule.last_adresse if vehicule else "Base LSS — Antananarivo",
+        etapes=[{"etat": "INITIALISATION_OT", "ts": iso(ts),
+                 "lieu": (vehicule.last_adresse if vehicule else None) or "Base LSS — Antananarivo",
+                 "zone": "BASETNR"}]
+    )
+    db.add(m)
+    db.flush()
+    suivi.mission_id = m.id
+    suivi.statut_camion = StatutCamion.VIDE
+    if numero_ot:
+        suivi.numero_ot = numero_ot
+    if distributeur:
+        suivi.distributeur = distributeur
+    if produit:
+        suivi.produit = produit
+    if depot_prevu:
+        suivi.depot_recepteur = depot_prevu
+    log.info("Mission %s (%s) rattachée à l'OT pour %s -> Statut Camion VIDE (heure_debut en attente départ physique)",
+             code, numero_ot or "Sans OT", vehicule.plaque if vehicule else "?")
+    if PUBLISH_ENABLED["on"]:
+        publish("mission.new", s_mission(m))
+    return m
 
 
 def transition_statut(db, suivi: SuiviJournalier, vehicule: Vehicule,
                       ancien: str | None, nouveau: str | None, ts: datetime):
-    """Segmentation générique (§6.3) : une nouvelle mission démarre à chaque
-    transition LIBRE → VIDE (sans attendre un retour à la base principale) ;
-    CHARGÉ clôture le chargement ; LIBRE après CHARGÉ clôture la mission
-    (déchargement). Supporte nativement plusieurs missions/chauffeur/jour
-    (cas Moramanga).
+    """Segmentation logistique automatique (§3) :
+    - LIBRE -> VIDE (attribution OT / départ transit vers Tamatave)
+    - VIDE -> CHARGÉ (chargement GRT)
+    - CHARGÉ -> LIBRE (déchargement validé)
     """
     if ancien == nouveau:
         return
     jour = suivi.date_jour
 
     if nouveau == StatutCamion.VIDE.value and ancien != StatutCamion.VIDE.value:
-        ouverte = _mission_ouverte(db, vehicule.id, jour)
-        if ouverte:  # robustesse : une mission restée ouverte est clôturée
-            ouverte.statut = StatutMission.TERMINEE
-            ouverte.heure_fin = ts
-            if ouverte.heure_debut:
-                ouverte.duree_s = int((ts - ouverte.heure_debut).total_seconds())
-        numero = (db.scalar(select(func.count(Mission.id)).where(
-            Mission.vehicule_id == vehicule.id, Mission.date_jour == jour)) or 0) + 1
-        m = Mission(
-            date_jour=jour, conducteur_id=suivi.conducteur_id, vehicule_id=vehicule.id,
-            numero_mission_du_jour=numero, statut=StatutMission.EN_COURS, heure_debut=ts,
-            numero_ot=suivi.numero_ot, produit=suivi.produit,
-            depot=suivi.depot_recepteur, distributeur=suivi.distributeur,
-            origine=vehicule.last_adresse,
-            etapes=[{"etat": "TRANSIT_CHARGEMENT", "ts": iso(ts),
-                     "lieu": vehicule.last_adresse}])
-        db.add(m)
-        db.flush()
-        suivi.mission_id = m.id
-        log.info("Mission %s n°%s ouverte (%s)", vehicule.plaque, numero, iso(ts))
-        if PUBLISH_ENABLED["on"]:
-            publish("mission.new", s_mission(m))
+        initialiser_ou_maj_mission(db, suivi, vehicule, suivi.numero_ot,
+                                   suivi.distributeur, suivi.produit,
+                                   suivi.depot_recepteur, ts)
 
     elif nouveau == StatutCamion.CHARGE.value and ancien == StatutCamion.VIDE.value:
         m = _mission_ouverte(db, vehicule.id, jour)
         if m:
-            m.etapes = (m.etapes or []) + [{"etat": "CHARGEMENT_TERMINE", "ts": iso(ts),
-                                            "lieu": vehicule.last_adresse}]
+            m.statut_camion_actuel = "CHARGE"
+            m.heure_chargement = ts
+            m.etapes = (m.etapes or []) + [{"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts),
+                                            "lieu": vehicule.last_adresse or "Galana Rafinérie Terminale (GRT)",
+                                            "zone": "GRT"}]
             m.produit = suivi.produit or m.produit
             m.depot = suivi.depot_recepteur or m.depot
+            m.depot_prevu = suivi.depot_recepteur or m.depot_prevu
             m.numero_ot = suivi.numero_ot or m.numero_ot
             m.distributeur = suivi.distributeur or m.distributeur
             if PUBLISH_ENABLED["on"]:
                 publish("mission.update", s_mission(m))
 
-    elif nouveau == StatutCamion.LIBRE.value and ancien == StatutCamion.CHARGE.value:
+    elif nouveau == StatutCamion.LIBRE.value and ancien in (StatutCamion.CHARGE.value, StatutCamion.VIDE.value):
         m = _mission_ouverte(db, vehicule.id, jour)
         if m:
-            m.etapes = (m.etapes or []) + [{"etat": "DECHARGEMENT_TERMINE", "ts": iso(ts),
-                                            "lieu": vehicule.last_adresse}]
+            m.etapes = (m.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts),
+                                            "lieu": vehicule.last_adresse or "Dépôt récepteur",
+                                            "zone": normaliser_code_depot(m.depot_effectif or m.depot_prevu) or "DEPOT"}]
             m.statut = StatutMission.TERMINEE
+            m.statut_camion_actuel = "LIBRE"
             m.heure_fin = ts
             if m.heure_debut:
                 m.duree_s = int((ts - m.heure_debut).total_seconds())
@@ -891,8 +1501,505 @@ def transition_statut(db, suivi: SuiviJournalier, vehicule: Vehicule,
             log.info("Mission %s n°%s terminée", vehicule.plaque, m.numero_mission_du_jour)
             if PUBLISH_ENABLED["on"]:
                 publish("mission.update", s_mission(m))
+        # Effacement automatique des informations OT dans l'onglet suivi journalier
+        suivi.numero_ot = None
+        suivi.distributeur = None
+        suivi.produit = None
+        suivi.depot_recepteur = None
 
 
+def rattraper_missions_7j(db, maintenant: datetime | None = None) -> dict:
+    """Collecte rétrospective et reconstruction automatique des missions sur les 7 derniers jours (§3).
+    1. Plage de requêtage : NOW() - 7 jours -> NOW()
+    2. Séquence de reconstruction rétrospective :
+       - Retrouver l'événement de sortie BASETNR -> date_debut
+       - Retrouver la sortie GRT -> date_chargement et statut_camion_actuel = "CHARGE"
+       - Retrouver l'entrée/déchargement au Dépôt Récepteur -> date_fin et statut = "TERMINEE" (camion LIBRE)
+    3. Anti-Doublon / Upsert :
+       - Vérifier si la mission existe déjà par (Immatriculation, date_debut)
+       - Si elle existe -> màj des horodatages manquants (date_chargement, date_fin, km, depot_effectif)
+       - Si elle n'existe pas -> insérer la mission reconstituée
+    """
+    maintenant = maintenant or now_local()
+    debut_7j_dt = datetime.combine(maintenant.date() - timedelta(days=7), time.min)
+
+    stats = {"creees": 0, "mises_a_jour": 0, "total_traites": 0}
+
+    vehicules = db.scalars(select(Vehicule)).all()
+    if not vehicules:
+        return stats
+
+    for vehicule in vehicules:
+        evs = list(db.scalars(
+            select(EvenementGPS).where(
+                EvenementGPS.vehicule_id == vehicule.id,
+                EvenementGPS.horodatage >= debut_7j_dt,
+                EvenementGPS.horodatage <= maintenant
+            ).order_by(EvenementGPS.horodatage.asc())
+        ).all())
+
+        suivis = list(db.scalars(
+            select(SuiviJournalier).where(
+                SuiviJournalier.vehicule_id == vehicule.id,
+                SuiviJournalier.date_jour >= debut_7j_dt.date(),
+                SuiviJournalier.date_jour <= maintenant.date()
+            ).order_by(SuiviJournalier.date_jour.asc())
+        ).all())
+
+        historiques = list(db.scalars(
+            select(HistoriqueJournalier).where(
+                HistoriqueJournalier.vehicule_id == vehicule.id,
+                HistoriqueJournalier.date_jour >= debut_7j_dt.date(),
+                HistoriqueJournalier.date_jour <= maintenant.date()
+            ).order_by(HistoriqueJournalier.date_jour.asc())
+        ).all())
+
+        jours = [debut_7j_dt.date() + timedelta(days=i) for i in range(8)]
+        for j in jours:
+            if j > maintenant.date():
+                continue
+
+            s_j = next((s for s in suivis if s.date_jour == j), None)
+            h_j = next((h for h in historiques if h.date_jour == j), None)
+            donnees_h = h_j.donnees if (h_j and h_j.donnees) else {}
+
+            missions_j = list(db.scalars(select(Mission).where(
+                Mission.vehicule_id == vehicule.id,
+                Mission.date_jour == j
+            )).all())
+
+            numero_ot = (s_j.numero_ot if s_j else None) or donnees_h.get("numero_ot") or (missions_j[0].numero_ot if missions_j else None)
+            produit = (s_j.produit if s_j else None) or donnees_h.get("produit") or (missions_j[0].produit if missions_j else None)
+            distributeur = (s_j.distributeur if s_j else None) or donnees_h.get("distributeur") or (missions_j[0].distributeur if missions_j else None)
+            depot_prev = (s_j.depot_recepteur if s_j else None) or donnees_h.get("depot_recepteur") or (missions_j[0].depot_prevu if missions_j else None)
+            cond_id = (s_j.conducteur_id if s_j else None) or (h_j.conducteur_id if h_j else None) or (missions_j[0].conducteur_id if missions_j else None) or vehicule.conducteur_actuel_id
+
+            evs_j = [e for e in evs if e.horodatage.date() == j]
+
+            trajets_j = []
+            if s_j and s_j.trajets:
+                trajets_j = [t for t in s_j.trajets if t.heure_debut is not None]
+            elif donnees_h and donnees_h.get("trajets"):
+                trajets_j = donnees_h.get("trajets") or []
+
+            ts_depart_base = None
+            ts_sortie_grt = None
+            ts_dechargement = None
+            depot_detecte = depot_prev
+
+            # 1. Analyse chronologique des événements GPS
+            if evs_j:
+                dans_base = True
+                dans_grt = False
+                for ev in evs_j:
+                    adr_l = (ev.adresse or "").lower()
+                    z = detecter_zone_logistique(ev.latitude, ev.longitude, ev.adresse)
+                    z_t, z_c, z_n = z["type"], z["code"], z["nom"]
+                    
+                    if dans_base:
+                        if ("sortie" in adr_l and "base" in adr_l) or (z_t != "BASETNR" and "base lss" not in adr_l and "base tana" not in adr_l):
+                            ts_depart_base = ev.horodatage
+                            dans_base = False
+                    
+                    if (z_t == "GRT" and z_c == "GRT") or "sortie grt" in adr_l or "chargement grt" in adr_l:
+                        dans_grt = True
+                        ts_sortie_grt = ev.horodatage
+                    elif dans_grt and z_t != "GRT":
+                        ts_sortie_grt = ev.horodatage
+                        dans_grt = False
+                    
+                    if z_t == "DEPOT_RECEPTEUR" and z_c in DEPOTS_DECHARGEMENT_CODES:
+                        # RÈGLE FONDAMENTALE : Un déchargement ne peut exister QUE si le camion a DÉJÀ chargé à GRT !
+                        if not ts_sortie_grt or dans_grt:
+                            # En cours d'aller vers Tamatave / GRT : Moramanga ou tout autre lieu n'est JAMAIS un déchargement
+                            pass
+                        else:
+                            code_p = normaliser_code_depot(depot_prev)
+                            # Moramanga traversé en transit RN2 vers Tana/Sud n'est pas un déchargement terminal
+                            if z_c == "DMMG" and code_p in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"):
+                                pass
+                            elif code_p and z_c == code_p:
+                                depot_detecte = nom_officiel_depot(z_c)
+                                if ev.type_evenement == TypeEvenement.ARRET or ev.vitesse < 3:
+                                    ts_dechargement = ev.horodatage
+
+            # 2. Complément depuis les trajets
+            if not ts_depart_base and trajets_j:
+                t1 = trajets_j[0]
+                t1_deb = t1.heure_debut if hasattr(t1, "heure_debut") else (
+                    datetime.fromisoformat(t1["heure_debut"]) if isinstance(t1.get("heure_debut"), str) else None)
+                if t1_deb:
+                    ts_depart_base = t1_deb
+
+            if not ts_sortie_grt and ts_depart_base and (numero_ot or (s_j and s_j.statut_camion == StatutCamion.CHARGE)):
+                if len(trajets_j) >= 2:
+                    t_grt = trajets_j[0]
+                    t_grt_fin = t_grt.heure_fin if hasattr(t_grt, "heure_fin") else (
+                        datetime.fromisoformat(t_grt["heure_fin"]) if isinstance(t_grt.get("heure_fin"), str) else None)
+                    if t_grt_fin:
+                        ts_sortie_grt = t_grt_fin + timedelta(minutes=45)
+                elif j < maintenant.date():
+                    ts_sortie_grt = ts_depart_base + timedelta(hours=4)
+
+            if not ts_dechargement and j < maintenant.date() and ts_sortie_grt:
+                if len(trajets_j) >= 2:
+                    t_last = trajets_j[-1]
+                    t_last_fin = t_last.heure_fin if hasattr(t_last, "heure_fin") else (
+                        datetime.fromisoformat(t_last["heure_fin"]) if isinstance(t_last.get("heure_fin"), str) else None)
+                    if t_last_fin:
+                        ts_dechargement = t_last_fin
+
+            # Calcul des kilométrages
+            if s_j:
+                km_tot_j = float(s_j.km_parcourus or 0.0)
+            elif donnees_h:
+                km_tot_j = float(donnees_h.get("km_parcourus") or 0.0)
+            else:
+                km_tot_j = 0.0
+
+            if ts_sortie_grt and ts_dechargement:
+                km_v = round(km_tot_j * 0.45, 1)
+                km_c = round(km_tot_j * 0.55, 1)
+            elif ts_sortie_grt:
+                km_v = round(km_tot_j * 0.5, 1)
+                km_c = round(km_tot_j * 0.5, 1)
+            else:
+                km_v = round(km_tot_j, 1)
+                km_c = 0.0
+
+            # 3. Anti-Doublon / Upsert (Règle 8 : intégrité absolue, jamais de création fictive)
+            if missions_j or numero_ot or (j == maintenant.date() and s_j and s_j.numero_ot):
+                stats["total_traites"] += 1
+                missions_exist = list(db.scalars(
+                    select(Mission).where(
+                        Mission.vehicule_id == vehicule.id,
+                        Mission.date_jour == j
+                    ).order_by(Mission.numero_mission_du_jour.asc())
+                ).all())
+
+                # Rapprochement prioritaire par (Immatriculation, date_debut)
+                m_exist = None
+                if ts_depart_base:
+                    for me in missions_exist:
+                        if me.heure_debut and abs((me.heure_debut - ts_depart_base).total_seconds()) <= 7200:
+                            m_exist = me
+                            break
+                if not m_exist:
+                    for me in missions_exist:
+                        if not me.heure_chargement or not me.heure_fin:
+                            m_exist = me
+                            break
+                if not m_exist and missions_exist:
+                    m_exist = missions_exist[0]
+                    for me in missions_exist:
+                        if not me.heure_chargement or not me.heure_fin:
+                            m_exist = me
+                            break
+                if not m_exist and missions_exist:
+                    m_exist = missions_exist[0]
+
+                if m_exist:
+                    maj = False
+                    # Pour aujourd'hui, alignement strict avec les saisies manuelles de SuiviJournalier
+                    if j == maintenant.date() and s_j:
+                        if s_j.numero_ot and m_exist.numero_ot != s_j.numero_ot:
+                            m_exist.numero_ot = s_j.numero_ot
+                            m_exist.code_mission = _formater_code_mission(s_j.numero_ot, j, m_exist.numero_mission_du_jour)
+                            maj = True
+                        if s_j.distributeur and m_exist.distributeur != s_j.distributeur:
+                            m_exist.distributeur = s_j.distributeur
+                            maj = True
+                        if s_j.produit and m_exist.produit != s_j.produit:
+                            m_exist.produit = s_j.produit
+                            maj = True
+                        if s_j.depot_recepteur:
+                            nom_d = nom_officiel_depot(s_j.depot_recepteur) or s_j.depot_recepteur
+                            if m_exist.depot_prevu != nom_d:
+                                m_exist.depot = nom_d
+                                m_exist.depot_prevu = nom_d
+                                if not m_exist.est_deviee:
+                                    m_exist.depot_effectif = nom_d
+                                maj = True
+                        stat_c_s = s_j.statut_camion.value if hasattr(s_j.statut_camion, "value") else str(s_j.statut_camion)
+                        if stat_c_s in ("VIDE", "CHARGE"):
+                            m_exist.statut_camion_actuel = stat_c_s
+                            m_exist.statut = StatutMission.DEVIEE if m_exist.est_deviee else StatutMission.EN_COURS
+                            m_exist.heure_fin = None
+                            maj = True
+                        elif stat_c_s == "LIBRE" and m_exist.heure_fin:
+                            m_exist.statut_camion_actuel = "LIBRE"
+                            m_exist.statut = StatutMission.TERMINEE
+                            maj = True
+
+                    if not m_exist.heure_debut and ts_depart_base:
+                        m_exist.heure_debut = ts_depart_base
+                        maj = True
+                    if not m_exist.heure_chargement and ts_sortie_grt:
+                        m_exist.heure_chargement = ts_sortie_grt
+                        if m_exist.statut != StatutMission.TERMINEE:
+                            m_exist.statut_camion_actuel = "CHARGE"
+                        maj = True
+                    if not m_exist.heure_fin and ts_dechargement:
+                        if j < maintenant.date():
+                            m_exist.heure_fin = ts_dechargement
+                            m_exist.statut = StatutMission.TERMINEE
+                            m_exist.statut_camion_actuel = "LIBRE"
+                            if m_exist.heure_debut:
+                                m_exist.duree_s = int((ts_dechargement - m_exist.heure_debut).total_seconds())
+                            maj = True
+                        else:
+                            # Pour aujourd'hui : l'arrivée au dépôt ne clôture JAMAIS automatiquement la mission !
+                            if not m_exist.heure_fin and m_exist.statut != StatutMission.TERMINEE:
+                                m_exist.validation_dechargement = "EN_ATTENTE"
+                                maj = True
+                    if not m_exist.depot_effectif and depot_detecte:
+                        m_exist.depot_effectif = depot_detecte
+                        maj = True
+                    if (not m_exist.km_vide or m_exist.km_vide == 0.0) and km_v > 0:
+                        m_exist.km_vide = km_v
+                        maj = True
+                    if (not m_exist.km_charge or m_exist.km_charge == 0.0) and km_c > 0:
+                        m_exist.km_charge = km_c
+                        maj = True
+                    if not m_exist.kilometrage_total or m_exist.kilometrage_total == 0.0:
+                        m_exist.kilometrage_total = round((m_exist.km_vide or 0.0) + (m_exist.km_charge or 0.0), 1)
+                        m_exist.kilometrage = m_exist.kilometrage_total
+                        maj = True
+                    if maj:
+                        stats["mises_a_jour"] += 1
+                elif numero_ot or (j < maintenant.date() and evs_j and ts_depart_base):
+                    code = _formater_code_mission(numero_ot, j, 1)
+                    est_term = bool(ts_dechargement) and (j < maintenant.date())
+                    statut_m = StatutMission.TERMINEE if est_term else StatutMission.EN_COURS
+                    statut_c = "LIBRE" if est_term else ("CHARGE" if ts_sortie_grt else (StatutCamion.VIDE.value if numero_ot else StatutCamion.LIBRE.value))
+                    
+                    etapes = []
+                    if ts_depart_base:
+                        etapes.append({"etat": "DEPART_BASE", "ts": iso(ts_depart_base), "lieu": "Sortie Base Tana", "zone": "BASETNR"})
+                    if ts_sortie_grt:
+                        etapes.append({"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts_sortie_grt), "lieu": "GRT (GALANA RAFINERIE TERMINALE)", "zone": "GRT"})
+                    if ts_dechargement and est_term:
+                        nom_dep_eff = nom_officiel_depot(depot_detecte) or "Depot Soanierana (DSNR)"
+                        code_dep_eff = normaliser_code_depot(depot_detecte) or "DSNR"
+                        etapes.append({"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts_dechargement), "lieu": nom_dep_eff, "zone": code_dep_eff})
+
+                    duree = int((ts_dechargement - ts_depart_base).total_seconds()) if (est_term and ts_dechargement and ts_depart_base) else 0
+
+                    m_nouv = Mission(
+                        id=uid(),
+                        code_mission=code,
+                        date_jour=j,
+                        conducteur_id=cond_id,
+                        vehicule_id=vehicule.id,
+                        numero_mission_du_jour=1,
+                        statut=statut_m,
+                        statut_camion_actuel=statut_c,
+                        heure_debut=ts_depart_base,
+                        heure_chargement=ts_sortie_grt,
+                        heure_fin=ts_dechargement if est_term else None,
+                        duree_s=duree,
+                        numero_ot=numero_ot,
+                        distributeur=distributeur,
+                        produit=produit,
+                        depot=depot_prev or depot_detecte,
+                        depot_prevu=depot_prev or depot_detecte,
+                        depot_effectif=depot_detecte or depot_prev,
+                        est_deviee=False,
+                        validation_dechargement="VALIDÉ" if est_term else ("EN_ATTENTE" if ts_dechargement else "NON_REQUIS"),
+                        km_vide=km_v,
+                        km_charge=km_c,
+                        kilometrage=round(km_v + km_c, 1),
+                        kilometrage_total=round(km_v + km_c, 1),
+                        origine="Base LSS — Antananarivo",
+                        etapes=etapes
+                    )
+                    db.add(m_nouv)
+                    stats["creees"] += 1
+
+    db.commit()
+    # Réconciliation et persistance des alertes non traitées des jours passés
+    reconcilier_alertes_missions_en_attente(db)
+    log.info("Rattrapage missions 7 jours terminé : %s", stats)
+    return stats
+
+
+def reconcilier_alertes_missions_en_attente(db: Session) -> int:
+    """Restaure et persiste les alertes LÉGITIMES non traitées des missions réelles.
+    RÈGLE ABSOLUE DE STABILITÉ ET D'INTÉGRITÉ :
+      - Les alertes actives restent stables et persistantes en base (NOUVELLE / VUE).
+      - Une alerte n'est clôturée (TRAITEE) QUE si la mission est formellement terminée (StatutMission.TERMINEE)
+        ou si l'action a été expressément validée par l'opérateur.
+      - Aucun clignotement ou purge intempestive en boucle.
+    """
+    nb_creees = 0
+    now = now_local()
+
+    # 1. Clôture des alertes UNIQUEMENT pour les missions formellement terminées
+    missions_terminees_ids = {m.id for m in db.scalars(select(Mission).where(Mission.statut == StatutMission.TERMINEE)).all()}
+    vehicules_termines_ids = {m.vehicule_id for m in db.scalars(select(Mission).where(Mission.statut == StatutMission.TERMINEE)).all()}
+
+    # Clôture des alertes de déchargement pour les camions dont la mission est déjà terminée
+    if vehicules_termines_ids:
+        db.query(Alerte).filter(
+            Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+            Alerte.vehicule_id.in_(list(vehicules_termines_ids)),
+            Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    # 2. Réconciliation stricte sur les missions réellement actives
+    debut_recherche = now.date() - timedelta(days=30)
+    missions_actives = list(db.scalars(
+        select(Mission).where(
+            Mission.date_jour >= debut_recherche,
+            Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE])
+        ).order_by(Mission.date_jour.asc(), Mission.heure_debut.asc())
+    ).all())
+
+    for m in missions_actives:
+        v = db.get(Vehicule, m.vehicule_id)
+        if not v:
+            continue
+
+        etapes = m.etapes or []
+        s_suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.vehicule_id == v.id, SuiviJournalier.date_jour == m.date_jour))
+        sit_l = ((s_suivi.situation if s_suivi else "") or "").lower()
+        adr_l = (v.last_adresse or "").lower()
+        z_geo = detecter_zone_logistique(v.last_lat, v.last_lng, v.last_adresse)
+
+        # Détection de présence GRT : soit par étape ENTREE_GRT, soit par télématique/situation
+        est_a_grt = (z_geo["type"] == "GRT") or ("grt" in adr_l) or ("chargement" in sit_l) or any(e.get("etat") == "ENTREE_GRT" for e in etapes)
+        est_deja_charge = any(e.get("etat") == "CHARGEMENT_EFFECTUE" for e in etapes) or (m.heure_chargement is not None and m.validation_chargement == "VALIDÉ")
+
+        # Alerte 1 : MISSION_SANS_OT (camion réellement à GRT sans OT)
+        if est_a_grt and (not m.numero_ot or m.statut_camion_actuel == "LIBRE"):
+            ts_grt = None
+            for e in etapes:
+                if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
+                    try:
+                        ts_grt = datetime.fromisoformat(e["ts"])
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = (ts_grt + timedelta(minutes=15)) if ts_grt else (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.MISSION_SANS_OT,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.MISSION_SANS_OT, GraviteAlerte.MOYENNE,
+                    f"OT manquant — Le camion {v.plaque} est à GRT (GALANA RAFINERIE TERMINALE) sans Ordre de Transport enregistré",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+        # Alerte 2 : VALIDATION_CHARGEMENT (camion réellement à GRT ≥ 30 min ou en chargement)
+        if est_a_grt and not est_deja_charge and m.validation_chargement != "VALIDÉ":
+            m.validation_chargement = "EN_ATTENTE"
+            ts_grt = None
+            for e in etapes:
+                if e.get("etat") == "ENTREE_GRT" and e.get("ts"):
+                    try:
+                        ts_grt = datetime.fromisoformat(e["ts"])
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = (ts_grt + timedelta(minutes=30)) if ts_grt else (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.VALIDATION_CHARGEMENT,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.VALIDATION_CHARGEMENT, GraviteAlerte.INFORMATION,
+                    f"Validation requise : Chargement GRT (GALANA RAFINERIE TERMINALE) pour {v.plaque}",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+        # Détection de présence Dépôt Récepteur Officiel : soit par étape, soit par télématique/situation
+        code_depot = z_geo["code"] if z_geo["type"] == "DEPOT_RECEPTEUR" else normaliser_code_depot(m.depot_effectif or m.depot_prevu or (s_suivi.depot_recepteur if s_suivi else None))
+        est_au_depot = (z_geo["type"] == "DEPOT_RECEPTEUR" and z_geo["code"] in DEPOTS_DECHARGEMENT_CODES) or \
+                       ("déchargement" in sit_l or "dechargement" in sit_l or "dépôt" in sit_l or "depot" in sit_l) or \
+                       any(e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES for e in etapes)
+
+        # Alerte 3 : VALIDATION_DECHARGEMENT (camion au dépôt récepteur officiel avec statut CHARGÉ)
+        if est_au_depot and m.statut_camion_actuel in ("CHARGE", "CHARGÉ") and m.validation_dechargement not in ("VALIDÉ", "INVALIDÉ") and m.statut != StatutMission.TERMINEE:
+            m.validation_dechargement = "EN_ATTENTE"
+            ts_depot = None
+            lieu_depot = nom_officiel_depot(code_depot or m.depot_effectif or m.depot_prevu) or "Depot Soanierana (DSNR)"
+            for e in reversed(etapes):
+                if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DEVIATION_DETECTEE") and e.get("ts") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES:
+                    try:
+                        ts_depot = datetime.fromisoformat(e["ts"])
+                        if e.get("lieu"):
+                            lieu_depot = nom_officiel_depot(e["lieu"]) or e["lieu"]
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = (ts_depot + timedelta(hours=3)) if ts_depot else (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.VALIDATION_DECHARGEMENT, GraviteAlerte.MOYENNE,
+                    f"Validation requise : Déchargement au {lieu_depot} pour {v.plaque}",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+        # Alerte 4 : DEVIATION_DETECTEE
+        if m.est_deviee or m.statut == StatutMission.DEVIEE:
+            ts_dev = None
+            for e in reversed(etapes):
+                if e.get("etat") == "DEVIATION_DETECTEE" and e.get("ts") and e.get("zone") in DEPOTS_DECHARGEMENT_CODES:
+                    try:
+                        ts_dev = datetime.fromisoformat(e["ts"])
+                        break
+                    except Exception:
+                        pass
+            ts_alerte = ts_dev or (m.heure_debut or now)
+
+            existe = db.scalar(
+                select(Alerte).where(
+                    Alerte.vehicule_id == v.id,
+                    Alerte.type == TypeAlerte.DEVIATION_DETECTEE,
+                    Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+                )
+            )
+            if not existe:
+                creer_alerte(
+                    db, TypeAlerte.DEVIATION_DETECTEE, GraviteAlerte.CRITIQUE,
+                    f"Déviation détectée pour {v.plaque} : nouveau dépôt {nom_officiel_depot(m.depot_effectif) or m.depot_effectif or '—'} (prévu : {nom_officiel_depot(m.depot_prevu) or m.depot_prevu or '—'})",
+                    ts=ts_alerte, vehicule_id=v.id, conducteur_id=m.conducteur_id,
+                    lien_module="/missions"
+                )
+                nb_creees += 1
+
+    db.commit()
+    if nb_creees > 0:
+        log.info("Réconciliation des alertes missions des jours passés : %d alerte(s) persistante(s) restaurée(s)", nb_creees)
+    return nb_creees
+
+
+CHAMPS_A = {"conducteur_id"}
 CHAMPS_B = {"situation", "statut_camion", "depot_recepteur", "distributeur",
             "produit", "numero_ot"}
 CHAMPS_C = {"emplacement_j_moins_1", "position_08h", "position_10h", "position_12h",
@@ -903,18 +2010,45 @@ CHAMPS_C = {"emplacement_j_moins_1", "position_08h", "position_10h", "position_1
 
 def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
                            ts: datetime | None = None) -> dict:
-    """Application centralisée des saisies Parties B/C (utilisée par l'API et
-    le simulateur) ; déclenche la chaîne de synchronisation §9."""
+    """Application centralisée des saisies Parties A/B/C (utilisée par l'API et
+    le simulateur) ; déclenche la chaîne de synchronisation §9 et garantit l'anti-doublon."""
     ts = ts or now_local()
     vehicule = db.get(Vehicule, suivi.vehicule_id)
     diffs = {}
     ancien_statut = suivi.statut_camion.value if suivi.statut_camion else None
 
     for cle, val in champs.items():
-        if cle not in CHAMPS_B | CHAMPS_C:
+        if cle not in CHAMPS_A | CHAMPS_B | CHAMPS_C:
             continue
+        if cle == "conducteur_id":
+            nouv_cid = val or None
+            if suivi.conducteur_id != nouv_cid:
+                diffs["conducteur_id"] = {"avant": suivi.conducteur_id, "apres": nouv_cid}
+                if nouv_cid:
+                    # Règle stricte anti-doublon : détacher ce chauffeur de tout autre camion le même jour
+                    for s_autre in db.scalars(select(SuiviJournalier).where(
+                            SuiviJournalier.date_jour == suivi.date_jour,
+                            SuiviJournalier.conducteur_id == nouv_cid,
+                            SuiviJournalier.id != suivi.id)).all():
+                        s_autre.conducteur_id = None
+                        s_autre.conducteur_origine = None
+                        if PUBLISH_ENABLED["on"]:
+                            publish("suivi.update", {"suivi": s_suivi(s_autre, get_seuils(db))})
+                    suivi.conducteur_id = nouv_cid
+                    suivi.conducteur_origine = "MANUEL"
+                else:
+                    suivi.conducteur_id = None
+                    suivi.conducteur_origine = None
+            continue
+
         if cle == "statut_camion" and val:
-            val = StatutCamion(val)
+            val_str = str(val.value if hasattr(val, "value") else val).upper()
+            if val_str in ("CHARGE", "CHARGÉ"):
+                val = StatutCamion.CHARGE
+            elif val_str == "VIDE":
+                val = StatutCamion.VIDE
+            else:
+                val = StatutCamion.LIBRE
         ancienne = getattr(suivi, cle)
         ancienne_s = ancienne.value if hasattr(ancienne, "value") else ancienne
         nouvelle_s = val.value if hasattr(val, "value") else val
@@ -925,6 +2059,52 @@ def appliquer_champs_suivi(db, suivi: SuiviJournalier, champs: dict,
     nouveau_statut = suivi.statut_camion.value if suivi.statut_camion else None
     if "statut_camion" in champs and ancien_statut != nouveau_statut:
         transition_statut(db, suivi, vehicule, ancien_statut, nouveau_statut, ts)
+
+    if nouveau_statut == StatutCamion.LIBRE.value and "statut_camion" in champs:
+        # Passage au statut LIBRE -> effacement automatique des informations OT
+        if "numero_ot" not in champs:
+            suivi.numero_ot = None
+        if "distributeur" not in champs:
+            suivi.distributeur = None
+        if "produit" not in champs:
+            suivi.produit = None
+        if "depot_recepteur" not in champs:
+            suivi.depot_recepteur = None
+
+    # Synchronisation stricte et bidirectionnelle 1:1 vers l'onglet Missions
+    if any(k in champs for k in ("numero_ot", "produit", "depot_recepteur", "distributeur", "statut_camion")):
+        stat_c_str = suivi.statut_camion.value if hasattr(suivi.statut_camion, "value") else str(suivi.statut_camion or "LIBRE")
+        if suivi.numero_ot or stat_c_str in ("VIDE", "CHARGE"):
+            m = initialiser_ou_maj_mission(
+                db, suivi, vehicule,
+                suivi.numero_ot, suivi.distributeur, suivi.produit,
+                suivi.depot_recepteur, ts
+            )
+            if m:
+                m.statut_camion_actuel = "CHARGE" if stat_c_str in ("CHARGE", "CHARGÉ") else ("VIDE" if stat_c_str == "VIDE" else "LIBRE")
+                if suivi.numero_ot:
+                    m.numero_ot = suivi.numero_ot
+                    m.code_mission = _formater_code_mission(suivi.numero_ot, suivi.date_jour, m.numero_mission_du_jour)
+                if suivi.distributeur:
+                    m.distributeur = suivi.distributeur
+                if suivi.produit:
+                    m.produit = suivi.produit
+                if suivi.depot_recepteur:
+                    nom_d = nom_officiel_depot(suivi.depot_recepteur) or suivi.depot_recepteur
+                    m.depot = nom_d
+                    m.depot_prevu = nom_d
+                    if not m.est_deviee:
+                        m.depot_effectif = nom_d
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    publish("mission.update", s_mission(m))
+        elif stat_c_str == "LIBRE" and not suivi.numero_ot:
+            if suivi.mission_id:
+                m_anc = db.get(Mission, suivi.mission_id)
+                if m_anc and m_anc.statut != StatutMission.TERMINEE:
+                    m_anc.statut_camion_actuel = "LIBRE"
+                    if PUBLISH_ENABLED["on"]:
+                        publish("mission.update", s_mission(m_anc))
 
     suivi.updated_at = now_local()
     db.commit()
@@ -940,6 +2120,22 @@ SITUATIONS_TRANQUILLES = (
     "indisponible", "vitting", "compteur", "suspendu", "attente", "ostie",
     "caméra", "certificat", "cyclone",
 )
+
+
+# Correctif v1.46 — retard d'ingestion global (alerte COLLECTE_RETARD).
+SEUIL_RETARD_COLLECTE_S = int(os.getenv("SEUIL_RETARD_COLLECTE_S", "900"))
+
+
+def retard_collecte_s(db, maintenant: datetime) -> int | None:
+    """Écart en secondes entre `maintenant` et le dernier événement GPS des
+    portails ingéré. None si aucun événement sur les dernières 24 h."""
+    dernier = db.scalar(select(func.max(EvenementGPS.horodatage)).where(
+        EvenementGPS.source.in_([SourceEvenement.MZONEX,
+                                 SourceEvenement.CAMTRACKPRO]),
+        EvenementGPS.horodatage >= maintenant - timedelta(hours=24)))
+    if dernier is None:
+        return None
+    return int((maintenant - dernier).total_seconds())
 
 
 def boucle_surveillance():
@@ -985,22 +2181,33 @@ def boucle_surveillance():
                         if PUBLISH_ENABLED["on"]:
                             publish("alerte.new", s_alerte(a))
 
-        # Missions retardées (durée réelle > durée prévisionnelle paramétrée)
-        missions = db.scalars(select(Mission).where(
-            Mission.statut == StatutMission.EN_COURS, Mission.date_jour == jour)).all()
-        for m in missions:
-            if m.heure_debut and (now - m.heure_debut).total_seconds() > seuils["DUREE_MISSION_PREVUE"]:
-                m.statut = StatutMission.RETARDEE
-                v = db.get(Vehicule, m.vehicule_id)
-                a = creer_alerte(
-                    db, TypeAlerte.MISSION_RETARDEE, GraviteAlerte.MOYENNE,
-                    f"Mission retardée — {v.plaque if v else '?'} mission n°{m.numero_mission_du_jour} "
-                    f"(début {m.heure_debut:%H:%M}) au-delà de la durée prévue",
-                    vehicule_id=m.vehicule_id, conducteur_id=m.conducteur_id,
-                    lien_module="/missions")
-                if PUBLISH_ENABLED["on"]:
-                    publish("mission.update", s_mission(m))
-                    publish("alerte.new", s_alerte(a))
+        # Correctif v1.46 — retard d'ingestion de la collecte portails : les
+        # portails peuvent être sains pendant que la boucle locale traîne ou
+        # se bloque (constat du 04/09/2026 : base arrêtée à 12h19, portails à
+        # jour jusqu'à 14h59) — alerte visible au tableau, jamais bloquante.
+        # Fenêtre 05h–22h : le serveur est normalement éteint la nuit (§8).
+        if 5 <= now.hour < 22:
+            try:
+                retard = retard_collecte_s(db, now)
+                if (retard is not None
+                        and retard > SEUIL_RETARD_COLLECTE_S
+                        and not _alerte_recente(db, TypeAlerte.COLLECTE_RETARD,
+                                                None, 60)):
+                    a = creer_alerte(
+                        db, TypeAlerte.COLLECTE_RETARD, GraviteAlerte.MOYENNE,
+                        f"Collecte GPS en retard : dernier événement ingéré il y a "
+                        f"{retard // 60} min (seuil {SEUIL_RETARD_COLLECTE_S // 60} min) — "
+                        "vérifier la boucle de collecte et les logs portails",
+                        lien_module="/suivi")
+                    if PUBLISH_ENABLED["on"]:
+                        publish("alerte.new", s_alerte(a))
+            except Exception:
+                log.exception("Contrôle de retard de collecte en échec")
+
+        # Note opérationnelle (Madagascar) : aucune durée standard rigide n'est imposée sur
+        # les missions en cours en raison de l'état des axes routiers (RN2, RN7), des temps
+        # d'attente variables aux dépôts et des repos hebdomadaires (≥ 24h/45h) pris en cours de route.
+        # Les missions restent actives (EN_COURS ou DEVIEE) jusqu'à confirmation physique du déchargement.
         db.commit()
     finally:
         db.close()
@@ -1338,6 +2545,25 @@ def aligner_archives_positions(db, jour: date) -> list[str]:
     return synchronises
 
 
+def _existe_alias_en_session_ou_db(db, alias_normalise: str, conducteur_id: str | None = None) -> ConducteurAlias | None:
+    """Retourne un alias déjà présent dans la session courante ou la base.
+
+    Le point clé ici est que SQLAlchemy ne voit pas les objets ajoutés en
+    mémoire tant qu'un flush n'a pas eu lieu. Dans un batch réél, plusieurs
+    appels à `creer_conducteur_auto()` peuvent donc créer des `ConducteurAlias`
+    identiques avant l'insertion SQL effective, ce qui déclenche le UNIQUE
+    constraint sur `alias_normalise`.
+    """
+    if not alias_normalise:
+        return None
+    for obj in db.new:
+        if isinstance(obj, ConducteurAlias) and obj.alias_normalise == alias_normalise:
+            if conducteur_id is None or obj.conducteur_id == conducteur_id:
+                return obj
+    return db.scalar(select(ConducteurAlias).where(
+        ConducteurAlias.alias_normalise == alias_normalise))
+
+
 # ------------------------------------------------------------------ §0quater D1/D2
 def creer_vehicule_auto(db, ident: str, plateforme: str) -> Vehicule | None:
     """Arbitrage §0quater D1 (14/08/2026) — DÉCOUVERTE AUTOMATIQUE : identifiant
@@ -1379,61 +2605,149 @@ def creer_vehicule_auto(db, ident: str, plateforme: str) -> Vehicule | None:
     return v
 
 
-def creer_conducteur_auto(db, nom_brut: str) -> "object | None":
-    """Arbitrage §0quater D2 (14/08/2026) — conducteur vu sur un portail mais
-    inconnu → fiche Conducteur créée (matricule AUTO-xxxxxxxx) + alerte ⓘ +
-    audit. L'affectation au véhicule reste MANUELLE (remplacements = métier).
-    Idempotent (§0sexies decies J1, 27/08) : rapprochement par forme
-    CANONIQUE du nom — insensible casse ET accents (« MICHAËL Justin » =
-    « MICHAEL JUSTIN »), une seule fiche par chauffeur."""
-    from .models import Conducteur
+def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = None,
+                          plateforme: str | None = None) -> "object | None":
+    """Arbitrage §0quater D2 (14/08/2026) & Spécification Déduplication Avancée :
+    1. Rapprochement direct par driverKeyCode MZoneX (si badge_code présent).
+    2. Rapprochement par forme CANONIQUE (nom_normalise).
+    3. Rapprochement par ALIAS connu (conducteur_aliases).
+    4. Rapprochement par SAC DE MOTS exact (tokens_set).
+    5. Rapprochement par INCLUSION forte de patronyme (nom_court in nom_long).
+    6. Découverte chauffeur : création de fiche Conducteur.
+       - MZoneX : matricule = str(driverKeyCode), code_badge_mzonex = badge_code
+       - CamtrackPro : matricule = None, code_badge_mzonex = None
+    """
+    from .models import Conducteur, ConducteurAlias
     nom = " ".join((nom_brut or "").split()).strip()
-    if len(nom) < 5 or not any(c.isalpha() for c in nom):
+
+    # 1. Filtres non-personnes (D5), garages et clés de service (B2)
+    if nom:
+        if est_libelle_service_ou_garage(nom):
+            if nom.lower() not in _D5_DEJA_LOGUES:
+                _D5_DEJA_LOGUES.add(nom.lower())
+                log.info("§0quinquies D5 / B2 : libellé clé de service / garage / non-personne ignoré "
+                         ": %r (tracé une seule fois)", nom)
+            return None
+
+    # Règle MZoneX : si badge_code valide, chercher en priorité absolue par code_badge_mzonex ou matricule
+    if badge_code and badge_code > 0:
+        ex_badge = db.scalar(select(Conducteur).where(
+            (Conducteur.code_badge_mzonex == badge_code) | (Conducteur.matricule == str(badge_code))))
+        if ex_badge is not None:
+            tset_badge = ex_badge.tokens_set or (calculer_tokens_set(ex_badge.nom_prenom)[:170] if ex_badge.nom_prenom else "")
+            if tset_badge:
+                for c_hom in db.scalars(select(Conducteur).where(
+                        Conducteur.tokens_set == tset_badge,
+                        Conducteur.id != ex_badge.id,
+                        Conducteur.code_badge_mzonex.is_(None))).all():
+                    c_hom.code_badge_mzonex = badge_code
+                    c_hom.matricule = str(badge_code)
+            if nom and len(nom) >= 3:
+                cible = normaliser_libelle(nom)[:170]
+                if cible and cible != ex_badge.nom_normalise:
+                    if _existe_alias_en_session_ou_db(db, cible, ex_badge.id) is None:
+                        db.add(ConducteurAlias(conducteur_id=ex_badge.id, alias_brut=nom,
+                                               alias_normalise=cible, source=plateforme or "MZONEX"))
+            return ex_badge
+
+    if not nom or len(nom) < 3 or not any(c.isalpha() for c in nom):
         return None
-    # §0quinquies D5 (arbitrage 14/08/2026) — le portail met parfois un LIEU
-    # dans la colonne chauffeur (« Garage LSS 2 », « Dépôt »…) : ces libellés
-    # ne créent jamais de fiche (liste surchargeable CONDUCTEUR_MOTS_IGNORES).
-    if set(nom.lower().split()) & set(mots_ignores_conducteur()):
-        if nom.lower() not in _D5_DEJA_LOGUES:
-            _D5_DEJA_LOGUES.add(nom.lower())
-            log.info("§0quinquies D5 : libellé chauffeur non-personne ignoré "
-                     ": %r (tracé une seule fois)", nom)
-        return None
-    # §0sexies decies J1 (27/08/2026) — l'anti-doublon compare la FORME
-    # CANONIQUE (NFKD, accents écartés, minuscules) et non lower() SQL :
-    # sous SQLite, lower() ne plie que A-Z → « MICHAËL Justin » n'était
-    # jamais reconnu déjà présent (bug : fiches créées en rafale).
+
     cible = normaliser_libelle(nom)[:170]
     if not cible:
         return None
-    existant = db.scalar(select(Conducteur).where(
-        Conducteur.nom_normalise == cible))
-    if existant is None:               # repli : fiches sans forme canonique
-        for c0 in db.scalars(select(Conducteur).where(
-                Conducteur.nom_normalise.is_(None))):
+    tset = calculer_tokens_set(nom)[:170]
+
+    # Échelon 2 : Correspondance canonique directe
+    existant = db.scalar(select(Conducteur).where(Conducteur.nom_normalise == cible))
+    if existant is None:
+        for c0 in db.scalars(select(Conducteur).where(Conducteur.nom_normalise.is_(None))):
             if normaliser_libelle(c0.nom_prenom)[:170] == cible:
                 existant = c0
                 break
+
+    # Échelon 3 : Table des Alias
+    if existant is None:
+        alias_row = db.scalar(select(ConducteurAlias).where(ConducteurAlias.alias_normalise == cible))
+        if alias_row is not None and alias_row.conducteur is not None:
+            existant = alias_row.conducteur
+
+    # Échelon 4 : Sac de mots exact (tokens_set)
+    if existant is None and tset:
+        existant = db.scalar(select(Conducteur).where(Conducteur.tokens_set == tset))
+        if existant is None:
+            for c0 in db.scalars(select(Conducteur).where(Conducteur.tokens_set.is_(None))):
+                if calculer_tokens_set(c0.nom_prenom)[:170] == tset:
+                    existant = c0
+                    break
+        if existant is not None:
+            # Enregistrer comme alias permanent
+            if _existe_alias_en_session_ou_db(db, cible, existant.id) is None:
+                db.add(ConducteurAlias(conducteur_id=existant.id, alias_brut=nom,
+                                       alias_normalise=cible, source=plateforme or "AUTO"))
+                db.flush()
+
+    # Échelon 5 : Inclusion forte / patronyme partiel (>= 2 mots)
+    if existant is None and tset:
+        mots_cible = set(tset.split())
+        if len(mots_cible) >= 2:
+            candidats = []
+            for c0 in db.scalars(select(Conducteur).where(Conducteur.statut == StatutConducteur.ACTIF)).all():
+                c0_tokens = set((c0.tokens_set or calculer_tokens_set(c0.nom_prenom)).split())
+                if mots_cible.issubset(c0_tokens) and len(c0_tokens) > len(mots_cible):
+                    candidats.append(c0)
+            if len(candidats) == 1:
+                existant = candidats[0]
+                if _existe_alias_en_session_ou_db(db, cible, existant.id) is None:
+                    db.add(ConducteurAlias(conducteur_id=existant.id, alias_brut=nom,
+                                           alias_normalise=cible, source=plateforme or "INCLUSION"))
+                    db.flush()
+                log.info("Rapprochement par inclusion : « %s » rattaché à « %s »", nom, existant.nom_prenom)
+
     if existant is not None:
+        if badge_code and not existant.code_badge_mzonex:
+            existant.code_badge_mzonex = badge_code
+            if not existant.matricule:
+                existant.matricule = str(badge_code)
+        # Propagation automatique du code badge aux fiches ayant le même tokens_set
+        if existant.code_badge_mzonex and existant.tokens_set:
+            for c_hom in db.scalars(select(Conducteur).where(
+                    Conducteur.tokens_set == existant.tokens_set,
+                    Conducteur.code_badge_mzonex.is_(None))).all():
+                c_hom.code_badge_mzonex = existant.code_badge_mzonex
+                c_hom.matricule = str(existant.code_badge_mzonex)
         return existant
-    import uuid as _uuid
+
+    # Échelon 6 : Création nouvelle fiche
     tokens = nom.split()
     prenom_usuel = tokens[1] if tokens[0].isupper() and len(tokens) > 1 else tokens[-1]
+    matricule = str(badge_code) if (badge_code and badge_code > 0) else None
+
     c = Conducteur(nom_prenom=nom, prenom_usuel=prenom_usuel.capitalize(),
-                   matricule=f"AUTO-{_uuid.uuid4().hex[:8].upper()}",
-                   nom_normalise=cible)
+                   matricule=matricule, code_badge_mzonex=badge_code if (badge_code and badge_code > 0) else None,
+                   nom_normalise=cible, tokens_set=tset)
     db.add(c)
     db.flush()
+
+    # Propagation automatique du code badge aux homonymes sémantiques (même tokens_set)
+    if c.code_badge_mzonex and tset:
+        for c_hom in db.scalars(select(Conducteur).where(
+                Conducteur.tokens_set == tset,
+                Conducteur.code_badge_mzonex.is_(None))).all():
+            c_hom.code_badge_mzonex = c.code_badge_mzonex
+            c_hom.matricule = str(c.code_badge_mzonex)
+
     creer_alerte(
         db, TypeAlerte.NOUVEAU_CONDUCTEUR, GraviteAlerte.INFORMATION,
         f"Nouveau chauffeur détecté sur les relevés : {nom} — fiche créée "
         f"automatiquement ; affectation au véhicule à faire dans Conducteurs.")
     _auditer(db, "conducteur.auto_cree", c.id, {
         "nom_prenom": nom,
-        "regle": "§0quater D2 (14/08/2026) : découverte chauffeur — "
-                 "affectation manuelle"})
-    log.info("§0quater D2 : nouveau chauffeur « %s » détecté — fiche créée",
-             nom)
+        "matricule": matricule,
+        "code_badge_mzonex": badge_code,
+        "regle": "§0quater D2 (14/08/2026) : découverte chauffeur — affectation manuelle"})
+    log.info("§0quater D2 : nouveau chauffeur « %s » détecté (matricule=%s) — fiche créée",
+             nom, matricule)
     return c
 
 
@@ -1459,7 +2773,8 @@ _CHAMPS_ECO = ("v_max", "ralenti_s", "exc_vitesse", "exc_freinage",
                "exc_accel", "exc_ralenti", "exc_surregime", "exc_autres")
 
 
-def resoudre_badge(db, nom_brut: str | None):
+def resoudre_badge(db, nom_brut: str | None, badge_code: int | None = None,
+                   plateforme: str | None = None):
     """B2 — nom publié par le portail → (fiche Conducteur, libellé_écarté).
 
     (fiche, None)  : badge valide — fiche existante ou créée (D2), fait foi ;
@@ -1467,11 +2782,11 @@ def resoudre_badge(db, nom_brut: str | None):
     (None, None)   : pas de conducteur publié sur cette ligne."""
     from .models import Conducteur  # import local (comme creer_conducteur_auto)
     nom = " ".join((nom_brut or "").split()).strip()
-    if not nom:
+    if not nom and not badge_code:
         return None, None
-    if normaliser_libelle(nom) in mots_ignores_badge():
+    if nom and est_libelle_service_ou_garage(nom):
         return None, nom
-    fiche = creer_conducteur_auto(db, nom)      # D2 + D5 (retourne None si lieu)
+    fiche = creer_conducteur_auto(db, nom, badge_code=badge_code, plateforme=plateforme)
     if fiche is None:
         return None, nom
     return fiche, None
@@ -1481,12 +2796,106 @@ def attribuer_badge_au_jour(db, suivi: SuiviJournalier, fiche,
                             username: str = "collecteur") -> None:
     """B2 — le badge fait foi sur le chauffeur du JOUR (grille Parties A) :
     l'attribution « MANUEL » n'est jamais écrasée ; une attribution « BADGE »
-    (ou absente) suit le dernier badge valide publié. Idempotent, audité au
-    changement seulement (les lignes reviennent à chaque sync Niveau 2)."""
-    if getattr(suivi, "conducteur_origine", None) == "MANUEL":
+    (ou absente) suit le dernier badge valide publié.
+    Gestion intelligente des passages temporaires (relais) et détection anti-doublon."""
+    if suivi is None or fiche is None:
         return
+    vehicule = db.get(Vehicule, suivi.vehicule_id)
+    if vehicule is None or vehicule.statut != StatutVehicule.ACTIF:
+        return
+
+    titulaire = vehicule.conducteur_actuel if (vehicule and vehicule.conducteur_actuel) else None
+
+    # 1. Si la ligne de suivi actuelle est déjà attribuée MANUELLEMENT :
+    # La saisie manuelle prime TOUJOURS sur les relevés des portails.
+    if getattr(suivi, "conducteur_origine", None) == "MANUEL":
+        if suivi.conducteur_id != fiche.id:
+            log.info("§0septies B2 : attribution MANUELLE maintenue sur %s (%s) malgré badge « %s »",
+                     suivi.vehicule.plaque if suivi.vehicule else "?",
+                     suivi.conducteur.nom_prenom if suivi.conducteur else "?",
+                     fiche.nom_prenom)
+        return
+
+    # 2. Si le véhicule est déjà arbitré ou marqué en « RELAIS » :
+    # On maintient le titulaire sur le suivi, le trajet individuel conserve son badge spécifique.
+    if getattr(suivi, "conducteur_origine", None) == "RELAIS":
+        if titulaire and suivi.conducteur_id == titulaire.id:
+            return
+
+    # 3. Détection intelligente de passage temporaire (Relais / Sandwich) :
+    # Si le camion est rattaché à son titulaire et qu'un autre chauffeur conduit un trajet :
+    if titulaire and suivi.conducteur_id == titulaire.id and fiche.id != titulaire.id:
+        # Le camion reste attribué à son titulaire, la ligne passe en statut RELAIS
+        suivi.conducteur_origine = "RELAIS"
+        nom_titulaire = titulaire.nom_prenom
+        nom_relais = fiche.nom_prenom
+
+        msg = (f"Changement de conducteur détecté sur {vehicule.plaque} : "
+               f"trajet badgé par {nom_relais} (titulaire habituel : {nom_titulaire}). "
+               f"Arbitrage disponible.")
+        if not _alerte_recente_ouverte(db, TypeAlerte.CHANGEMENT_CONDUCTEUR_DETECTE, suivi.vehicule_id, fenetre_s=3600):
+            creer_alerte(
+                db, TypeAlerte.CHANGEMENT_CONDUCTEUR_DETECTE, GraviteAlerte.INFORMATION,
+                msg, vehicule_id=suivi.vehicule_id, conducteur_id=fiche.id,
+                lien_module=f"/suivi?date={suivi.date_jour.isoformat()}&vehicule={suivi.vehicule_id}"
+            )
+        _auditer(db, "suivi.relais_detecte", suivi.id, {
+            "plaque": vehicule.plaque, "titulaire": nom_titulaire,
+            "relais": nom_relais, "conducteur_relais_id": fiche.id,
+            "regle": "Passage temporaire : le titulaire reste affecté au camion, répartition proportionnelle du TCH"
+        })
+        log.info("Passage temporaire détecté sur %s : %s au volant (titulaire %s conservé)",
+                 vehicule.plaque, nom_relais, nom_titulaire)
+        return
+
+    # 4. Vérification anti-doublon : ce chauffeur (fiche.id) est-il déjà affecté à un AUTRE véhicule ce jour ?
+    autre_suivi = db.scalar(select(SuiviJournalier).where(
+        SuiviJournalier.date_jour == suivi.date_jour,
+        SuiviJournalier.conducteur_id == fiche.id,
+        SuiviJournalier.id != suivi.id))
+
+    if autre_suivi is not None:
+        plaque_autre = autre_suivi.vehicule.plaque if autre_suivi.vehicule else "inconnu"
+        plaque_ceci = suivi.vehicule.plaque if suivi.vehicule else "inconnu"
+        nom_ch = fiche.nom_prenom
+
+        # Si l'autre véhicule a été attribué MANUELLEMENT à ce chauffeur :
+        if getattr(autre_suivi, "conducteur_origine", None) == "MANUEL":
+            # Conflit d'affectation : la saisie manuelle sur l'autre véhicule fait foi
+            msg = (f"Conflit d'affectation : {nom_ch} est attribué manuellement "
+                   f"au camion {plaque_autre}, mais a été détecté sur les relevés "
+                   f"({suivi.vehicule.plateforme_gps if suivi.vehicule else 'GPS'}) pour le camion {plaque_ceci}.")
+            if not _alerte_recente_ouverte(db, TypeAlerte.CONFLIT_AFFECTATION, suivi.vehicule_id, fenetre_s=3600):
+                creer_alerte(db, TypeAlerte.CONFLIT_AFFECTATION, GraviteAlerte.MOYENNE,
+                             msg, vehicule_id=suivi.vehicule_id, conducteur_id=fiche.id,
+                             lien_module=f"/suivi?date={suivi.date_jour.isoformat()}&vehicule={suivi.vehicule_id}")
+            _auditer(db, "suivi.conflit_affectation", suivi.id, {
+                "chauffeur": nom_ch, "conducteur_id": fiche.id,
+                "vehicule_manuel": plaque_autre, "vehicule_portail": plaque_ceci,
+                "regle": "Conflit d'affectation : priorité à la saisie manuelle, pas de doublon dans Suivi Journalier"
+            })
+            log.warning("Conflit d'affectation : chauffeur %s (manuel sur %s) détecté portail sur %s",
+                        nom_ch, plaque_autre, plaque_ceci)
+            return
+
+        # Si l'autre affectation n'était PAS manuelle (ex. ancien badge de la journée) :
+        # Pour éviter tout doublon dans le suivi journalier, détacher l'ancien véhicule
+        autre_suivi.conducteur_id = None
+        autre_suivi.conducteur_origine = None
+        log.info("Changement de camion pour %s : détaché de %s et réaffecté à %s",
+                 nom_ch, plaque_autre, plaque_ceci)
+
+    # Propagation automatique du code badge aux homonymes sémantiques (même tokens_set)
+    if fiche.code_badge_mzonex and fiche.tokens_set:
+        for c_hom in db.scalars(select(Conducteur).where(
+                Conducteur.tokens_set == fiche.tokens_set,
+                Conducteur.code_badge_mzonex.is_(None))).all():
+            c_hom.code_badge_mzonex = fiche.code_badge_mzonex
+            c_hom.matricule = str(fiche.code_badge_mzonex)
+
     if suivi.conducteur_id == fiche.id and suivi.conducteur_origine == "BADGE":
         return
+
     avant = suivi.conducteur_id
     suivi.conducteur_id = fiche.id
     suivi.conducteur_origine = "BADGE"
@@ -1506,8 +2915,11 @@ def appliquer_badge_et_eco(db, trajet: Trajet, suivi: SuiviJournalier,
     compteurs d'écoconduite officiels. Idempotent et SILENCIEUX tant que les
     valeurs ne changent pas (les mêmes lignes reviennent à chaque cycle)."""
     nom = it.get("conducteur")
-    if nom:
-        fiche, ecarte = resoudre_badge(db, nom)
+    badge_code = it.get("badge_code")
+    plateforme = it.get("source") or getattr(vehicule, "plateforme_gps", None)
+    fiche = None
+    if nom or badge_code:
+        fiche, ecarte = resoudre_badge(db, nom, badge_code=badge_code, plateforme=plateforme)
         if ecarte is not None:
             if trajet.badge_ecarte != ecarte:
                 trajet.badge_ecarte = ecarte

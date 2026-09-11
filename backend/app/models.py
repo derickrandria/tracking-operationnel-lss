@@ -50,6 +50,7 @@ class StatutCamion(str, enum.Enum):
 class StatutMission(str, enum.Enum):
     EN_COURS = "EN_COURS"
     TERMINEE = "TERMINÉE"
+    DEVIEE = "DÉVIÉE"
     RETARDEE = "RETARDÉE"
 
 
@@ -100,6 +101,22 @@ class TypeAlerte(str, enum.Enum):
     REPARATION_DONNEES = "REPARATION_DONNEES"  # journée contrôlée/réparée (récap)
     # §0septies decies K1 (arbitrage LSS 27/08/2026 — observabilité Ym@ne)
     COLLECTE_YMANE = "COLLECTE_YMANE"        # collecte infractions en échec — auto-refermée à la guérison
+    # Module Temps de conduite (TCH) — seuil 46h (avertissement) et 56h (limite)
+    TCH_PROCHE_LIMITE = "TCH_PROCHE_LIMITE"      # TCH cumulé ≥ 46h00 (avertissement)
+    TCH_LIMITE_ATTEINTE = "TCH_LIMITE_ATTEINTE"  # TCH cumulé ≥ 56h00 (limite réglementaire)
+    # Détection de conflits et doublons d'affectation chauffeur
+    CONFLIT_AFFECTATION = "CONFLIT_AFFECTATION"  # Chauffeur attribué manuellement vs détecté sur un autre camion
+    DOUBLON_CONDUCTEUR = "DOUBLON_CONDUCTEUR"    # Doublon chauffeur sur la même journée
+    CHANGEMENT_CONDUCTEUR_DETECTE = "CHANGEMENT_CONDUCTEUR_DETECTE"  # Nouveau chauffeur détecté sur un trajet (arbitrage requis)
+    # Correctif v1.46 (constat du 04/09/2026) — la collecte portails peut traîner
+    # ou se bloquer SILENCIEUSEMENT (base arrêtée à 12h19, portails sains) :
+    # alerte dès que le dernier événement ingéré dépasse le seuil de retard.
+    COLLECTE_RETARD = "COLLECTE_RETARD"
+    # Alertes spécifiques aux cycles logistiques et missions
+    MISSION_SANS_OT = "MISSION_SANS_OT"              # Camion à GRT ≥ 15 min sans OT renseigné
+    VALIDATION_CHARGEMENT = "VALIDATION_CHARGEMENT"    # Camion à GRT ≥ 30 min (validation requise)
+    VALIDATION_DECHARGEMENT = "VALIDATION_DECHARGEMENT" # Camion au dépôt ≥ 3h (validation requise)
+    DEVIATION_DETECTEE = "DEVIATION_DETECTEE"          # Déviation de dépôt détectée ou déclarée
 
 
 class TypeEvenement(str, enum.Enum):
@@ -170,12 +187,36 @@ class Conducteur(Base):
     # réparation v1.38 une fois les doublons historiques résorbés.
     nom_normalise: Mapped[str | None] = mapped_column(String(170), index=True,
                                                       nullable=True)
+    tokens_set: Mapped[str | None] = mapped_column(String(170), index=True,
+                                                   nullable=True)
+    # Code badge MZoneX (driverKeyCode) — renseigné pour les camions MZoneX, vide pour CamtrackPro
+    code_badge_mzonex: Mapped[int | None] = mapped_column(Integer, index=True,
+                                                          nullable=True)
     prenom_usuel: Mapped[str] = mapped_column(String(60), index=True)
-    matricule: Mapped[str] = mapped_column(String(20), unique=True, index=True)
+    # Matricule : renseigné ou driverKeyCode pour MZoneX, vide/null pour CamtrackPro
+    matricule: Mapped[str | None] = mapped_column(String(40), index=True,
+                                                  nullable=True)
     telephone: Mapped[str | None] = mapped_column(String(40), nullable=True)
     statut: Mapped[StatutConducteur] = mapped_column(
         SAEnum(StatutConducteur, **SA_ENUM_KW), default=StatutConducteur.ACTIF)
     date_creation: Mapped[datetime] = mapped_column(DateTime, default=now_local)
+
+    aliases = relationship("ConducteurAlias", back_populates="conducteur",
+                           cascade="all, delete-orphan", lazy="selectin")
+
+
+class ConducteurAlias(Base):
+    """Alias textuels et variantes orthographiques pour le rapprochement des chauffeurs."""
+    __tablename__ = "conducteur_aliases"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    conducteur_id: Mapped[str] = mapped_column(
+        ForeignKey("conducteurs.id", ondelete="CASCADE"), index=True)
+    alias_brut: Mapped[str] = mapped_column(String(160))
+    alias_normalise: Mapped[str] = mapped_column(String(170), unique=True, index=True)
+    source: Mapped[str | None] = mapped_column(String(30), default="MANUEL")
+    date_creation: Mapped[datetime] = mapped_column(DateTime, default=now_local)
+
+    conducteur = relationship("Conducteur", back_populates="aliases")
 
 
 class Vehicule(Base):
@@ -231,8 +272,8 @@ class SuiviJournalier(Base):
     date_jour: Mapped[date] = mapped_column(Date, index=True)
 
     # Partie A
-    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
+    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"), index=True)
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
     # §0septies B2 (20/08/2026) — origine de l'attribution chauffeur du jour :
     # None / « BADGE » (portail, fait foi) / « MANUEL » (saisie — jamais
     # écrasée par un badge, même valide)
@@ -312,7 +353,7 @@ class Trajet(Base):
     # CamtrackPro). None = non fourni (≠ 0 infraction : on n'invente pas §10).
     conducteur_badge: Mapped[str | None] = mapped_column(String(160), nullable=True)
     conducteur_badge_id: Mapped[str | None] = mapped_column(
-        ForeignKey("conducteurs.id"), nullable=True)
+        ForeignKey("conducteurs.id"), index=True, nullable=True)
     badge_ecarte: Mapped[str | None] = mapped_column(String(160), nullable=True)
     v_max: Mapped[float | None] = mapped_column(Float, nullable=True)
     ralenti_s: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -339,20 +380,34 @@ class Trajet(Base):
 class Mission(Base):
     __tablename__ = "missions"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    code_mission: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     date_jour: Mapped[date] = mapped_column(Date, index=True)
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
-    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
+    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"), index=True)
     numero_mission_du_jour: Mapped[int] = mapped_column(Integer, default=1)
     statut: Mapped[StatutMission] = mapped_column(
         SAEnum(StatutMission, **SA_ENUM_KW), default=StatutMission.EN_COURS)
+    statut_camion_actuel: Mapped[str] = mapped_column(String(20), default="VIDE")
     heure_debut: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heure_chargement: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     heure_fin: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     duree_s: Mapped[int] = mapped_column(Integer, default=0)
     numero_ot: Mapped[str | None] = mapped_column(String(40), nullable=True)
-    produit: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    depot: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    distributeur: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    kilometrage: Mapped[float] = mapped_column(Float, default=0)
+    produit: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    depot: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    depot_prevu: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    depot_effectif: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    est_deviee: Mapped[bool] = mapped_column(Boolean, default=False)
+    motif_deviation: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    validation_chargement: Mapped[str | None] = mapped_column(String(20), default="EN_ATTENTE", nullable=True)
+    validation_dechargement: Mapped[str | None] = mapped_column(String(20), default="EN_ATTENTE", nullable=True)
+    motif_invalidation: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    est_repositionnement: Mapped[bool] = mapped_column(Boolean, default=False)
+    distributeur: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    km_vide: Mapped[float] = mapped_column(Float, default=0.0)
+    km_charge: Mapped[float] = mapped_column(Float, default=0.0)
+    kilometrage: Mapped[float] = mapped_column(Float, default=0.0)
+    kilometrage_total: Mapped[float] = mapped_column(Float, default=0.0)
     origine: Mapped[str | None] = mapped_column(String(200), nullable=True)
     etapes: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_local)
@@ -360,6 +415,7 @@ class Mission(Base):
 
     vehicule = relationship("Vehicule", lazy="joined")
     conducteur = relationship("Conducteur", lazy="joined")
+    infractions = relationship("Infraction", back_populates="mission", lazy="selectin")
 
 
 # ------------------------------------------------------------- infractions/alertes
@@ -412,6 +468,7 @@ class Infraction(Base):
 
     vehicule = relationship("Vehicule", lazy="joined")
     conducteur = relationship("Conducteur", lazy="joined")
+    mission = relationship("Mission", back_populates="infractions", foreign_keys=[mission_id], lazy="joined")
 
 
 class Alerte(Base):
@@ -420,8 +477,8 @@ class Alerte(Base):
     date_heure: Mapped[datetime] = mapped_column(DateTime, index=True, default=now_local)
     type: Mapped[TypeAlerte] = mapped_column(SAEnum(TypeAlerte, **SA_ENUM_KW), index=True)
     gravite: Mapped[GraviteAlerte] = mapped_column(SAEnum(GraviteAlerte, **SA_ENUM_KW))
-    vehicule_id: Mapped[str | None] = mapped_column(ForeignKey("vehicules.id"), nullable=True)
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
+    vehicule_id: Mapped[str | None] = mapped_column(ForeignKey("vehicules.id"), index=True, nullable=True)
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
     message: Mapped[str] = mapped_column(Text)
     statut: Mapped[StatutAlerte] = mapped_column(
         SAEnum(StatutAlerte, **SA_ENUM_KW), default=StatutAlerte.NOUVELLE)
@@ -442,8 +499,8 @@ class HistoriqueJournalier(Base):
     date_jour: Mapped[date] = mapped_column(Date, index=True)
     annee: Mapped[int] = mapped_column(Integer, index=True)
     mois: Mapped[int] = mapped_column(Integer, index=True)
-    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
-    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), nullable=True)
+    vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"), index=True)
+    conducteur_id: Mapped[str | None] = mapped_column(ForeignKey("conducteurs.id"), index=True, nullable=True)
     donnees: Mapped[dict] = mapped_column(JSON)  # snapshot complet (suivi + trajets)
     nb_infractions: Mapped[int] = mapped_column(Integer, default=0)
     nb_alertes: Mapped[int] = mapped_column(Integer, default=0)
@@ -469,7 +526,9 @@ class ParametrageSeuil(Base):
 class EvenementGPS(Base):
     """Données brutes issues du scraping/simulateur — table technique (§10)."""
     __tablename__ = "evenements_gps"
-    __table_args__ = (Index("ix_evenement_vehicule_ts", "vehicule_id", "horodatage"),)
+    __table_args__ = (
+        Index("ix_evenement_vehicule_ts", "vehicule_id", "horodatage"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
     vehicule_id: Mapped[str] = mapped_column(ForeignKey("vehicules.id"))
@@ -483,7 +542,30 @@ class EvenementGPS(Base):
         SAEnum(TypeEvenement, **SA_ENUM_KW), default=TypeEvenement.POSITION)
     source: Mapped[SourceEvenement] = mapped_column(
         SAEnum(SourceEvenement, **SA_ENUM_KW), default=SourceEvenement.SIMULATEUR)
+    idempotence_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=now_local, index=True)
+    historique: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now_local)
+
+
+class CollecteCheckpoint(Base):
+    """Fenêtre de collecte durable, repriseable après panne ou redémarrage."""
+    __tablename__ = "collecte_checkpoints"
+    __table_args__ = (
+        UniqueConstraint("source", "fenetre_debut", "fenetre_fin",
+                         name="uq_collecte_checkpoint_fenetre"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uid)
+    source: Mapped[str] = mapped_column(String(30), index=True)
+    fenetre_debut: Mapped[datetime] = mapped_column(DateTime)
+    fenetre_fin: Mapped[datetime] = mapped_column(DateTime)
+    statut: Mapped[str] = mapped_column(String(20), default="EN_COURS")
+    curseur: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    tentatives: Mapped[int] = mapped_column(Integer, default=0)
+    derniere_erreur: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now_local,
+                                                  onupdate=now_local)
 
 
 # ------------------------------------------------------------- audit (§11)

@@ -17,19 +17,34 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 celery = Celery("lss", broker=REDIS_URL, backend=REDIS_URL)
 celery.conf.timezone = "Indian/Antananarivo"
+CELERY_ENABLED = os.getenv("CELERY_ENABLED", "0") == "1"
 
 
 @celery.task
 def collecte_gps():
-    """Scraping MZoneX/CamtrackPro (§10) — planifié toutes les 5–10 min."""
-    from .scrapers import SOURCES
+    """Collecte API MZoneX/CamtrackPro (§10) — planifiée toutes les 10 s."""
+    if not CELERY_ENABLED:
+        return {"desactive": True, "orchestrateur": "ASYNCIO"}
+    from .scrapers import (SOURCES, MZoneXCollector,
+                           synchroniser_trajets_valides)
     source = os.getenv("COLLECTOR_SOURCE", "MZONEX")
-    return SOURCES[source]().run()
+    if source.upper() == "SIMULATEUR":
+        return 0
+    if source.upper() == "MIXTE":
+        n1 = MZoneXCollector().run()
+        n2 = synchroniser_trajets_valides("MIXTE")
+        return {"niveau1": n1, "niveau2": n2}
+    classe = SOURCES.get(source.upper())
+    if classe is None:
+        raise ValueError(f"Source de collecte inconnue : {source}")
+    return classe().run()
 
 
 @celery.task
 def chien_de_garde():
     """GPS hors ligne, immobilisations, missions retardées (§6.5)."""
+    if not CELERY_ENABLED:
+        return {"desactive": True, "orchestrateur": "ASYNCIO"}
     from .engine import boucle_surveillance
     boucle_surveillance()
 
@@ -37,6 +52,8 @@ def chien_de_garde():
 @celery.task
 def cycle_minuit():
     """Archivage + nouvelle journée + reset sélectif (§8)."""
+    if not CELERY_ENABLED:
+        return {"desactive": True, "orchestrateur": "ASYNCIO"}
     from datetime import date, timedelta
     from .daily import executer_cycle_quotidien
     aujourd = date.today()
@@ -44,7 +61,7 @@ def cycle_minuit():
 
 
 celery.conf.beat_schedule = {
-    "collecte-gps": {"task": "app.celery_app.collecte_gps", "schedule": 420.0},
+    "collecte-gps": {"task": "app.celery_app.collecte_gps", "schedule": 10.0},
     "chien-de-garde": {"task": "app.celery_app.chien_de_garde", "schedule": 60.0},
     "cycle-minuit": {"task": "app.celery_app.cycle_minuit",
                      "schedule": crontab(hour=0, minute=0)},

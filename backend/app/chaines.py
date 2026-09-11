@@ -188,6 +188,16 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     debut_max = max((s.debut for s in segs if not s.rejete), default=None)
     if debut_max is None:
         return res                        # que des manœuvres : aucune ligne
+
+    # Borne temporelle stricte : si tous les segments sont d'un jour passé (J < maintenant.date()),
+    # le calcul ne doit JAMAIS déborder sur le lendemain (plafond à J 23:59:59).
+    jour_max_segs = max(s.debut.date() for s in segs if s.debut)
+    if maintenant.date() > jour_max_segs:
+        maintenant = datetime.combine(jour_max_segs, datetime.max.time().replace(microsecond=0))
+        est_jour_passe = True
+    else:
+        est_jour_passe = False
+
     segs = [s for s in segs if not (s.fin is None and s.debut < debut_max)]
     segs.sort(key=lambda s: (s.debut, s.fin or datetime.max))
 
@@ -196,8 +206,8 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     for s in segs:
         if s.rejete:
             continue
-        fin_s = _fin_effective(s, vivant_possible=(s.debut >= debut_max),
-                               roule=roule,
+        fin_s = _fin_effective(s, vivant_possible=((s.debut >= debut_max) and not est_jour_passe),
+                               roule=(roule if not est_jour_passe else False),
                                fin_substitution=fin_substitution)
         if (fin_s is not None and s.distance_km is not None
                 and s.distance_km < seuil_km):

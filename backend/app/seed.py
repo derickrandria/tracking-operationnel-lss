@@ -9,6 +9,7 @@ import random
 
 from sqlalchemy import func, select
 
+from .config import calculer_tokens_set, normaliser_libelle
 from .database import SessionLocal, Base, engine as _engine
 from .engine import SEUILS_DEFAUT
 from .models import (Conducteur, ParametrageSeuil, Role, SituationCamion, User,
@@ -192,7 +193,10 @@ def seed_si_vide():
                 elif i == 54:
                     statut = "SUSPENDU"
                 c = Conducteur(nom_prenom=nom, prenom_usuel=usuel,
-                               matricule=f"CH{i:03d}", telephone=tel, statut=statut)
+                               matricule=None, code_badge_mzonex=None,
+                               nom_normalise=normaliser_libelle(nom),
+                               tokens_set=calculer_tokens_set(nom),
+                               telephone=tel, statut=statut)
                 db.add(c)
                 conducteurs.append(c)
             db.flush()
@@ -203,12 +207,24 @@ def seed_si_vide():
                 if plaque in ("0926TBV", "5716TBS"):
                     statut = "MAINTENANCE"
                 conducteur = disponibles[i] if i < len(disponibles) else None
+                est_camtrack = plaque in VEHICULES_CAMTRACKPRO
+                plateforme_gps = "CAMTRACKPRO" if est_camtrack else "MZONEX"
+                if conducteur:
+                    if not est_camtrack:
+                        # Flotte MZoneX : driverKeyCode officiel (numérique)
+                        badge_code = 10000 + i
+                        conducteur.code_badge_mzonex = badge_code
+                        conducteur.matricule = str(badge_code)
+                    else:
+                        # Flotte CamtrackPro : code vide
+                        conducteur.code_badge_mzonex = None
+                        conducteur.matricule = None
+
                 db.add(Vehicule(
                     plaque=plaque, description=desc, marque=MARQUES[i % len(MARQUES)],
                     capacite=CAPACITES[i % len(CAPACITES)], statut=statut,
                     gps_associe=f"OBC-{plaque}",
-                    plateforme_gps=("CAMTRACKPRO" if plaque in VEHICULES_CAMTRACKPRO
-                                    else "MZONEX"),
+                    plateforme_gps=plateforme_gps,
                     conducteur_actuel_id=conducteur.id if conducteur else None))
             log.info("Référentiels seedés : %d véhicules, %d chauffeurs, %d situations",
                      len(VEHICULES), len(CHAUFFEURS), len(SITUATIONS))
@@ -235,7 +251,6 @@ def seed_si_vide():
                     pauses = rng.randint(1800, 5400)
                     dep = datetime.combine(jour, datetime.min.time()).replace(hour=rng.randint(5, 7))
                     nb_inf = rng.choices([0, 1, 2], weights=[70, 22, 8])[0]
-                    depot = rng.choice(["DMMG", "DABI", "DABE", "DFIA"])
                     db.add(HistoriqueJournalier(
                         date_jour=jour, annee=jour.year, mois=jour.month,
                         vehicule_id=v.id, conducteur_id=c.id if c else None,
@@ -243,10 +258,10 @@ def seed_si_vide():
                             "plaque": v.plaque,
                             "conducteur": {"prenom_usuel": c.prenom_usuel, "nom_prenom": c.nom_prenom} if c else None,
                             "situation": "Repos chauffeur", "statut_camion": "LIBRE",
-                            "depot_recepteur": depot,
-                            "distributeur": rng.choice(["GALANA", "VIVO", "JOVENA", "TOTAL"]),
-                            "produit": rng.choice(["SP95", "GO", "PL"]),
-                            "numero_ot": f"OT-{jour:%Y%m%d}-{rng.randint(1, 60):04d}",
+                            "depot_recepteur": None,
+                            "distributeur": None,
+                            "produit": None,
+                            "numero_ot": None,
                             "heure_depart": dep.isoformat(),
                             "arret_final": f"{rng.randint(15, 19):02d}:{rng.randint(0, 59):02d} · Base LSS — Antananarivo",
                             "tcc_s": rng.randint(3600, 3 * 3600), "tcj_s": tcj,
@@ -268,6 +283,7 @@ def seed_si_vide():
                             adresse=rng.choice(["RN2 · PK 74 (avant Moramanga)", "RN2 · PK 201 (après Beforona)",
                                                 "RN7 · PK 96 (avant Antsirabe)"])))
             log.info("Historique de démonstration généré (6 jours archivés)")
+
         db.commit()
     finally:
         db.close()

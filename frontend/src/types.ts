@@ -1,13 +1,31 @@
 /** Types partagés avec l'API. */
+export interface ConducteurAlias {
+  id: string;
+  alias_brut: string;
+}
+
 export interface Conducteur {
   id: string;
   nom_prenom: string;
   prenom_usuel: string;
-  matricule: string;
+  matricule?: string | null;
+  code_badge_mzonex?: number | null;
+  nom_normalise?: string | null;
+  tokens_set?: string | null;
   telephone: string | null;
   statut: string;
+  statut_operationnel?: "En mission (Vide)" | "En mission (Chargé)" | "Disponible" | "En repos" | string;
   vehicule_plaque?: string | null;
   date_creation?: string;
+  aliases?: ConducteurAlias[];
+  mission_active?: {
+    id: string;
+    code_mission: string;
+    numero_ot: string | null;
+    produit: string | null;
+    depot_prevu: string | null;
+    statut_camion: string;
+  } | null;
 }
 
 export interface Vehicule {
@@ -17,11 +35,22 @@ export interface Vehicule {
   marque: string | null;
   capacite: number | null;
   statut: string;
+  statut_operationnel?: "LIBRE" | "VIDE" | "CHARGÉ" | "En maintenance" | string;
+  situation?: string | null;
+  statut_camion?: string | null;
   gps_associe: string | null;
   plateforme_gps?: string | null;
   conducteur_actuel_id: string | null;
   conducteur: Conducteur | null;
   date_creation?: string;
+  mission_active?: {
+    id: string;
+    code_mission: string;
+    numero_ot: string | null;
+    produit: string | null;
+    depot_prevu: string | null;
+    statut_camion: string;
+  } | null;
   position?: {
     lat: number | null;
     lng: number | null;
@@ -46,6 +75,8 @@ export interface Trajet {
   /** Addendum v1.5 §7.1 — validité métier (REJETE un trajet < 0,3 km ;
    * les REJETÉS sont filtrés côté serveur et n'arrivent pas jusqu'ici). */
   statut_validation?: "EN_ATTENTE" | "VALIDE" | "REJETE" | null;
+  conducteur_badge?: string | null;
+  conducteur_badge_id?: string | null;
 }
 
 export interface SuiviLigne {
@@ -56,6 +87,7 @@ export interface SuiviLigne {
   description: string | null;
   conducteur_id: string | null;
   conducteur: Conducteur | null;
+  conducteur_origine?: "MANUEL" | "BADGE" | "RELAIS" | "ARBITRE" | null;
   situation: string | null;
   statut_camion: "LIBRE" | "VIDE" | "CHARGÉ" | null;
   depot_recepteur: string | null;
@@ -93,23 +125,43 @@ export interface SuiviLigne {
 
 export interface Mission {
   id: string;
+  code_mission?: string;
   date_jour: string;
   conducteur_id: string | null;
   conducteur: Conducteur | null;
   vehicule_id: string;
   plaque: string;
   numero_mission_du_jour: number;
-  statut: "EN_COURS" | "TERMINÉE" | "RETARDÉE";
+  statut: "EN_COURS" | "TERMINÉE" | "DÉVIÉE" | "RETARDÉE";
+  statut_camion_actuel?: "VIDE" | "CHARGE" | "CHARGÉ" | "LIBRE" | string;
   heure_debut: string | null;
+  date_debut?: string | null;
+  heure_chargement?: string | null;
+  date_chargement?: string | null;
   heure_fin: string | null;
+  date_fin?: string | null;
   duree_s: number;
   numero_ot: string | null;
   produit: string | null;
   depot: string | null;
+  depot_prevu?: string | null;
+  depot_effectif?: string | null;
+  est_deviee?: boolean;
+  motif_deviation?: string | null;
+  validation_chargement?: "EN_ATTENTE" | "VALIDÉ" | string;
+  validation_dechargement?: "EN_ATTENTE" | "VALIDÉ" | "INVALIDÉ" | string;
+  motif_invalidation?: string | null;
+  est_repositionnement?: boolean;
   distributeur: string | null;
+  km_vide?: number;
+  km_charge?: number;
   kilometrage: number;
+  kilometrage_total?: number;
+  nb_infractions?: number;
   origine: string | null;
-  etapes: { etat: string; ts: string; lieu: string | null }[];
+  etapes: { etat: string; ts: string; lieu: string | null; zone?: string | null }[];
+  created_at?: string;
+  updated_at?: string;
 }
 
 export interface Infraction {
@@ -157,7 +209,9 @@ export interface Alerte {
   date_heure: string;
   type: string;
   gravite: "CRITIQUE" | "MOYENNE" | "INFORMATION";
+  vehicule_id?: string | null;
   plaque: string | null;
+  conducteur_id?: string | null;
   conducteur: Conducteur | null;
   message: string;
   statut: "NOUVELLE" | "VUE" | "TRAITEE";
@@ -172,4 +226,46 @@ export interface Referentiels {
   produits: string[];
   statuts_vehicule: string[];
   statuts_conducteur: string[];
+}
+
+export interface JourneeTCH {
+  tcj_s: number;
+  ttj_s: number;
+  vehicules: string[];
+  inclus_dans_tch: boolean;
+  en_cours: boolean;
+}
+
+export interface ConducteurTCH {
+  conducteur_id: string;
+  nom_prenom: string;
+  prenom_usuel: string;
+  matricule: string;
+  telephone: string | null;
+  statut: string;
+  vehicules_actifs: string[];
+  tch_cumul_s: number;
+  tch_restant_s: number;
+  date_dernier_reset: string | null;
+  alerte_statut: "NORMAL" | "PROCHE_LIMITE" | "LIMITE_ATTEINTE";
+  historique: Record<string, JourneeTCH>;
+}
+
+export interface SyntheseTCH {
+  du: string;
+  au: string;
+  dates: string[];
+  seuils: {
+    seuil_alerte_s: number;
+    seuil_max_s: number;
+    seuil_reset_repos_s: number;
+  };
+  stats: {
+    total_chauffeurs: number;
+    en_conduite_aujourdhui: number;
+    proche_limite: number;
+    limite_atteinte: number;
+    tch_moyen_s: number;
+  };
+  lignes: ConducteurTCH[];
 }
