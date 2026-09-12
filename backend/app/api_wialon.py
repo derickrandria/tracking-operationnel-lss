@@ -36,8 +36,8 @@ import logging
 import os
 import threading
 import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
+import httpx
 
 from .config import TZ, plaque_depuis_libelle_portail
 
@@ -45,7 +45,7 @@ log = logging.getLogger("lss.api_wialon")
 
 API_URL = os.getenv("WIALON_API_URL",
                     "https://hst-api.wialon.com/wialon/ajax.html")
-_TIMEOUT = int(os.getenv("CAMTRACKPRO_API_TIMEOUT_S", "10"))
+_TIMEOUT = float(os.getenv("CAMTRACKPRO_API_TIMEOUT_S", "30.0"))
 # Correctif PROPOSÉ v1.46 — opt-in STRICT (l'arbitrage O4 du 01/09/2026 « laisser
 # tel quel » reste le comportement PAR DÉFAUT) : WIALON_SESSION_PARTAGEE=1 fait
 # réutiliser UNE session Wialon unique par le processus (plus d'invalidation de
@@ -272,11 +272,15 @@ class ApiWialon:
                f"{urllib.parse.quote(json.dumps(params))}"
                + (f"&sid={self._sid}" if self._sid else ""))
         try:
-            with urllib.request.urlopen(url, timeout=_TIMEOUT) as r:
-                data = json.load(r)
-        except (TimeoutError, OSError) as e:
-            raise ErreurApiWialon(f"svc={svc} injoignable : "
-                                  f"{type(e).__name__}") from e
+            with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
+                resp = client.get(url)
+                if resp.status_code != 200:
+                    raise ErreurApiWialon(f"svc={svc} → HTTP {resp.status_code}")
+                data = resp.json()
+        except httpx.TimeoutException as e:
+            raise TimeoutError(f"svc={svc} timeout après {_TIMEOUT}s : {e}") from e
+        except Exception as e:
+            raise ErreurApiWialon(f"svc={svc} injoignable : {type(e).__name__} {e}") from e
         if isinstance(data, dict) and data.get("error"):
             code_err = int(data["error"])
             if code_err == 1 and reessai:      # session expirée

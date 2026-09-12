@@ -31,7 +31,7 @@ import time
 import urllib.parse
 import httpx
 
-socket.setdefaulttimeout(10.0)
+socket.setdefaulttimeout(30.0)
 
 log = logging.getLogger("lss.api_mzonex")
 
@@ -43,7 +43,7 @@ URI_REDIRECTION = os.getenv("MZONEX_API_REDIRECT_URI",
                             "https://live.mzoneweb.net/mzonex/")
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-_TIMEOUT = float(os.getenv("MZONEX_AUTH_TIMEOUT_S", "10.0"))
+_TIMEOUT = float(os.getenv("MZONEX_AUTH_TIMEOUT_S", "30.0"))
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "data")

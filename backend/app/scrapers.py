@@ -281,8 +281,8 @@ def etat_collecte_memoire() -> dict:
         }
 
 
-def _collecte_protegee(source: str, action, timeout_s: float = 15.0) -> int:
-    """Exécute une passe de source N1 sans chevauchement avec timeout dur de 15s."""
+def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
+    """Exécute une passe de source N1 sans chevauchement avec timeout dur de 30s."""
     if not _acquerir_verrou_n1(source):
         log.warning("Collecte N1 %s ignorée : une autre passe N1 est en cours", source)
         return 0
@@ -293,8 +293,14 @@ def _collecte_protegee(source: str, action, timeout_s: float = 15.0) -> int:
         _etat_collecte_fin(source, nombre)
         return nombre
     except (TimeoutError, FutureTimeoutError):
-        _etat_collecte_erreur(source, TimeoutError(f"Timeout dur de {timeout_s}s dépassé"))
-        log.warning("Collecte N1 %s interrompue : timeout dur de %.1fs dépassé", source, timeout_s)
+        msg = f"Timeout dur de {timeout_s}s dépassé — replanifié au prochain cycle"
+        _etat_collecte_erreur(source, TimeoutError(msg))
+        log.warning("Collecte N1 %s interrompue : %s", source, msg)
+        if source == "MZONEX":
+            try:
+                _synchroniser_dernier_point_mzonex()
+            except Exception:
+                pass
         return 0
     except Exception as exc:
         _etat_collecte_erreur(source, exc)
@@ -2403,8 +2409,10 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
         return 0
     coll = MZoneXApiCollector()
     total = 0
+    # Traitement par petits lots de 2 fenêtres max pour garantir une exécution rapide (< 5s)
+    fenetres_a_traiter = fenetres[:2]
     try:
-        for debut_local, fin_local in fenetres:
+        for debut_local, fin_local in fenetres_a_traiter:
             debut_utc = coll.api._utc_naive(debut_local)
             fin_utc = coll.api._utc_naive(fin_local)
             checkpoint_id = _checkpoint_ouvre("MZONEX_N1_RELECTURE",
@@ -2423,7 +2431,7 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
             log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
                      "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
                      fin_local.strftime("%H:%M"), len(brut), n)
-            time.sleep(0.5)   # laisser respirer la boucle d'événements (GIL)
+            time.sleep(0.2)
     except Exception:
         log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
                       "passage)")

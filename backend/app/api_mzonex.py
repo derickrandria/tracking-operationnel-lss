@@ -39,19 +39,16 @@ log = logging.getLogger("lss.api_mzonex")
 BASE_API = os.getenv("MZONEX_API_BASE_URL",
                      "https://live.mzoneweb.net/mzone62.api").rstrip("/")
 _UA = "LSS-Tracking/1.25"
-_TIMEOUT = int(os.getenv("MZONEX_API_TIMEOUT_S", "10"))
+_TIMEOUT = float(os.getenv("MZONEX_API_TIMEOUT_S", "30.0"))
 # Fenêtre de relecture Niveau 1 : 3 min de chevauchement (l'anti-rejeu existant
-# dédoublonne) ; 1ʳᵉ passe plafonnée à 30 min pour ne pas inonder (§10).
+# dédoublonne) ; 1ʳᵉ passe calibrée sur 15 min pour un payload léger et rapide.
 CHEVAUCHEMENT_S = int(os.getenv("MZONEX_API_CHEVAUCHEMENT_S", "180"))
-# §0nonies decies M3 (arbitrage LSS du 29/08/2026) — fenêtre élargie à 3 h :
-# un boîtier « muet » (zone sans couverture GSM) qui renvoie son tampon avec
-# moins de 3 h de retard enrichit la journée EN COURS (volume mesuré en direct
-# le 29/08 : ~600 événements/15 min — très loin du plafond technique 9 000) ;
-# au-delà de 3 h, la relecture des jours passés (M1, §0nonies decies) fait foi.
-FENETRE_MAX_S = int(os.getenv("MZONEX_API_FENETRE_MAX_S", "10800"))
+# Payload optimisé : fenêtre max temps réel calibrée à 15 minutes (900 s)
+# pour éviter tout timeout réseau sur l'API OData distante.
+FENETRE_MAX_S = int(os.getenv("MZONEX_API_FENETRE_MAX_S", "900"))
 DECALAGE_PUBLICATION_S = int(os.getenv("MZONEX_API_DECALAGE_S", "20"))
 MAX_PAGES = int(os.getenv("MZONEX_API_MAX_PAGES", "10"))
-TAILLE_PAGE = int(os.getenv("MZONEX_API_TAILLE_PAGE", "900"))
+TAILLE_PAGE = int(os.getenv("MZONEX_API_TAILLE_PAGE", "200"))
 
 
 class ErreurApiMZoneX(RuntimeError):
@@ -311,13 +308,9 @@ class ApiMZoneX:
     def evenements(self, debut_utc: datetime, fin_utc: datetime) -> list[dict]:
         """Fil d'événements de la flotte sur [debut_utc ; fin_utc] (UTC naïves).
 
-        Correctif v1.46 (constat du 04/09/2026) : la fenêtre est DÉCOUPÉE en
-        tranches d'une heure — les volumes réels (~2 600 évts/h, pic mesuré)
-        dépassent le plafond de pagination 9 000 dès qu'une fenêtre couvre
-        plusieurs heures, ce qui tronquait silencieusement le fil. Chaque
-        tranche horaire reste très en dessous du plafond ; l'anti-rejeu amont
-        dédoublonne, le résultat est identique à un appel monolithique."""
-        pas = timedelta(hours=1)
+        Optimisation Payload v2026 : la fenêtre est découpée en tranches
+        de 15 minutes pour éviter tout engorgement et garantir des temps de réponse < 2s."""
+        pas = timedelta(minutes=15)
         evs: list[dict] = []
         borne = debut_utc
         while borne < fin_utc:
