@@ -24,9 +24,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
+import httpx
+
+socket.setdefaulttimeout(10.0)
 
 from .config import TZ, plaque_depuis_libelle_portail
 from .oauth_mzonex import ErreurAuthMZoneX, gestionnaire
@@ -205,26 +208,30 @@ class ApiMZoneX:
 
     # ---------------------------------------------------------------- bas
     def _get(self, chemin_requete: str, reessai: bool = True) -> dict:
-        req = urllib.request.Request(
-            f"{BASE_API}/{chemin_requete}",
-            headers={"Authorization": "Bearer " + self._jetons.jeton(),
-                     "User-Agent": _UA, "Accept": "application/json"})
+        url = f"{BASE_API}/{chemin_requete}"
+        headers = {
+            "Authorization": "Bearer " + self._jetons.jeton(),
+            "User-Agent": _UA,
+            "Accept": "application/json"
+        }
         try:
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and reessai:
-                log.info("MZoneX API : jeton refusé (401) — ré-authentification")
-                self._jetons.invalider()
-                return self._get(chemin_requete, reessai=False)
-            corps = e.read().decode("utf-8", "replace")[:160]
-            raise ErreurApiMZoneX(
-                f"GET {chemin_requete.split('?')[0]} → HTTP {e.code} : "
-                f"{corps}") from e
-        except (TimeoutError, OSError) as e:
+            with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
+                resp = client.get(url, headers=headers)
+                if resp.status_code == 401 and reessai:
+                    log.info("MZoneX API : jeton refusé (401) — ré-authentification")
+                    self._jetons.invalider()
+                    return self._get(chemin_requete, reessai=False)
+                if resp.status_code != 200:
+                    corps = resp.text[:160]
+                    raise ErreurApiMZoneX(
+                        f"GET {chemin_requete.split('?')[0]} → HTTP {resp.status_code} : {corps}")
+                return resp.json()
+        except httpx.TimeoutException as e:
+            raise TimeoutError(f"GET {chemin_requete.split('?')[0]} timeout après {_TIMEOUT}s : {e}") from e
+        except Exception as e:
             raise ErreurApiMZoneX(
                 f"GET {chemin_requete.split('?')[0]} injoignable : "
-                f"{type(e).__name__}") from e
+                f"{type(e).__name__} {e}") from e
 
     def _pages(self, chemin_requete: str) -> list:
         """Pagination par $skip (le serveur n'émet pas de @odata.nextLink).

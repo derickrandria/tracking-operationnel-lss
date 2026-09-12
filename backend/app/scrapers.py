@@ -82,8 +82,11 @@ from .api_mzonex import (ApiMZoneX, point_depuis_evenement_api,
 from .api_wialon import (ApiWialon, jeton_configure,
                          point_depuis_position_wialon)
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
 log = logging.getLogger("lss.scraper")
 
+_COLLECTE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lss-collector")
 COLLECTE_LOCK = threading.Lock()
 _VERROU_LOCK = threading.Lock()
 _VERROU_ACQUIS_TS: float | None = None
@@ -184,16 +187,21 @@ def etat_collecte_memoire() -> dict:
         }
 
 
-def _collecte_protegee(source: str, action) -> int:
-    """Exécute une passe de source sans chevauchement dans le processus."""
+def _collecte_protegee(source: str, action, timeout_s: float = 15.0) -> int:
+    """Exécute une passe de source sans chevauchement avec timeout dur de 15s."""
     if not _acquerir_verrou_collecte(source):
         log.warning("Collecte %s ignorée : une autre passe est en cours", source)
         return 0
     _etat_collecte_debut(source)
     try:
-        nombre = int(action() or 0)
+        fut = _COLLECTE_EXECUTOR.submit(action)
+        nombre = int(fut.result(timeout=timeout_s) or 0)
         _etat_collecte_fin(source, nombre)
         return nombre
+    except (TimeoutError, FutureTimeoutError):
+        _etat_collecte_erreur(source, TimeoutError(f"Timeout dur de {timeout_s}s dépassé"))
+        log.warning("Collecte %s interrompue : timeout dur de %.1fs dépassé", source, timeout_s)
+        return 0
     except Exception as exc:
         _etat_collecte_erreur(source, exc)
         log.exception("Échec collecte protégée %s", source)
@@ -2330,6 +2338,14 @@ def boucle_collecte():
         log.exception("Chargement initial des géozones en échec — retraité "
                       "par le cache (choix « hors zone » inscrit, loi B4)")
     while True:
+        # §0bis : Sécurité anti-blocage — libération forcée si le verrou est retenu > 30s
+        if COLLECTE_LOCK.locked():
+            now_m = time.monotonic()
+            if _VERROU_ACQUIS_TS is not None and (now_m - _VERROU_ACQUIS_TS) > 30.0:
+                log.warning("Verrou de collecte bloqué depuis %.1fs (> 30s) — réinitialisation forcée",
+                            now_m - _VERROU_ACQUIS_TS)
+                forcer_deverrouillage_collecte(raison="abandon_cycle_bloque")
+
         try:
             charger_zones()          # rechargement périodique (cache 6 h)
         except Exception:

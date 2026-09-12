@@ -74,10 +74,15 @@ async def _boucle_collecteur_reel():
     """Collecte réelle MZoneX / CamtrackPro (§10) — activée par COLLECTOR_SOURCE.
     Les points insérés transitent par le même `ingest_event()` (§7) : missions,
     temps réglementaires, infractions, alertes et temps réel s'enchaînent tels quels."""
-    from .scrapers import SOURCES, boucle_collecte
+    from .scrapers import SOURCES, boucle_collecte, forcer_deverrouillage_collecte, etat_collecte_memoire
     source = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
     if source not in SOURCES and source != "MIXTE":
         return
+    # Réinitialisation de sécurité du verrou au boot
+    st = etat_collecte_memoire()
+    if st.get("verrou_occupe") and (st.get("verrou_duree_s") or 0) > 30.0:
+        log.warning("Verrou de collecte hérité bloqué — réinitialisation au démarrage de la boucle")
+        forcer_deverrouillage_collecte(raison="demarrage_boucle_collecte")
     if SIM_ENABLE:
         log.warning("SIMULATEUR et COLLECTEUR %s actifs ensemble — "
                     "mettez SIM_ENABLE=0 pour la production réelle", source)
