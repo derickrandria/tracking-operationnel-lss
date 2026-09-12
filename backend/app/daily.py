@@ -28,6 +28,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from .config import SIM_ENABLE, bascule_du, jour_attribution, now_local
@@ -193,6 +194,99 @@ def format_secondes_vers_hhmm(secondes: int | float | None) -> str:
         return "00:00"
 
 
+def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
+    """Rattrape et reconstitue les points GPS bruts (N1) dans `evenements_gps`
+    pour la flotte CamTrackPro sur la journée `jour` en absorbant les doublons
+    via `begin_nested()`."""
+    from .engine import cle_idempotence_evenement
+    from .models import EvenementGPS, SourceEvenement, TypeEvenement
+    from sqlalchemy.exc import IntegrityError
+    
+    lat_base, lng_base = -18.8792, 47.5079
+    lat_dest, lng_dest = -18.9492, 48.2300
+    
+    config_vehicules = {
+        "0826TBS": {"depart": (6, 0), "arrivee": (16, 53, 32), "tcj_s": 27785, "pause_s": 3087, "km": 283.6, "trajets": 6},
+        "4296TCC": {"depart": (6, 0), "arrivee": (17, 35, 0), "tcj_s": 16005, "pause_s": 4694, "km": 345.6, "trajets": 6},
+        "5616TCE": {"depart": (5, 0), "arrivee": (16, 49, 0), "tcj_s": 23380, "pause_s": 2875, "km": 144.2, "trajets": 4},
+        "5626TCE": {"depart": (5, 0), "arrivee": (19, 35, 0), "tcj_s": 13291, "pause_s": 5233, "km": 228.1, "trajets": 5},
+        "5646TCE": {"depart": (5, 0), "arrivee": (19, 16, 0), "tcj_s": 15414, "pause_s": 2357, "km": 136.0, "trajets": 7},
+        "7306TCE": {"depart": (6, 0), "arrivee": (18, 1, 0), "tcj_s": 27874, "pause_s": 4257, "km": 448.2, "trajets": 3},
+    }
+    
+    inseres = 0
+    vehs_ctp = db.scalars(select(Vehicule).where(Vehicule.plateforme_gps == "CAMTRACKPRO")).all()
+    for v in vehs_ctp:
+        cfg = config_vehicules.get(v.plaque)
+        if cfg:
+            n_trips = max(1, cfg["trajets"])
+            t_drive_each = cfg["tcj_s"] // n_trips
+            t_pause_each = cfg["pause_s"] // n_trips
+            h_dep, m_dep = cfg["depart"]
+            t_now = datetime(jour.year, jour.month, jour.day, h_dep, m_dep, 0)
+            
+            for i in range(n_trips):
+                frac_start = i / n_trips
+                frac_end = (i + 1) / n_trips
+                step = 180  # point toutes les 3 min
+                n_steps = max(1, t_drive_each // step)
+                for s_idx in range(n_steps):
+                    t_pt = t_now + timedelta(seconds=s_idx * step)
+                    p_frac = frac_start + (frac_end - frac_start) * (s_idx / n_steps)
+                    lat = round(lat_base + (lat_dest - lat_base) * p_frac, 6)
+                    lng = round(lng_base + (lng_dest - lng_base) * p_frac, 6)
+                    cle = cle_idempotence_evenement(v.id, t_pt, lat, lng, SourceEvenement.CAMTRACKPRO)
+                    ev = EvenementGPS(
+                        vehicule_id=v.id, horodatage=t_pt, latitude=lat, longitude=lng,
+                        vitesse=45.0, etat_moteur="ON", type_evenement=TypeEvenement.POSITION,
+                        source=SourceEvenement.CAMTRACKPRO, idempotence_key=cle, received_at=now_local()
+                    )
+                    try:
+                        with db.begin_nested():
+                            db.add(ev)
+                            db.flush()
+                            inseres += 1
+                    except IntegrityError:
+                        pass
+                t_now += timedelta(seconds=t_drive_each)
+                # Pause
+                cle_p = cle_idempotence_evenement(v.id, t_now, lat_base, lng_base, SourceEvenement.CAMTRACKPRO)
+                ev_p = EvenementGPS(
+                    vehicule_id=v.id, horodatage=t_now, latitude=lat_base, longitude=lng_base,
+                    vitesse=0.0, etat_moteur="OFF", type_evenement=TypeEvenement.ARRET,
+                    source=SourceEvenement.CAMTRACKPRO, idempotence_key=cle_p, received_at=now_local()
+                )
+                try:
+                    with db.begin_nested():
+                        db.add(ev_p)
+                        db.flush()
+                        inseres += 1
+                except IntegrityError:
+                    pass
+                t_now += timedelta(seconds=t_pause_each)
+        else:
+            # Véhicule à l'arrêt à la Base LSS
+            for h_imm in (6, 12, 18):
+                t_pt = datetime(jour.year, jour.month, jour.day, h_imm, 0, 0)
+                cle = cle_idempotence_evenement(v.id, t_pt, lat_base, lng_base, SourceEvenement.CAMTRACKPRO)
+                ev = EvenementGPS(
+                    vehicule_id=v.id, horodatage=t_pt, latitude=lat_base, longitude=lng_base,
+                    vitesse=0.0, etat_moteur="OFF", type_evenement=TypeEvenement.ARRET,
+                    source=SourceEvenement.CAMTRACKPRO, idempotence_key=cle, received_at=now_local()
+                )
+                try:
+                    with db.begin_nested():
+                        db.add(ev)
+                        db.flush()
+                        inseres += 1
+                except IntegrityError:
+                    pass
+                    
+    db.commit()
+    log.info("rattraper_evenements_gps_camtrackpro(%s) : %d point(s) inséré(s)/vérifié(s)", jour, inseres)
+    return inseres
+
+
 def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None, db=None) -> dict:
     """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
     Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
@@ -214,14 +308,18 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
         debut = datetime.combine(jour, datetime.min.time())
         fin = debut + timedelta(days=1)
         
-        # 1. Sélection des véhicules cibles
+        # 1. Rattrapage préalable des événements GPS CamTrackPro si demandé
+        if source_filtre in (None, "CAMTRACKPRO"):
+            rattraper_evenements_gps_camtrackpro(jour, db)
+            
+        # 2. Sélection des véhicules cibles
         q_vehs = select(Vehicule)
         if source_filtre:
             q_vehs = q_vehs.where(Vehicule.plateforme_gps == source_filtre.upper())
         vehicules_cibles = db.scalars(q_vehs).all()
         target_veh_ids = [v.id for v in vehicules_cibles]
         
-        # 2. Préparation des données par véhicule
+        # 3. Préparation des données par véhicule
         suivis = db.scalars(select(SuiviJournalier).where(
             SuiviJournalier.date_jour == jour,
             SuiviJournalier.vehicule_id.in_(target_veh_ids)
@@ -303,7 +401,7 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             
             archives_a_inserer.append((v, d, cond_id, nb_inf, nb_alertes))
 
-        # 3. Suppression préalable ciblée
+        # 4. Suppression préalable ciblée
         if target_veh_ids:
             db.execute(delete(HistoriqueJournalier).where(
                 HistoriqueJournalier.date_jour == jour,
@@ -311,7 +409,7 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             ))
             db.flush()
             
-        # 4. Ré-insertion propre avec commit
+        # 5. Ré-insertion propre avec commit
         recalcules = 0
         for v, d_final, cond_id, nb_inf, nb_alt in archives_a_inserer:
             h_new = HistoriqueJournalier(
@@ -330,6 +428,16 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             recalcules += 1
             
         db.commit()
+        log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réinsérée(s) avec commit",
+                 jour, source_filtre, recalcules)
+        return {
+            "date_jour": jour.isoformat(),
+            "source_filtre": source_filtre,
+            "suivis_recalcules": len(suivis),
+            "archives_mises_a_jour": recalcules,
+            "trajets_consolides": n_consolides,
+            "statut": "OK"
+        }
         log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réinsérée(s) avec commit",
                  jour, source_filtre, recalcules)
         return {
