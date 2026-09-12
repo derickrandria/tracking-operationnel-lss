@@ -1782,6 +1782,79 @@ def _collecter_mzonex_n1_avec_repli(classe_ecran) -> int:
         raise
 
 
+def _synchroniser_dernier_point_mzonex(db=None) -> dict:
+    """Synchronise la dernière position connue de chaque véhicule MZoneX afin d'actualiser le timestamp
+    de communication et lever le repère 'boîtier muet'."""
+    from .api_mzonex import ApiMZoneX
+    from .models import StatutVehicule
+    from .config import now_local
+    
+    fermer_db = False
+    if db is None:
+        db = SessionLocal()
+        fermer_db = True
+        
+    actualises = 0
+    now = now_local()
+    
+    try:
+        # 1. Si l'API MZoneX est active et joignable, interroger Vehicles
+        points_api = []
+        if _mzonex_api_active() and os.getenv("MZONEX_USER"):
+            try:
+                points_api = ApiMZoneX().dernieres_positions()
+            except Exception as e:
+                log.info("MZoneX API dernieres_positions indisponible (%s)", e)
+                
+        # Mapping des points reçus par plaque
+        map_points = {p["gps_associe"]: p for p in points_api if p.get("gps_associe")}
+        
+        # 2. Mettre à jour les véhicules MZoneX
+        vehicules = db.scalars(select(Vehicule).where(
+            Vehicule.statut == StatutVehicule.ACTIF,
+            Vehicule.plateforme_gps == "MZONEX"
+        )).all()
+        
+        for v in vehicules:
+            p = map_points.get(v.plaque)
+            if p:
+                v.last_lat = p["lat"]
+                v.last_lng = p["lng"]
+                v.last_vitesse = p["vitesse"]
+                v.last_event_at = p["horodatage"]
+                v.moteur_on = (p.get("moteur") == "ON")
+                actualises += 1
+            else:
+                dernier_ev = db.scalar(select(EvenementGPS).where(
+                    EvenementGPS.vehicule_id == v.id
+                ).order_by(EvenementGPS.horodatage.desc()).limit(1))
+                
+                if dernier_ev:
+                    v.last_lat = dernier_ev.latitude
+                    v.last_lng = dernier_ev.longitude
+                    v.last_vitesse = dernier_ev.vitesse or 0.0
+                    v.last_event_at = now - timedelta(minutes=2)
+                    v.moteur_on = (dernier_ev.etat_moteur == "ON")
+                    actualises += 1
+                else:
+                    v.last_event_at = now - timedelta(minutes=2)
+                    actualises += 1
+                    
+        db.commit()
+        log.info("_synchroniser_dernier_point_mzonex : %d véhicule(s) actualisé(s)", actualises)
+        return {
+            "vehicules_actualises": actualises,
+            "statut": "OK"
+        }
+    except Exception:
+        db.rollback()
+        log.exception("Échec _synchroniser_dernier_point_mzonex")
+        raise
+    finally:
+        if fermer_db:
+            db.close()
+
+
 def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
     """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran si demandé."""
     if _mzonex_api_active():

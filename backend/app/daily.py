@@ -179,6 +179,91 @@ def pre_consolider_veille(db, jour_veille: date, maintenant: datetime | None = N
     return consolider_jour(db, jour_veille, maintenant)
 
 
+def recalculer_archives_journee(jour_cible: str | date, db=None) -> dict:
+    """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
+    Met à jour les métriques TCJ, TTJ, KM, arrêts et le snapshot JSON d'HistoriqueJournalier."""
+    from .engine import get_seuils, recalculer_temps
+    from .serializers import s_suivi
+    
+    fermer_db = False
+    if db is None:
+        db = SessionLocal()
+        fermer_db = True
+        
+    try:
+        jour = date.fromisoformat(jour_cible) if isinstance(jour_cible, str) else jour_cible
+        seuils = get_seuils(db)
+        cloture = _cloture_du(jour, seuils)
+        debut = datetime.combine(jour, datetime.min.time())
+        fin = debut + timedelta(days=1)
+        
+        # 1. Consolidation des trajets du jour s'il existe des suivis en base
+        suivis = db.scalars(select(SuiviJournalier).where(SuiviJournalier.date_jour == jour)).all()
+        n_consolides = 0
+        recalcules = 0
+        
+        if suivis:
+            n_consolides = consolider_jour(db, jour)
+            for s in suivis:
+                recalculer_temps(db, s, cloture)
+                h = db.scalar(select(HistoriqueJournalier).where(
+                    HistoriqueJournalier.date_jour == jour,
+                    HistoriqueJournalier.vehicule_id == s.vehicule_id))
+                    
+                nb_inf = db.scalar(select(func.count(Infraction.id)).where(
+                    Infraction.date_jour == jour, Infraction.vehicule_id == s.vehicule_id,
+                    Infraction.exterieure.is_(True))) or 0
+                nb_alertes = db.scalar(select(func.count(Alerte.id)).where(
+                    Alerte.vehicule_id == s.vehicule_id,
+                    Alerte.date_heure >= debut, Alerte.date_heure < fin)) or 0
+                    
+                donnees_suivi = s_suivi(s, seuils)
+                if h is None:
+                    h = HistoriqueJournalier(
+                        date_jour=jour, annee=jour.year, mois=jour.month,
+                        vehicule_id=s.vehicule_id, conducteur_id=s.conducteur_id,
+                        donnees=donnees_suivi, nb_infractions=nb_inf, nb_alertes=nb_alertes)
+                    db.add(h)
+                else:
+                    h.conducteur_id = s.conducteur_id
+                    h.donnees = donnees_suivi
+                    h.nb_infractions = nb_inf
+                    h.nb_alertes = nb_alertes
+                recalcules += 1
+        else:
+            # Re-calibrer les archives existantes pour garantir l'exacte cohérence métier TTJ = TCJ + Pause
+            archives = db.scalars(select(HistoriqueJournalier).where(
+                HistoriqueJournalier.date_jour == jour
+            )).all()
+            for h in archives:
+                d = dict(h.donnees or {})
+                tcj = int(d.get("tcj_s") or 0)
+                pauses = int(d.get("total_pause_s") or 0)
+                # Formule métier v3 AM-1 : TTJ = TCJ + Pauses
+                ttj = tcj + pauses
+                d["ttj_s"] = ttj
+                d["tcc_s"] = 0  # TCC archivé masqué à 0 à la clôture (règle N1)
+                h.donnees = d
+                recalcules += 1
+                
+        db.commit()
+        log.info("recalculer_archives_journee(%s) terminé : %d archive(s) réactualisée(s)", jour, recalcules)
+        return {
+            "date_jour": jour.isoformat(),
+            "suivis_recalcules": len(suivis),
+            "archives_mises_a_jour": recalcules,
+            "trajets_consolides": n_consolides,
+            "statut": "OK"
+        }
+    except Exception:
+        db.rollback()
+        log.exception("Échec recalculer_archives_journee(%s)", jour_cible)
+        raise
+    finally:
+        if fermer_db:
+            db.close()
+
+
 def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
     """Enchaîne CONSOLIDATION 23:59:59 de la veille (v3 AM-3/C1) + archivage
     + création des lignes du nouveau jour (A+B reportées, C et D vides).

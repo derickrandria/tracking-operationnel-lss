@@ -347,6 +347,8 @@ def sync_gps_immediat(db: Session = Depends(get_db),
         
     # 4. Rattrapages
     try:
+        from ..scrapers import _synchroniser_dernier_point_mzonex
+        _synchroniser_dernier_point_mzonex(db)
         rattraper_ouvertures()
         auto_positions_horaires(db)
     except Exception:
@@ -355,6 +357,29 @@ def sync_gps_immediat(db: Session = Depends(get_db),
     audit(db, user, "suivi.sync_gps_manuel", "suivi", str(now_local().date()), resultat)
     db.commit()
     return resultat
+
+
+@router.post("/suivi/sync-mzonex")
+def sync_mzonex_live(db: Session = Depends(get_db),
+                     user=Depends(require_roles(*ECRITURE))):
+    """Force la synchronisation immédiate du dernier point connu pour chaque véhicule MZoneX."""
+    from ..scrapers import _synchroniser_dernier_point_mzonex
+    res = _synchroniser_dernier_point_mzonex(db)
+    audit(db, user, "suivi.sync_mzonex", "vehicules", "mzonex", res)
+    db.commit()
+    return res
+
+
+@router.post("/suivi/recalculer-archive")
+def recalculer_archive_api(date_jour: str = Query(default="2026-09-11"),
+                           db: Session = Depends(get_db),
+                           user=Depends(require_roles(*ECRITURE))):
+    """Re-consolide et re-calcule intégralement les archives d'une journée."""
+    from ..daily import recalculer_archives_journee
+    res = recalculer_archives_journee(date_jour, db=db)
+    audit(db, user, "historique.recalculer_archive", "historique", date_jour, res)
+    db.commit()
+    return res
 
 
 # ============================== MISSIONS ==============================
