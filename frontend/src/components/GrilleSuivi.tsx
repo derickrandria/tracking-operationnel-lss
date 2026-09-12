@@ -9,7 +9,8 @@
  *
  * `onEdit` absent / `lectureSeule` → cellules désactivées, structure inchangée.
  */
-import { Fragment, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
+import { api } from "../api";
 import Icon from "./icons";
 import { Modal } from "./ui";
 import { Referentiels, SuiviLigne } from "../types";
@@ -122,16 +123,86 @@ export interface GrilleSuiviProps {
   pendingUI?: Record<string, boolean>;
   /** §0vicies decies N1 : journée terminée → colonne TCC affichée « 0:00 ». */
   masquerTCC?: boolean;
+  onRefresh?: () => void;
+}
+
+function extraireConducteursRelais(l: SuiviLigne): Array<{ nom: string; duree_s: number }> {
+  if (!l.trajets || l.trajets.length === 0) return [];
+  const mapRelais = new Map<string, number>();
+  const nomPrincipal = (l.conducteur?.nom_prenom || "").toLowerCase().trim();
+  const prenomPrincipal = (l.conducteur?.prenom_usuel || "").toLowerCase().trim();
+
+  for (const t of l.trajets) {
+    const badge = (t.conducteur_badge || "").trim();
+    if (!badge) continue;
+    const badgeNorm = badge.toLowerCase();
+    if (nomPrincipal && (badgeNorm === nomPrincipal || nomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    if (prenomPrincipal && (badgeNorm === prenomPrincipal || prenomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    let sec = 0;
+    if (t.heure_debut && t.heure_fin) {
+      const d1 = new Date(t.heure_debut).getTime();
+      const d2 = new Date(t.heure_fin).getTime();
+      if (d2 > d1) sec = Math.round((d2 - d1) / 1000);
+    }
+    mapRelais.set(badge, (mapRelais.get(badge) || 0) + sec);
+  }
+  return Array.from(mapRelais.entries()).map(([nom, duree_s]) => ({ nom, duree_s }));
+}
+
+function fmtDureeRelais(sec: number): string {
+  if (!sec || sec <= 0) return "";
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  return `${h}h${String(m).padStart(2, "0")}`;
 }
 
 export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                                       lectureSeule, onEdit, pendingUI,
-                                      masquerTCC }: GrilleSuiviProps) {
+                                      masquerTCC, onRefresh }: GrilleSuiviProps) {
   const [extra, setExtra] = useState<SuiviLigne | null>(null);
+  const [arbitrageLigne, setArbitrageLigne] = useState<SuiviLigne | null>(null);
+  const [choixArbitrage, setChoixArbitrage] = useState<"PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE">("PASSAGE_TEMPORAIRE");
+  const [envoiArbitrage, setEnvoiArbitrage] = useState(false);
+
   const fige = lectureSeule || !onEdit;
   const edit = onEdit || PAS_DE_MODIF;
   const pauseMin = seuils?.DUREE_MIN_PAUSE_VALIDE || 900;
   const tccMax = seuils?.SEUIL_TCC_MAX ?? 16200;   // 4h30 (Addendum v1.9 §1.1)
+
+  const conducteursComptes = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const l of lignes) {
+      if (l.conducteur?.id) {
+        map.set(l.conducteur.id, (map.get(l.conducteur.id) || 0) + 1);
+      }
+    }
+    return map;
+  }, [lignes]);
+
+  async function validerArbitrage() {
+    if (!arbitrageLigne) return;
+    setEnvoiArbitrage(true);
+    try {
+      await api("/api/suivi/arbitrer-conducteur", {
+        method: "POST",
+        body: JSON.stringify({
+          suivi_id: arbitrageLigne.id,
+          choix: choixArbitrage,
+          conducteur_id: arbitrageLigne.conducteur?.id,
+        })
+      });
+      setArbitrageLigne(null);
+      if (onRefresh) onRefresh();
+    } catch (e) {
+      console.error("Erreur lors de l'arbitrage conducteur:", e);
+    } finally {
+      setEnvoiArbitrage(false);
+    }
+  }
 
   return (
     <>
@@ -151,7 +222,7 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
           <tr>
             <TH classe="sticky left-0 z-20 min-w-[104px] bg-slate-200 dark:bg-nuit-800 text-slate-500">{modeDetail ? "Plaque" : "A · CC"}</TH>
             <TH classe={modeDetail ? "sticky left-[104px] z-20 min-w-[168px] bg-slate-200 dark:bg-nuit-800" : undefined}>Description</TH>
-            <TH classe={modeDetail ? "sticky left-[272px] z-20 min-w-[140px] bg-slate-200 dark:bg-nuit-800 shadow-[6px_0_10px_-6px_rgba(15,23,42,0.25)]" : undefined}>Chauffeur</TH>
+            <TH classe={modeDetail ? "sticky left-[272px] z-20 min-w-[170px] bg-slate-200 dark:bg-nuit-800 shadow-[6px_0_10px_-6px_rgba(15,23,42,0.25)]" : undefined}>Chauffeur</TH>
             <TH>Téléphone</TH>
             <TH classe="text-blue-500">B · Situation</TH><TH classe="text-blue-500">Statut</TH>
             <TH classe="text-blue-500">Dépôt</TH><TH classe="text-blue-500">Distrib.</TH>
@@ -178,7 +249,10 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
           </tr>
         </thead>
         <tbody>
-          {lignes.map((l) => (
+          {lignes.map((l) => {
+            const estDoublonChauffeur = l.conducteur?.id ? (conducteursComptes.get(l.conducteur.id) || 0) > 1 : false;
+            const relais = extraireConducteursRelais(l);
+            return (
             <tr key={l.id} className={cls(l.flag_tcc || l.flag_tcj || l.flag_ttj ? "bg-red-500/[0.04]" : "")}>
               <td className={cls("sticky left-0 z-10 font-bold whitespace-nowrap bg-white dark:bg-nuit-900")}>{l.plaque}</td>
               <td className={cls("whitespace-nowrap text-slate-400 text-[12px]",
@@ -196,8 +270,99 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
               <td className={cls("whitespace-nowrap",
                 modeDetail && "sticky left-[272px] z-10 bg-white dark:bg-nuit-900 shadow-[6px_0_10px_-6px_rgba(15,23,42,0.25)]")}>
                 {l.conducteur ? (
-                  <span title={l.conducteur.nom_prenom} className="font-medium">{l.conducteur.prenom_usuel}</span>
-                ) : <span className="text-slate-400">—</span>}
+                  <div className="flex flex-col py-0.5">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span title={l.conducteur.nom_prenom} className="font-bold text-slate-900 dark:text-slate-100">
+                        {l.conducteur.prenom_usuel || l.conducteur.nom_prenom}
+                      </span>
+                      {l.conducteur.code_badge_mzonex ? (
+                        <span className="px-1 py-0.2 rounded text-[10px] font-mono font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20" title="driverKeyCode MZoneX">
+                          {l.conducteur.code_badge_mzonex}
+                        </span>
+                      ) : null}
+                      {l.conducteur_origine === "MANUEL" && (
+                        <span className="px-1 py-0.2 rounded text-[9.5px] font-medium bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20" title="Attribution manuelle (prioritaire)">
+                          Manuel
+                        </span>
+                      )}
+                      {l.conducteur_origine === "RELAIS" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setArbitrageLigne(l);
+                            setChoixArbitrage("PASSAGE_TEMPORAIRE");
+                          }}
+                          className="px-1.5 py-0.2 rounded text-[9.5px] font-semibold bg-sky-500/15 text-sky-600 dark:text-sky-400 border border-sky-500/30 hover:bg-sky-500/25 flex items-center gap-1 cursor-pointer"
+                          title="Passage temporaire / Relais validé — cliquer pour modifier l'arbitrage"
+                        >
+                          🔄 Relais
+                        </button>
+                      )}
+                      {relais.length > 0 && l.conducteur_origine !== "RELAIS" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setArbitrageLigne(l);
+                            setChoixArbitrage("PASSAGE_TEMPORAIRE");
+                          }}
+                          className="px-1.5 py-0.2 rounded text-[9.5px] font-semibold bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30 hover:bg-amber-500/25 flex items-center gap-1 cursor-pointer animate-pulse"
+                          title="Nouveau conducteur détecté — cliquer pour arbitrer l'attribution"
+                        >
+                          ⚡ Arbitrer
+                        </button>
+                      )}
+                      {estDoublonChauffeur && relais.length === 0 && (
+                        <span className="px-1 py-0.2 rounded text-[9.5px] font-bold bg-red-500/15 text-red-600 border border-red-500/30 animate-pulse" title="Doublon : ce chauffeur est affecté à plus d'un camion sur cette journée !">
+                          ⚠️ Doublon
+                        </span>
+                      )}
+                    </div>
+                    <span className="text-[10.5px] text-slate-400 truncate max-w-[170px]" title={l.conducteur.nom_prenom}>
+                      {l.conducteur.nom_prenom}
+                    </span>
+                    {relais.length > 0 && (
+                      <div className="flex flex-col gap-0.5 mt-0.5">
+                        {relais.map((r) => (
+                          <span
+                            key={r.nom}
+                            className="text-[11px] font-normal text-slate-600 dark:text-slate-300"
+                            title={`Autre conducteur ayant conduit sur ce camion : ${r.nom}${r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}`}
+                          >
+                            {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  relais.length > 0 ? (
+                    <div className="flex flex-col py-0.5">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="font-bold text-slate-900 dark:text-slate-100">
+                          {relais[0].nom}
+                        </span>
+                        {relais[0].duree_s > 0 && (
+                          <span className="text-[10px] text-slate-400">
+                            ({fmtDureeRelais(relais[0].duree_s)})
+                          </span>
+                        )}
+                      </div>
+                      {relais.length > 1 && (
+                        <div className="flex flex-col gap-0.5 mt-0.5">
+                          {relais.slice(1).map((r) => (
+                            <span
+                              key={r.nom}
+                              className="text-[11px] font-normal text-slate-600 dark:text-slate-300"
+                              title={`Autre chauffeur ayant conduit : ${r.nom}`}
+                            >
+                              {r.nom}{r.duree_s > 0 ? ` (${fmtDureeRelais(r.duree_s)})` : ""}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : <span className="text-slate-400">—</span>
+                )}
               </td>
               <td className="whitespace-nowrap text-slate-400 text-[12px]">{l.conducteur?.telephone || "—"}</td>
 
@@ -299,7 +464,8 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                 {pendingUI?.[l.id] && <span title="Modification en attente d'enregistrement" className="inline-block h-2 w-2 rounded-full bg-amber-500" />}
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
 
@@ -313,6 +479,139 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
           une heure ne passe en noir que lorsque le trajet est terminé ET suivi d'une pause ≥ 20 min.
         </p>
       )}
+
+      {/* Modal d'arbitrage changement / relais conducteur */}
+      <Modal
+        ouvert={!!arbitrageLigne}
+        onFermer={() => setArbitrageLigne(null)}
+        titre={`Arbitrage Conducteur — ${arbitrageLigne?.plaque || ""}`}
+      >
+        {arbitrageLigne && (
+          <div className="space-y-4 text-sm">
+            <div className="p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+              <div className="font-semibold text-slate-800 dark:text-slate-100 flex items-center justify-between">
+                <span>Véhicule : <b className="font-mono">{arbitrageLigne.plaque}</b></span>
+                <span className="text-xs text-slate-500">Journée du {arbitrageLigne.date_jour}</span>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
+                <div>
+                  <span className="text-slate-400">Titulaire affecté :</span>
+                  <p className="font-bold text-slate-700 dark:text-slate-200">
+                    {arbitrageLigne.conducteur?.nom_prenom || "Non défini"}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-slate-400">Conducteur(s) relais détecté(s) :</span>
+                  <p className="font-bold text-sky-600 dark:text-sky-400">
+                    {extraireConducteursRelais(arbitrageLigne).map(r => r.nom).join(", ") || "Autre badge portail"}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Choisir le mode d'attribution pour cette journée :
+              </label>
+
+              {/* Option A */}
+              <label className={cls(
+                "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors",
+                choixArbitrage === "PASSAGE_TEMPORAIRE"
+                  ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/40 text-blue-900 dark:text-blue-100"
+                  : "border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              )}>
+                <input
+                  type="radio"
+                  name="arbitrage_choix"
+                  value="PASSAGE_TEMPORAIRE"
+                  checked={choixArbitrage === "PASSAGE_TEMPORAIRE"}
+                  onChange={() => setChoixArbitrage("PASSAGE_TEMPORAIRE")}
+                  className="mt-1"
+                />
+                <div>
+                  <div className="font-bold text-xs flex items-center gap-1.5">
+                    <span>Option A : Passage temporaire / Relais (Recommandé)</span>
+                    <span className="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/15 text-emerald-600 font-semibold">Conseillé</span>
+                  </div>
+                  <p className="text-[11.5px] text-slate-600 dark:text-slate-300 mt-0.5">
+                    Le camion reste attribué au titulaire (<b>{arbitrageLigne.conducteur?.prenom_usuel || arbitrageLigne.conducteur?.nom_prenom}</b>).
+                    Le temps de conduite de chaque trajet est ventilé proportionnellement au TCH du conducteur qui était réellement au volant.
+                  </p>
+                </div>
+              </label>
+
+              {/* Option B */}
+              <label className={cls(
+                "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors",
+                choixArbitrage === "REMPLACEMENT_JOURNEE"
+                  ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/40 text-blue-900 dark:text-blue-100"
+                  : "border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              )}>
+                <input
+                  type="radio"
+                  name="arbitrage_choix"
+                  value="REMPLACEMENT_JOURNEE"
+                  checked={choixArbitrage === "REMPLACEMENT_JOURNEE"}
+                  onChange={() => setChoixArbitrage("REMPLACEMENT_JOURNEE")}
+                  className="mt-1"
+                />
+                <div>
+                  <div className="font-bold text-xs">
+                    Option B : Remplacement pour toute la journée
+                  </div>
+                  <p className="text-[11.5px] text-slate-600 dark:text-slate-300 mt-0.5">
+                    La ligne du jour est entièrement réattribuée au nouveau conducteur. Tous les trajets et l'intégralité du TCJ lui sont rattachés.
+                  </p>
+                </div>
+              </label>
+
+              {/* Option C */}
+              <label className={cls(
+                "flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors",
+                choixArbitrage === "MAINTENIR_TITULAIRE"
+                  ? "border-blue-500 bg-blue-50/60 dark:bg-blue-950/40 text-blue-900 dark:text-blue-100"
+                  : "border-slate-200 dark:border-slate-700 hover:bg-slate-50 dark:hover:bg-slate-800"
+              )}>
+                <input
+                  type="radio"
+                  name="arbitrage_choix"
+                  value="MAINTENIR_TITULAIRE"
+                  checked={choixArbitrage === "MAINTENIR_TITULAIRE"}
+                  onChange={() => setChoixArbitrage("MAINTENIR_TITULAIRE")}
+                  className="mt-1"
+                />
+                <div>
+                  <div className="font-bold text-xs">
+                    Option C : Maintenir 100% au titulaire (Ignorer le badge portail)
+                  </div>
+                  <p className="text-[11.5px] text-slate-600 dark:text-slate-300 mt-0.5">
+                    100% du temps de conduite de la journée reste rattaché au titulaire (ex: clé garage ou carte de service passée par erreur).
+                  </p>
+                </div>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-200 dark:border-slate-700">
+              <button
+                type="button"
+                onClick={() => setArbitrageLigne(null)}
+                className="px-3 py-1.5 text-xs font-semibold rounded-md border border-slate-300 dark:border-slate-600 hover:bg-slate-100 dark:hover:bg-slate-700"
+              >
+                Annuler
+              </button>
+              <button
+                type="button"
+                disabled={envoiArbitrage}
+                onClick={validerArbitrage}
+                className="px-4 py-1.5 text-xs font-semibold rounded-md bg-blue-600 hover:bg-blue-700 text-white shadow-xs"
+              >
+                {envoiArbitrage ? "Enregistrement…" : "Confirmer l'arbitrage"}
+              </button>
+            </div>
+          </div>
+        )}
+      </Modal>
 
       {/* Trajets supplémentaires (> 9) : consultables, jamais perdus */}
       <Modal ouvert={!!extra} onFermer={() => setExtra(null)}

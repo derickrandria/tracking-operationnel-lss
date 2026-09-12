@@ -117,6 +117,17 @@ check("Toutes variantes reconnues (MAJ/min, doubles espaces, Unicode NFD "
 check("Aucune alerte supplémentaire pour les variantes (1 seule alerte au "
       "total pour ce chauffeur)",
       _compter_alertes_nouveau_chauffeur() - n_alertes_avant == 1)
+
+# Régression : même chauffeur soumis deux fois dans le même batch ne doit pas
+# provoquer d'alias dupliqué avant flush/commit.
+nom_dup = "RABEMIARAMONA Solofo Jean Michel"
+f_dup_1 = creer_conducteur_auto(db, nom_dup)
+f_dup_2 = creer_conducteur_auto(db, nom_dup)
+db.commit()
+check("Même nom dans le même batch → même conducteur, pas d'alias dupliqué",
+      f_dup_1 is not None and f_dup_2 is not None and f_dup_1.id == f_dup_2.id,
+      f"ids={f_dup_1 and f_dup_1.id} / {f_dup_2 and f_dup_2.id}")
+
 f2 = creer_conducteur_auto(db, "RAKOTO Nirina Test")
 db.commit()
 check("Deux personnes DIFFÉRENTES → deux fiches distinctes",

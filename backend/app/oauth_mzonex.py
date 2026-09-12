@@ -41,7 +41,7 @@ URI_REDIRECTION = os.getenv("MZONEX_API_REDIRECT_URI",
                             "https://live.mzoneweb.net/mzonex/")
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-_TIMEOUT = 30
+_TIMEOUT = int(os.getenv("MZONEX_AUTH_TIMEOUT_S", "10"))
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "data")
@@ -232,9 +232,10 @@ class GestionnaireJetonsMZoneX:
             if stock and stock.get("refresh_token"):
                 try:
                     brut = self._fournir_refresh(stock["refresh_token"])
-                except ErreurAuthMZoneX:
-                    log.info("MZoneX API : actualisation refusée — "
-                             "reconnexion complète")
+                except Exception as exc:
+                    log.info("MZoneX API : actualisation refusée (%s) — "
+                             "invalidation du jeton et reconnexion complète", exc)
+                    self.invalider()
                 else:
                     stock = {"access_token": brut["access_token"],
                              # rotation IS4 : conserver le NOUVEAU refresh s'il
@@ -246,7 +247,11 @@ class GestionnaireJetonsMZoneX:
                     self._sauver(stock)
                     log.info("MZoneX API : jeton actualisé (valide ~1 h)")
                     return stock["access_token"]
-            brut = self._fournir_login()
+            try:
+                brut = self._fournir_login()
+            except Exception:
+                self.invalider()
+                raise
             stock = {"access_token": brut["access_token"],
                      "refresh_token": brut.get("refresh_token"),
                      "expire": time.time() + int(brut.get("expires_in", 3600))}

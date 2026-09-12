@@ -12,6 +12,7 @@ import { addToast, Toasts } from "./toast";
 const MODULES = [
   { path: "/dashboard", label: "Dashboard", icone: "dashboard" },
   { path: "/suivi", label: "Suivi Journalier", icone: "suivi" },
+  { path: "/temps-conduite", label: "Temps de conduite", icone: "horloge" },
   { path: "/missions", label: "Missions", icone: "missions" },
   { path: "/infractions", label: "Infractions", icone: "infractions" },
   { path: "/conduite", label: "Conduite", icone: "conducteurs" },

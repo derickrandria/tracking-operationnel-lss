@@ -15,6 +15,14 @@ const ICONES: Record<string, string> = {
   NOUVEAU_VEHICULE: "vehicules", NOUVEAU_CONDUCTEUR: "conducteurs",
   HORS_ITINERAIRE: "missions", CARBURANT_SUSPECT: "carburant",
   REPARATION_DONNEES: "historique",
+  TCH_PROCHE_LIMITE: "horloge", TCH_LIMITE_ATTEINTE: "horloge",
+  CONFLIT_AFFECTATION: "conducteurs", DOUBLON_CONDUCTEUR: "conducteurs",
+  CHANGEMENT_CONDUCTEUR_DETECTE: "conducteurs",
+  MISSION_SANS_OT: "missions",
+  VALIDATION_CHARGEMENT: "missions",
+  VALIDATION_DECHARGEMENT: "missions",
+  DEVIATION_DETECTEE: "localisation",
+  COLLECTE_RETARD: "horloge",
 };
 
 export default function Alertes() {
@@ -36,9 +44,14 @@ export default function Alertes() {
   }
 
   async function charger() {
-    const d = await api(`/api/alertes?${query()}`);
-    setData(d);
-    setTypes(d.types || {});
+    try {
+      const d = await api(`/api/alertes?${query()}`);
+      setData(d || { items: [] });
+      setTypes(d?.types || {});
+    } catch (e) {
+      console.error("Erreur chargement alertes:", e);
+      setData({ items: [] });
+    }
   }
 
   useEffect(() => { charger(); }, [gravite, statut, type]);

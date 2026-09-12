@@ -45,17 +45,54 @@ log = logging.getLogger("lss.api_wialon")
 
 API_URL = os.getenv("WIALON_API_URL",
                     "https://hst-api.wialon.com/wialon/ajax.html")
-_TIMEOUT = 60
+_TIMEOUT = int(os.getenv("CAMTRACKPRO_API_TIMEOUT_S", "10"))
+# Correctif PROPOSÉ v1.46 — opt-in STRICT (l'arbitrage O4 du 01/09/2026 « laisser
+# tel quel » reste le comportement PAR DÉFAUT) : WIALON_SESSION_PARTAGEE=1 fait
+# réutiliser UNE session Wialon unique par le processus (plus d'invalidation de
+# session à chaque cycle — cause mesurée de la dégradation CamtrackPro du
+# 04/09/2026 : 2-15 pts/h au lieu de 150-220). Le portail web reste utilisable.
+SESSION_PARTAGEE = os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1"
+_sid_partage: dict = {"sid": None}
 NOM_RAPPORT = os.getenv("CAMTRACKPRO_API_RAPPORT_NOM", "Detail Trajet Vehicule")
 RESSOURCE_ID = os.getenv("CAMTRACKPRO_API_RESSOURCE_ID", "").strip()
 GABARIT_ID = os.getenv("CAMTRACKPRO_API_GABARIT_ID", "").strip()
-# colonnes du tableau « Detail Trajet » (validées en direct le 20/08/2026) :
+# colonnes du tableau « Detail Trajet » (détection dynamique avec repli par défaut) :
 # 0 Début · 1 Emplacement initial · 2 Fin · 3 Emplacement final ·
 # 4 Heures moteur · 5 Ralenti moteur · 6 En mouvement · 7 Distance parcourue ·
 # 8 Vitesse moyenne · 9 Vitesse max · 10 Durée depuis trajet · 11 Conducteur
 COL_DEBUT, COL_FIN, COL_DISTANCE, COL_CONDUCTEUR = 0, 2, 7, 11
-# §0septies B3 (20/08/2026) — carnet de conduite : ralenti moteur + vitesse max
 COL_RALENTI, COL_VMAX = 5, 9
+
+
+def detecter_colonnes_wialon(headers: list[str] | None = None) -> dict[str, int]:
+    """Détecte les index des colonnes à partir des libellés du gabarit Wialon.
+    Supporte les gabarits 9 colonnes (standard), 10, 11 ou 12 colonnes avec repli robuste."""
+    mapping = {
+        "debut": COL_DEBUT,
+        "fin": COL_FIN,
+        "distance": COL_DISTANCE,
+        "ralenti": COL_RALENTI,
+        "v_max": COL_VMAX,
+        "conducteur": COL_CONDUCTEUR,
+    }
+    if not headers:
+        return mapping
+
+    for i, h in enumerate(headers):
+        hl = (str(h) or "").strip().lower()
+        if "debut" in hl or "début" in hl or "start" in hl:
+            mapping["debut"] = i
+        elif "fin" in hl or "end" in hl:
+            mapping["fin"] = i
+        elif "distance" in hl or "km" in hl or "parcour" in hl:
+            mapping["distance"] = i
+        elif "ralenti" in hl or "idle" in hl:
+            mapping["ralenti"] = i
+        elif "max" in hl and ("vitesse" in hl or "speed" in hl or "v_max" in hl):
+            mapping["v_max"] = i
+        elif "conducteur" in hl or "driver" in hl or "chauffeur" in hl:
+            mapping["conducteur"] = i
+    return mapping
 
 
 class ErreurApiWialon(RuntimeError):
@@ -160,25 +197,60 @@ def _parse_duree(texte: str) -> int | None:
     return None
 
 
-def item_depuis_ligne_rapport(nom_unite: str, cellules: list) -> dict | None:
+def item_depuis_ligne_rapport(nom_unite: str, cellules: list, col_map: dict[str, int] | None = None) -> dict | None:
     """Ligne « Detail Trajet » Wialon → item du contrat réconciliation.
 
+    Supporte dynamiquement les gabarits Wialon à 9, 10, 11 ou 12 colonnes.
     §0septies B3 : la vitesse max et le ralenti moteur de la ligne officielle
-    accompagnent le conducteur (compteurs d'infractions détaillés : gabarits
-    5/17, extension ultérieure possible — §0septies B3 in fine)."""
+    accompagnent le conducteur lorsqu'ils sont disponibles."""
     plaque = plaque_unite(nom_unite)
-    if plaque is None or len(cellules) <= COL_CONDUCTEUR:
+    if plaque is None or not cellules or len(cellules) < 3:
         return None
-    debut = _parse_instant(cellules[COL_DEBUT])
+
+    col = col_map or {
+        "debut": COL_DEBUT,
+        "fin": COL_FIN,
+        "distance": COL_DISTANCE,
+        "ralenti": COL_RALENTI,
+        "v_max": COL_VMAX,
+        "conducteur": COL_CONDUCTEUR,
+    }
+    idx_deb = col.get("debut", COL_DEBUT)
+    idx_fin = col.get("fin", COL_FIN)
+    idx_dist = col.get("distance", COL_DISTANCE)
+    idx_ral = col.get("ralenti", COL_RALENTI)
+    idx_vmax = col.get("v_max", COL_VMAX)
+    idx_cond = col.get("conducteur", COL_CONDUCTEUR)
+
+    if idx_deb >= len(cellules):
+        return None
+    debut = _parse_instant(cellules[idx_deb])
     if debut is None:
         return None
-    return {"plaque": plaque, "debut": debut,
-            "fin": _parse_instant(cellules[COL_FIN]),
-            "distance_km": _parse_distance(_texte(cellules[COL_DISTANCE])),
-            "conducteur": (_texte(cellules[COL_CONDUCTEUR]).strip() or None),
-            "v_max": _parse_distance(_texte(cellules[COL_VMAX])),
-            "ralenti_s": _parse_duree(_texte(cellules[COL_RALENTI])),
-            "source": "CAMTRACKPRO"}
+
+    fin = _parse_instant(cellules[idx_fin]) if idx_fin < len(cellules) else None
+    dist_txt = _texte(cellules[idx_dist]) if idx_dist < len(cellules) else ""
+    distance_km = _parse_distance(dist_txt)
+
+    cond_txt = _texte(cellules[idx_cond]).strip() if idx_cond < len(cellules) else ""
+    conducteur = cond_txt or None
+
+    vmax_txt = _texte(cellules[idx_vmax]) if idx_vmax < len(cellules) else ""
+    v_max = _parse_distance(vmax_txt)
+
+    ral_txt = _texte(cellules[idx_ral]) if idx_ral < len(cellules) else ""
+    ralenti_s = _parse_duree(ral_txt)
+
+    return {
+        "plaque": plaque,
+        "debut": debut,
+        "fin": fin,
+        "distance_km": distance_km,
+        "conducteur": conducteur,
+        "v_max": v_max,
+        "ralenti_s": ralenti_s,
+        "source": "CAMTRACKPRO",
+    }
 
 
 class ApiWialon:
@@ -189,6 +261,8 @@ class ApiWialon:
         if not self._jeton:
             raise ErreurApiWialon("CAMTRACKPRO_TOKEN absent de backend/.env")
         self._sid: str | None = None
+        if SESSION_PARTAGEE:
+            self._sid = _sid_partage.get("sid")
         self._ids_rapport: tuple[int, int] | None = None
         self._verrou = threading.Lock()
 
@@ -204,10 +278,17 @@ class ApiWialon:
             raise ErreurApiWialon(f"svc={svc} injoignable : "
                                   f"{type(e).__name__}") from e
         if isinstance(data, dict) and data.get("error"):
-            if int(data["error"]) == 1 and reessai:      # session expirée
+            code_err = int(data["error"])
+            if code_err == 1 and reessai:      # session expirée
                 self._sid = None
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = None
                 self.connecter()
                 return self._appel(svc, params, reessai=False)
+            if code_err in (1, 4, 7, 8):
+                self._sid = None
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = None
             raise ErreurApiWialon(f"svc={svc} → erreur Wialon "
                                   f"{data.get('error')} : "
                                   f"{str(data.get('reason'))[:120]}")
@@ -215,14 +296,25 @@ class ApiWialon:
 
     def connecter(self) -> str:
         with self._verrou:
-            r = self._appel("token/login", {"token": self._jeton},
-                            reessai=False)
-            if "eid" not in r:
-                raise ErreurApiWialon(f"jeton refusé : {r}")
-            self._sid = r["eid"]
-            log.info("CamtrackPro API : session Wialon ouverte (%s)",
-                     r.get("user", {}).get("nm"))
-            return self._sid
+            try:
+                r = self._appel("token/login", {"token": self._jeton},
+                                reessai=False)
+                if not isinstance(r, dict) or "eid" not in r:
+                    self._sid = None
+                    if SESSION_PARTAGEE:
+                        _sid_partage["sid"] = None
+                    raise ErreurApiWialon(f"jeton refusé : {r}")
+                self._sid = r["eid"]
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = self._sid
+                log.info("CamtrackPro API : session Wialon ouverte (%s)",
+                         r.get("user", {}).get("nm"))
+                return self._sid
+            except Exception:
+                self._sid = None
+                if SESSION_PARTAGEE:
+                    _sid_partage["sid"] = None
+                raise
 
     def _exiger_session(self) -> None:
         if not self._sid:
@@ -230,6 +322,12 @@ class ApiWialon:
 
     def fermer(self) -> None:
         if self._sid:
+            if SESSION_PARTAGEE:
+                # session partagée : on NE se déconnecte PAS (les autres
+                # utilisateurs du processus continuent de s'en servir) ;
+                # le re-login transparent couvre l'expiration naturelle.
+                self._sid = None
+                return
             try:
                 self._appel("core/logout", {}, reessai=False)
             except ErreurApiWialon:
@@ -310,6 +408,8 @@ class ApiWialon:
                 tables = (r.get("reportResult") or {}).get("tables", [])
                 if not tables:
                     continue
+                headers = tables[0].get("header") or []
+                col_map = detecter_colonnes_wialon(headers)
                 n_lig = int(tables[0].get("rows") or 0)
                 if n_lig <= 0:
                     continue
@@ -318,7 +418,7 @@ class ApiWialon:
                 if not isinstance(lignes, list):
                     continue
                 bruts = [it for it in (
-                    item_depuis_ligne_rapport(nom, lig.get("c") or [])
+                    item_depuis_ligne_rapport(nom, lig.get("c") or [], col_map=col_map)
                     for lig in lignes) if it]
                 items.extend(bruts)
                 if bruts:

@@ -1,5 +1,10 @@
 # Plateforme de Tracking Opérationnel LSS
 
+> ⚠️ AVERTISSEMENT DOCUMENTAIRE
+> Ce fichier décrit la vision produit, l’architecture et le comportement fonctionnel général de la plateforme.
+> La source de vérité unique pour le moteur de calcul, les seuils actifs, les règles d’affichage et la logique métier opérationnelle est [SPEC_RULES_v3.md](SPEC_RULES_v3.md).
+> Les documents historiques comme [REFERENCE_IA_REGLES.md](REFERENCE_IA_REGLES.md) et [AMELIORATIONS_REGLES.md](AMELIORATIONS_REGLES.md) sont conservés à titre d’archive et ne remplacent pas la spécification canonique.
+
 Plateforme web professionnelle de gestion de flotte pour le transport de produits
 pétroliers (cahier des charges v1.0 — 8 modules interconnectés et synchronisés
 en temps réel).
@@ -97,9 +102,11 @@ les infractions (Dépassement TCC, excès de vitesse, freinages) et les alertes
    de rupture) ; écran chauffeur → missions du jour ; cas multi-missions
    Moramanga détectés sans intervention (MISSION 1 / MISSION 2 distinctes,
    étapes horodatées, km cumulés depuis le flux GPS).
-4. **Infractions** — 100 % automatiques : excès de vitesse, accélération/
-   freinage brusque (OBC), dépassements TCC/TCJ/TTJ (CALCUL_INTERNE), avec
-   anti-doublon, gravité, valeur/seuil, lien mission, export Excel/PDF.
+4. **Infractions** — lecture seule depuis une source externe (ex. plateforme dédiée) ;
+   aucune génération locale d’infraction dans l’onglet Infraction. Les alertes internes
+   (TCC/TCJ/TTJ, dépassements, événements locaux) remontent vers la surface d’alerte
+   dédiée, sans écriture dans l’onglet Infraction. Les lignes importées restent visibles
+   en lecture seule, avec filtrage externe et validation métier si nécessaire.
 5. **Alertes** — flux WebSocket temps réel, badge non lues, classification
    CRITIQUE/MOYENNE/INFORMATION, filtres, marquage vue/traitée, deep-links
    vers les modules, export.
@@ -118,9 +125,10 @@ les infractions (Dépassement TCC, excès de vitesse, freinages) et les alertes
   `TCC` (reset si pause ≥ seuil), `TCJ = fin − départ − Σ pauses`,
   `TTJ = TCJ + Σ pauses` ; aucune valeur en dur — tout vient de
   `ParametrageSeuil` (éditable dans **Paramètres**, appliqué à chaud).
-- **Cycle de minuit (§8)** : archivage intégral dans `HistoriqueJournalier`,
-  création des lignes du jour, report A+B à l'identique (aucune ressaisie),
-  reset de C et D, `emplacement J-1` = arrêt final de la veille.
+- **Cycle de minuit (§8)** : consolidation à `23:59:59`, puis split à minuit sans insertion
+  d’une pause artificielle ; les trajets en cours sont séparés en deux segments (jour J et
+  jour J+1) ; l’archive conserve les données réelles et les calculs continuent sans effacer
+  les valeurs de base. Le moteur applique la règle canonique de [SPEC_RULES_v3.md](SPEC_RULES_v3.md).
 - **Synchronisation (§9)** : toute écriture publie un événement (`suivi.update`,
   `mission.*`, `infraction.new`, `alerte.new`, `referentiels.changed`,
   `jour.change`) — tous les écrans concernés se rafraîchissent sans rechargement.

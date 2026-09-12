@@ -130,7 +130,7 @@ def _charger_camtrackpro() -> list[tuple]:
                   "force": 1, "flags": tous, "from": 0, "to": 50}
         url = (f"{API_URL}?svc=core/search_items&params="
                f"{urllib.parse.quote(json.dumps(params))}&sid={api._sid}")
-        with urllib.request.urlopen(url, timeout=60) as r:
+        with urllib.request.urlopen(url, timeout=15) as r:
             data = json.load(r)
         for it in (data.get("items") or []):
             for z in (it.get("zl") or {}).values():
@@ -266,3 +266,227 @@ def libelle_position(lat: float, lng: float) -> str | None:
     if proche_g is not None:
         return f"proche {proche_g[1]}"
     return None
+
+
+# =============================================================================
+# RECONNAISSANCE DES GEOFENCES LOGISTIQUES OFFICIELLES
+# Chargement : GRT (GALANA RAFINERIE TERMINALE) unique.
+# Déchargement : 7 dépôts officiels stricts (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE).
+# Tout autre lieu non listé n'est pas un dépôt officiel et ne génère AUCUNE alerte.
+# =============================================================================
+DEPOT_OFFICIEL_CHARGEMENT = {
+    "code": "GRT",
+    "nom": "GRT (GALANA RAFINERIE TERMINALE)",
+}
+
+DEPOTS_OFFICIELS_DECHARGEMENT = {
+    "DABI": "Depot Alarobia (DABI)",
+    "DABE": "Depot Antsirabe (DABE)",
+    "DMDV": "Depot Morondava (DMDV)",
+    "DMKR": "Depot Manakara (DMKR)",
+    "DFIA": "Depot Fianarantsoa (DFIA)",
+    "DSNR": "Depot Soanierana (DSNR)",
+    "DMMG": "Depot Moramanga (DMMG)et parking (devant depot + steel 1947)",
+}
+
+DEPOTS_DECHARGEMENT_CODES = {"DSNR", "DABI", "DMMG", "DFIA", "DMDV", "DMKR", "DABE"}
+DEPOTS_SUD_CODES = {"DABE", "DFIA", "DMDV", "DMKR"}
+
+CHECKPOINTS_RN2 = {
+    "MORAMANGA": {"mots": ["moramanga", "dmmg", "steel 1947"], "lat": -18.9489, "lng": 48.2257},
+    "ANDASIBE": {"mots": ["andasibe", "perinet"], "lat": -18.9261, "lng": 48.4178},
+    "AMBATOSONEGALY": {"mots": ["ambatosonegaly", "ambatosoratra"], "lat": -18.8833, "lng": 48.6500},
+    "ANDRIAKA": {"mots": ["andriaka", "andakana", "anjiro"], "lat": -18.9167, "lng": 48.0500},
+    "TANA": {"mots": ["tana", "antananarivo", "basetnr", "dsnr", "dabi", "iavoloha", "by pass"], "lat": -18.9537, "lng": 47.5449},
+}
+
+ZONES_CANONIQUES = {
+    "BASETNR": {
+        "type": "BASETNR",
+        "code": "BASETNR",
+        "nom": "Base Tana (BASETNR)",
+        "mots_cles": ["jovenna by pass", "by pass", "alamabrah", "alasora",
+                      "ambohimangakely-iavoloha-cc", "iavoloha", "ambohimangakely",
+                      "base lss", "base tana", "base antananarivo"],
+        "coords": [(-18.9537, 47.5449, 2500)],
+        "est_depot_sud": False,
+    },
+    "GRT": {
+        "type": "GRT",
+        "code": "GRT",
+        "nom": "GRT (GALANA RAFINERIE TERMINALE)",
+        "mots_cles": ["galana rafinerie terminale", "galana rafinérie terminale",
+                      "galana terminal", "grt", "galana rafinerie", "galana toamasina"],
+        "coords": [(-18.1492, 49.4023, 3500)],
+        "est_depot_sud": False,
+    },
+    "DSNR": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DSNR",
+        "nom": "Depot Soanierana (DSNR)",
+        "mots_cles": ["depot soanierana", "dépôt soanierana", "soanierana", "dsnr"],
+        "coords": [(-18.9300, 47.5200, 3000)],
+        "est_depot_sud": False,
+    },
+    "DABI": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DABI",
+        "nom": "Depot Alarobia (DABI)",
+        "mots_cles": ["depot alarobia", "dépôt alarobia", "alarobia", "dabi", "ambohibao"],
+        "coords": [(-18.8100, 47.4450, 3000)],
+        "est_depot_sud": False,
+    },
+    "DMMG": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DMMG",
+        "nom": "Depot Moramanga (DMMG)et parking (devant depot + steel 1947)",
+        "mots_cles": ["depot moramanga", "dépôt moramanga", "moramanga", "dmmg", "steel 1947"],
+        "coords": [(-18.9489, 48.2257, 1500)],
+        "est_depot_sud": False,
+    },
+    "DFIA": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DFIA",
+        "nom": "Depot Fianarantsoa (DFIA)",
+        "mots_cles": ["depot fianarantsoa", "dépôt fianarantsoa", "fianarantsoa", "dfia"],
+        "coords": [(-21.4536, 47.0857, 4000)],
+        "est_depot_sud": True,
+    },
+    "DMDV": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DMDV",
+        "nom": "Depot Morondava (DMDV)",
+        "mots_cles": ["depot morondava", "dépôt morondava", "morondava", "dmdv"],
+        "coords": [(-20.2833, 44.2833, 5000)],
+        "est_depot_sud": True,
+    },
+    "DMKR": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DMKR",
+        "nom": "Depot Manakara (DMKR)",
+        "mots_cles": ["depot manakara", "dépôt manakara", "manakara", "dmkr"],
+        "coords": [(-22.1486, 48.0106, 4000)],
+        "est_depot_sud": True,
+    },
+    "DABE": {
+        "type": "DEPOT_RECEPTEUR",
+        "code": "DABE",
+        "nom": "Depot Antsirabe (DABE)",
+        "mots_cles": ["depot antsirabe", "dépôt antsirabe", "antsirabe", "dabe"],
+        "coords": [(-19.8659, 47.0333, 4000)],
+        "est_depot_sud": True,
+    },
+}
+
+
+def normaliser_code_depot(texte: str | None) -> str | None:
+    """Normalise un nom de dépôt (ou code) vers son code canonique officiel strict.
+    Ne reconnaît STRICTEMENT QUE :
+      - GRT (chargement)
+      - DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE (déchargement)
+    Retourne None pour tout autre lieu non officiel.
+    """
+    if not texte:
+        return None
+    t = texte.strip().lower()
+    if "soanierana" in t or "dsnr" in t:
+        return "DSNR"
+    if "alarobia" in t or "dabi" in t or "ambohibao" in t:
+        return "DABI"
+    if "moramanga" in t or "dmmg" in t or "steel 1947" in t:
+        return "DMMG"
+    if "fianarantsoa" in t or "dfia" in t:
+        return "DFIA"
+    if "morondava" in t or "dmdv" in t:
+        return "DMDV"
+    if "manakara" in t or "dmkr" in t:
+        return "DMKR"
+    if "antsirabe" in t or "dabe" in t:
+        return "DABE"
+    if "grt" in t or "galana" in t:
+        return "GRT"
+    
+    code_maj = texte.strip().upper()
+    if code_maj in DEPOTS_DECHARGEMENT_CODES or code_maj == "GRT":
+        return code_maj
+    return None
+
+
+def extraire_depot_portail(libelle_position: str | None) -> str | None:
+    """Extraction exacte du dépôt récepteur officiel depuis la chaîne du portail GPS (§6).
+    Exemples :
+      'Depot Antsirabe (DABE) - ...' -> 'DABE'
+      'Depot Fianarantsoa (DFIA)' -> 'DFIA'
+      'Depot Moramanga (DMMG)et parking (devant depot + steel 1947)' -> 'DMMG'
+      'Depot Soanierana (DSNR)' -> 'DSNR'
+      'Depot Alarobia (DABI)' -> 'DABI'
+      'Depot Morondava (DMDV)' -> 'DMDV'
+      'Depot Manakara (DMKR)' -> 'DMKR'
+      'GRT (GALANA RAFINERIE TERMINALE)' -> 'GRT'
+    """
+    if not libelle_position:
+        return None
+    return normaliser_code_depot(libelle_position)
+
+
+def detecter_checkpoint_rn2(lat: float | None, lng: float | None, adresse: str | None = None) -> str | None:
+    """Détecte les checkpoints clés le long de la RN2 pour la preuve rétrospective ou l'invalidation DMMG."""
+    adr_l = (adresse or "").lower()
+    for cp, data in CHECKPOINTS_RN2.items():
+        if any(m in adr_l for m in data["mots"]):
+            return cp
+        if lat is not None and lng is not None:
+            if _haversine_m(lat, lng, data["lat"], data["lng"]) <= 12000.0:
+                return cp
+    return None
+
+
+def nom_officiel_depot(code_ou_nom: str | None) -> str | None:
+    """Retourne le libellé officiel strict (ex. 'Depot Soanierana (DSNR)')."""
+    code = normaliser_code_depot(code_ou_nom)
+    if not code:
+        return None
+    if code == "GRT":
+        return "GRT (GALANA RAFINERIE TERMINALE)"
+    return DEPOTS_OFFICIELS_DECHARGEMENT.get(code)
+
+
+def detecter_zone_logistique(lat: float | None, lng: float | None, adresse: str | None = None) -> dict:
+    """Classifie le lieu courant selon les zones logistiques officielles strictes.
+    La télématique GPS (lat/lng) constitue la vérité terrain prioritaire.
+    Seuls GRT (chargement) et les 7 dépôts officiels de déchargement sont classifiés comme dépôts.
+    Aucun lieu non officiel ne sera classé comme dépôt récepteur ni ne générera d'alerte.
+    """
+    # 1. Vérification par coordonnées GPS (vérité terrain prioritaire)
+    if lat is not None and lng is not None:
+        for code, z in ZONES_CANONIQUES.items():
+            for (clat, clng, rayon_m) in z["coords"]:
+                if _haversine_m(lat, lng, clat, clng) <= rayon_m:
+                    return {
+                        "type": z["type"],
+                        "code": z["code"],
+                        "nom": z["nom"],
+                        "est_depot_sud": z["est_depot_sud"],
+                    }
+
+    # 2. Vérification par mots-clés stricts dans le libellé d'adresse si coordonnées absentes
+    adr_l = (adresse or "").lower()
+    if (lat is None or lng is None) and adr_l:
+        for code, z in ZONES_CANONIQUES.items():
+            for mot in z["mots_cles"]:
+                if mot in adr_l:
+                    return {
+                        "type": z["type"],
+                        "code": z["code"],
+                        "nom": z["nom"],
+                        "est_depot_sud": z["est_depot_sud"],
+                    }
+
+    # 3. Vérification axe routier
+    if "rn2" in adr_l:
+        return {"type": "AXE_ROUTIER", "code": "RN2", "nom": "Axe RN2 (Est)", "est_depot_sud": False}
+    if "rn7" in adr_l:
+        return {"type": "AXE_ROUTIER", "code": "RN7", "nom": "Axe RN7 (Sud)", "est_depot_sud": True}
+
+    return {"type": "AUTRE", "code": "AUTRE", "nom": adresse or "Hors zone", "est_depot_sud": False}
+

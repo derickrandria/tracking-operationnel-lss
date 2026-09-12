@@ -28,8 +28,23 @@ Exécution (base de test isolée, SUPPRIMÉE à la fin) :
   DATABASE_URL="sqlite:////tmp/test_v127.db" python3 test_conduite_v127.py
 """
 import os
-os.environ.setdefault("SIM_ENABLE", "0")
 import sys
+
+os.environ["TESTING"] = "1"
+os.environ["SIM_ENABLE"] = "0"
+os.environ["COLLECTOR_SOURCE"] = "AUCUN"
+os.environ["MZONEX_API_ENABLE"] = "0"
+os.environ["WIALON_ENABLE"] = "0"
+os.environ["YMANE_ACTIVE"] = "0"
+
+# Configuration universelle UTF-8 pour Windows PowerShell / Linux
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, func, select

@@ -143,3 +143,46 @@ def maj_utilisateur(uid: str, data: UserPatch, db: Session = Depends(get_db),
           {"champs": list(champs.keys())})
     db.commit()
     return _u(u)
+
+
+@router.get("/diagnostic/portails")
+def diagnostic_connexions_portails(db: Session = Depends(get_db)):
+    """Vérification en direct de la connectivité et de l'état des API MZoneX et CamtrackPro."""
+    from ..api_mzonex import ApiMZoneX
+    from ..api_wialon import ApiWialon, jeton_configure
+    from ..config import now_local
+
+    diag = {
+        "maintenant": now_local().isoformat(),
+        "mzonex": {"actif": False, "erreur": None, "flotte_recensee": 0, "token_ok": False},
+        "camtrackpro": {"actif": False, "erreur": None, "unites_trouvees": 0, "token_ok": False},
+    }
+
+    # Test MZoneX API
+    try:
+        mz = ApiMZoneX()
+        flotte = mz.recenser_flotte()
+        diag["mzonex"]["actif"] = True
+        diag["mzonex"]["token_ok"] = True
+        diag["mzonex"]["flotte_recensee"] = len(flotte)
+    except Exception as e:
+        diag["mzonex"]["erreur"] = f"{type(e).__name__}: {str(e)}"
+
+    # Test CamtrackPro (Wialon API)
+    try:
+        if jeton_configure():
+            api_w = ApiWialon()
+            try:
+                sid = api_w.connecter()
+                diag["camtrackpro"]["token_ok"] = bool(sid)
+                unites = api_w.unites()
+                diag["camtrackpro"]["actif"] = True
+                diag["camtrackpro"]["unites_trouvees"] = len(unites)
+            finally:
+                api_w.fermer()
+        else:
+            diag["camtrackpro"]["erreur"] = "CAMTRACKPRO_TOKEN absent ou non configuré"
+    except Exception as e:
+        diag["camtrackpro"]["erreur"] = f"{type(e).__name__}: {str(e)}"
+
+    return diag
