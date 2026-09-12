@@ -27,7 +27,7 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm.attributes import flag_modified
 
 from .config import SIM_ENABLE, bascule_du, jour_attribution, now_local
@@ -37,7 +37,7 @@ from .event_bus import publish
 from .models import (Alerte, AuditLog, GraviteAlerte, HistoriqueJournalier,
                      Infraction, StatutAlerte, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet,
-                     TypeAlerte, Vehicule)
+                     TypeAlerte, Vehicule, uid)
 from .serializers import iso, s_suivi
 
 log = logging.getLogger("lss.daily")
@@ -180,10 +180,25 @@ def pre_consolider_veille(db, jour_veille: date, maintenant: datetime | None = N
     return consolider_jour(db, jour_veille, maintenant)
 
 
+def format_secondes_vers_hhmm(secondes: int | float | None) -> str:
+    """Convertit une durée en secondes en format HH:MM (ex: 27785 -> '07:43')."""
+    if secondes is None:
+        return "00:00"
+    try:
+        s = max(0, int(secondes))
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h:02d}:{m:02d}"
+    except (TypeError, ValueError):
+        return "00:00"
+
+
 def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None, db=None) -> dict:
     """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
     Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
-    Met à jour les métriques TCJ, TTJ, KM, arrêts et le snapshot JSON d'HistoriqueJournalier."""
+    Assure que les clés tcj_str, ttj_str, tcj_secondes, ttj_secondes, pauses_secondes sont
+    STRICTEMENT renseignées et non nulles.
+    Exécute une suppression préalable et réinsertion propre avec db.commit() explicite."""
     from .engine import get_seuils, recalculer_temps
     from .serializers import s_suivi
     
@@ -199,76 +214,123 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
         debut = datetime.combine(jour, datetime.min.time())
         fin = debut + timedelta(days=1)
         
-        # 1. Consolidation des trajets du jour s'il existe des suivis en base
-        suivis = db.scalars(select(SuiviJournalier).where(SuiviJournalier.date_jour == jour)).all()
-        n_consolides = 0
-        recalcules = 0
+        # 1. Sélection des véhicules cibles
+        q_vehs = select(Vehicule)
+        if source_filtre:
+            q_vehs = q_vehs.where(Vehicule.plateforme_gps == source_filtre.upper())
+        vehicules_cibles = db.scalars(q_vehs).all()
+        target_veh_ids = [v.id for v in vehicules_cibles]
         
+        # 2. Préparation des données par véhicule
+        suivis = db.scalars(select(SuiviJournalier).where(
+            SuiviJournalier.date_jour == jour,
+            SuiviJournalier.vehicule_id.in_(target_veh_ids)
+        )).all()
+        map_suivis = {s.vehicule_id: s for s in suivis}
+        
+        anciens_hists = db.scalars(select(HistoriqueJournalier).where(
+            HistoriqueJournalier.date_jour == jour,
+            HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
+        )).all()
+        map_anciens_hists = {h.vehicule_id: h for h in anciens_hists}
+        
+        archives_a_inserer = []
+        n_consolides = 0
         if suivis:
             n_consolides = consolider_jour(db, jour)
-            for s in suivis:
-                v = db.scalar(select(Vehicule).where(Vehicule.id == s.vehicule_id))
-                if source_filtre and v and v.plateforme_gps != source_filtre.upper():
-                    continue
+            
+        for v in vehicules_cibles:
+            s = map_suivis.get(v.id)
+            h_old = map_anciens_hists.get(v.id)
+            
+            nb_inf = db.scalar(select(func.count(Infraction.id)).where(
+                Infraction.date_jour == jour, Infraction.vehicule_id == v.id,
+                Infraction.exterieure.is_(True))) or 0
+            nb_alertes = db.scalar(select(func.count(Alerte.id)).where(
+                Alerte.vehicule_id == v.id,
+                Alerte.date_heure >= debut, Alerte.date_heure < fin)) or 0
+            
+            cond_id = v.conducteur_actuel_id
+            if s:
                 recalculer_temps(db, s, cloture)
-                h = db.scalar(select(HistoriqueJournalier).where(
-                    HistoriqueJournalier.date_jour == jour,
-                    HistoriqueJournalier.vehicule_id == s.vehicule_id))
-                    
-                nb_inf = db.scalar(select(func.count(Infraction.id)).where(
-                    Infraction.date_jour == jour, Infraction.vehicule_id == s.vehicule_id,
-                    Infraction.exterieure.is_(True))) or 0
-                nb_alertes = db.scalar(select(func.count(Alerte.id)).where(
-                    Alerte.vehicule_id == s.vehicule_id,
-                    Alerte.date_heure >= debut, Alerte.date_heure < fin)) or 0
-                    
-                donnees_suivi = s_suivi(s, seuils)
-                if h is None:
-                    h = HistoriqueJournalier(
-                        date_jour=jour, annee=jour.year, mois=jour.month,
-                        vehicule_id=s.vehicule_id, conducteur_id=s.conducteur_id,
-                        donnees=donnees_suivi, nb_infractions=nb_inf, nb_alertes=nb_alertes)
-                    db.add(h)
-                else:
-                    h.conducteur_id = s.conducteur_id
-                    h.donnees = donnees_suivi
-                    h.nb_infractions = nb_inf
-                    h.nb_alertes = nb_alertes
-                    flag_modified(h, "donnees")
-                    db.execute(
-                        update(HistoriqueJournalier)
-                        .where(HistoriqueJournalier.id == h.id)
-                        .values(donnees=donnees_suivi, conducteur_id=s.conducteur_id,
-                                nb_infractions=nb_inf, nb_alertes=nb_alertes)
-                    )
-                recalcules += 1
-        else:
-            # Re-calibrer les archives existantes pour garantir l'exacte cohérence métier TTJ = TCJ + Pause
-            archives = db.scalars(select(HistoriqueJournalier).where(
-                HistoriqueJournalier.date_jour == jour
-            )).all()
-            for h in archives:
-                v = db.scalar(select(Vehicule).where(Vehicule.id == h.vehicule_id))
-                if source_filtre and v and v.plateforme_gps != source_filtre.upper():
-                    continue
-                d = dict(h.donnees or {})
-                tcj = int(d.get("tcj_s") or 0)
-                pauses = int(d.get("total_pause_s") or 0)
-                # Formule métier v3 AM-1 : TTJ = TCJ + Pauses
-                ttj = tcj + pauses
-                d["ttj_s"] = ttj
-                d["tcc_s"] = 0  # TCC archivé masqué à 0 à la clôture (règle N1)
-                h.donnees = d
-                flag_modified(h, "donnees")
-                db.execute(
-                    update(HistoriqueJournalier)
-                    .where(HistoriqueJournalier.id == h.id)
-                    .values(donnees=d)
-                )
-                recalcules += 1
-                
+                d = s_suivi(s, seuils)
+                cond_id = s.conducteur_id or cond_id
+            elif h_old and h_old.donnees:
+                d = dict(h_old.donnees)
+                cond_id = h_old.conducteur_id or cond_id
+            else:
+                # Véhicule sans mouvement ce jour
+                cond = v.conducteur_actuel
+                d = {
+                    "plaque": v.plaque,
+                    "conducteur": {
+                        "prenom_usuel": cond.prenom_usuel if cond else "NON ASSIGNÉ",
+                        "nom_prenom": cond.nom_prenom if cond else "NON ASSIGNÉ",
+                    } if cond else None,
+                    "situation": "Repos chauffeur",
+                    "statut_camion": "LIBRE",
+                    "depot_recepteur": None,
+                    "distributeur": None,
+                    "produit": None,
+                    "numero_ot": None,
+                    "heure_depart": None,
+                    "arret_final": "Base LSS — Antananarivo",
+                    "km_parcourus": 0.0,
+                    "nb_trajets": 0,
+                    "trajets": []
+                }
+            
+            tcj_sec = int(d.get("tcj_s") or d.get("tcj_secondes") or 0)
+            pauses_sec = int(d.get("total_pause_s") or d.get("pauses_secondes") or 0)
+            ttj_sec = tcj_sec + pauses_sec
+            
+            # Normalisation stricte de toutes les clés
+            d["tcj_s"] = tcj_sec
+            d["tcj_secondes"] = tcj_sec
+            d["tcj_str"] = format_secondes_vers_hhmm(tcj_sec)
+            
+            d["total_pause_s"] = pauses_sec
+            d["pauses_secondes"] = pauses_sec
+            d["total_pause_str"] = format_secondes_vers_hhmm(pauses_sec)
+            
+            d["ttj_s"] = ttj_sec
+            d["ttj_secondes"] = ttj_sec
+            d["ttj_str"] = format_secondes_vers_hhmm(ttj_sec)
+            
+            d["tcc_s"] = 0
+            d["tcc_secondes"] = 0
+            d["tcc_str"] = "00:00"
+            
+            archives_a_inserer.append((v, d, cond_id, nb_inf, nb_alertes))
+
+        # 3. Suppression préalable ciblée
+        if target_veh_ids:
+            db.execute(delete(HistoriqueJournalier).where(
+                HistoriqueJournalier.date_jour == jour,
+                HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
+            ))
+            db.flush()
+            
+        # 4. Ré-insertion propre avec commit
+        recalcules = 0
+        for v, d_final, cond_id, nb_inf, nb_alt in archives_a_inserer:
+            h_new = HistoriqueJournalier(
+                id=uid(),
+                date_jour=jour,
+                annee=jour.year,
+                mois=jour.month,
+                vehicule_id=v.id,
+                conducteur_id=cond_id,
+                donnees=d_final,
+                nb_infractions=nb_inf,
+                nb_alertes=nb_alt,
+                archive_le=now_local()
+            )
+            db.add(h_new)
+            recalcules += 1
+            
         db.commit()
-        log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réactualisée(s)",
+        log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réinsérée(s) avec commit",
                  jour, source_filtre, recalcules)
         return {
             "date_jour": jour.isoformat(),
