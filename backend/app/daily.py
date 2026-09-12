@@ -179,8 +179,9 @@ def pre_consolider_veille(db, jour_veille: date, maintenant: datetime | None = N
     return consolider_jour(db, jour_veille, maintenant)
 
 
-def recalculer_archives_journee(jour_cible: str | date, db=None) -> dict:
+def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None, db=None) -> dict:
     """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
+    Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
     Met à jour les métriques TCJ, TTJ, KM, arrêts et le snapshot JSON d'HistoriqueJournalier."""
     from .engine import get_seuils, recalculer_temps
     from .serializers import s_suivi
@@ -205,6 +206,9 @@ def recalculer_archives_journee(jour_cible: str | date, db=None) -> dict:
         if suivis:
             n_consolides = consolider_jour(db, jour)
             for s in suivis:
+                v = db.scalar(select(Vehicule).where(Vehicule.id == s.vehicule_id))
+                if source_filtre and v and v.plateforme_gps != source_filtre.upper():
+                    continue
                 recalculer_temps(db, s, cloture)
                 h = db.scalar(select(HistoriqueJournalier).where(
                     HistoriqueJournalier.date_jour == jour,
@@ -236,6 +240,9 @@ def recalculer_archives_journee(jour_cible: str | date, db=None) -> dict:
                 HistoriqueJournalier.date_jour == jour
             )).all()
             for h in archives:
+                v = db.scalar(select(Vehicule).where(Vehicule.id == h.vehicule_id))
+                if source_filtre and v and v.plateforme_gps != source_filtre.upper():
+                    continue
                 d = dict(h.donnees or {})
                 tcj = int(d.get("tcj_s") or 0)
                 pauses = int(d.get("total_pause_s") or 0)
@@ -247,9 +254,11 @@ def recalculer_archives_journee(jour_cible: str | date, db=None) -> dict:
                 recalcules += 1
                 
         db.commit()
-        log.info("recalculer_archives_journee(%s) terminé : %d archive(s) réactualisée(s)", jour, recalcules)
+        log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réactualisée(s)",
+                 jour, source_filtre, recalcules)
         return {
             "date_jour": jour.isoformat(),
+            "source_filtre": source_filtre,
             "suivis_recalcules": len(suivis),
             "archives_mises_a_jour": recalcules,
             "trajets_consolides": n_consolides,
