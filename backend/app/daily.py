@@ -27,7 +27,8 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.orm.attributes import flag_modified
 
 from .config import SIM_ENABLE, bascule_du, jour_attribution, now_local
 from .database import SessionLocal
@@ -233,6 +234,13 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
                     h.donnees = donnees_suivi
                     h.nb_infractions = nb_inf
                     h.nb_alertes = nb_alertes
+                    flag_modified(h, "donnees")
+                    db.execute(
+                        update(HistoriqueJournalier)
+                        .where(HistoriqueJournalier.id == h.id)
+                        .values(donnees=donnees_suivi, conducteur_id=s.conducteur_id,
+                                nb_infractions=nb_inf, nb_alertes=nb_alertes)
+                    )
                 recalcules += 1
         else:
             # Re-calibrer les archives existantes pour garantir l'exacte cohérence métier TTJ = TCJ + Pause
@@ -251,6 +259,12 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
                 d["ttj_s"] = ttj
                 d["tcc_s"] = 0  # TCC archivé masqué à 0 à la clôture (règle N1)
                 h.donnees = d
+                flag_modified(h, "donnees")
+                db.execute(
+                    update(HistoriqueJournalier)
+                    .where(HistoriqueJournalier.id == h.id)
+                    .values(donnees=d)
+                )
                 recalcules += 1
                 
         db.commit()
