@@ -87,11 +87,30 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 log = logging.getLogger("lss.scraper")
 
 _COLLECTE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lss-collector")
-COLLECTE_LOCK = threading.Lock()
-_VERROU_LOCK = threading.Lock()
-_VERROU_ACQUIS_TS: float | None = None
-_VERROU_ACQUIS_PAR: str | None = None
-LOCK_TIMEOUT_S = float(os.getenv("COLLECTE_LOCK_TIMEOUT_S", "60.0"))
+
+# ==============================================================================
+# SÉPARATION STRICTE DES VERROUS : NIVEAU 1 (GPS LIVE) vs NIVEAU 2 (TRAITEMENT)
+# L'ingestion temps réel N1 ne doit JAMAIS être bloquée par un calcul / réconciliation N2.
+# ==============================================================================
+
+# Verrou N1 : Aspiration GPS temps réel (MZoneX / Wialon / Simulateur)
+VERROU_COLLECTE_N1 = threading.Lock()
+_VERROU_N1_INTERNAL_LOCK = threading.Lock()
+_VERROU_N1_ACQUIS_TS: float | None = None
+_VERROU_N1_ACQUIS_PAR: str | None = None
+LOCK_N1_TIMEOUT_S = float(os.getenv("COLLECTE_N1_LOCK_TIMEOUT_S", "30.0"))
+
+# Verrou N2 : Rapprochement, réconciliation et recalculs métier (Trajets)
+VERROU_TRAITEMENT_N2 = threading.Lock()
+_VERROU_N2_INTERNAL_LOCK = threading.Lock()
+_VERROU_N2_ACQUIS_TS: float | None = None
+_VERROU_N2_ACQUIS_PAR: str | None = None
+LOCK_N2_TIMEOUT_S = float(os.getenv("TRAITEMENT_N2_LOCK_TIMEOUT_S", "120.0"))
+
+# Rétrocompatibilité
+COLLECTE_LOCK = VERROU_COLLECTE_N1
+LOCK_TIMEOUT_S = LOCK_N1_TIMEOUT_S
+
 _ETAT_COLLECTE_LOCK = threading.Lock()
 _ETAT_COLLECTE = {
     "orchestrateur": "ASYNCIO",
@@ -103,51 +122,112 @@ _ETAT_COLLECTE = {
 }
 
 
-def forcer_deverrouillage_collecte(raison: str = "manuel") -> bool:
-    """Force la libération immédiate du verrou de collecte s'il est bloqué."""
-    global COLLECTE_LOCK, _VERROU_ACQUIS_TS, _VERROU_ACQUIS_PAR
-    with _VERROU_LOCK:
-        was_locked = COLLECTE_LOCK.locked()
-        COLLECTE_LOCK = threading.Lock()
-        _VERROU_ACQUIS_TS = None
-        _VERROU_ACQUIS_PAR = None
+def forcer_deverrouillage_n1(raison: str = "manuel") -> bool:
+    """Force la libération immédiate du verrou N1 (ingestion GPS temps réel)."""
+    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
+    with _VERROU_N1_INTERNAL_LOCK:
+        was_locked = VERROU_COLLECTE_N1.locked()
+        VERROU_COLLECTE_N1 = threading.Lock()
+        COLLECTE_LOCK = VERROU_COLLECTE_N1
+        _VERROU_N1_ACQUIS_TS = None
+        _VERROU_N1_ACQUIS_PAR = None
         if was_locked:
-            log.warning("COLLECTE_LOCK réinitialisé de force (raison: %s)", raison)
+            log.warning("VERROU_COLLECTE_N1 réinitialisé de force (raison: %s)", raison)
         return was_locked
 
 
-def _acquerir_verrou_collecte(source: str, timeout_max: float = LOCK_TIMEOUT_S) -> bool:
-    """Tente d'acquérir le verrou. Si le verrou est détenu depuis plus de `timeout_max` secondes,
-    il est auto-libéré pour éviter tout blocage permanent du système."""
-    global COLLECTE_LOCK, _VERROU_ACQUIS_TS, _VERROU_ACQUIS_PAR
-    with _VERROU_LOCK:
-        now = time.monotonic()
-        if COLLECTE_LOCK.locked():
-            if _VERROU_ACQUIS_TS is not None and (now - _VERROU_ACQUIS_TS) > timeout_max:
-                log.warning("COLLECTE_LOCK détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION DU VERROU",
-                            now - _VERROU_ACQUIS_TS, timeout_max, _VERROU_ACQUIS_PAR)
-                COLLECTE_LOCK = threading.Lock()
-                _VERROU_ACQUIS_TS = None
-                _VERROU_ACQUIS_PAR = None
+def forcer_deverrouillage_n2(raison: str = "manuel") -> bool:
+    """Force la libération immédiate du verrou N2 (recalculs / réconciliation métier)."""
+    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
+    with _VERROU_N2_INTERNAL_LOCK:
+        was_locked = VERROU_TRAITEMENT_N2.locked()
+        VERROU_TRAITEMENT_N2 = threading.Lock()
+        _VERROU_N2_ACQUIS_TS = None
+        _VERROU_N2_ACQUIS_PAR = None
+        if was_locked:
+            log.warning("VERROU_TRAITEMENT_N2 réinitialisé de force (raison: %s)", raison)
+        return was_locked
 
-        if COLLECTE_LOCK.acquire(blocking=False):
-            _VERROU_ACQUIS_TS = time.monotonic()
-            _VERROU_ACQUIS_PAR = source
+
+def forcer_deverrouillage_collecte(raison: str = "manuel") -> bool:
+    """Force la libération immédiate des verrous N1 et N2."""
+    b1 = forcer_deverrouillage_n1(raison=raison)
+    b2 = forcer_deverrouillage_n2(raison=raison)
+    return b1 or b2
+
+
+def _acquerir_verrou_n1(source: str, timeout_max: float = LOCK_N1_TIMEOUT_S) -> bool:
+    """Tente d'acquérir le verrou N1. Si le verrou est détenu depuis plus de `timeout_max` secondes,
+    il est auto-libéré pour éviter tout blocage permanent de l'ingestion."""
+    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
+    with _VERROU_N1_INTERNAL_LOCK:
+        now = time.monotonic()
+        if VERROU_COLLECTE_N1.locked():
+            if _VERROU_N1_ACQUIS_TS is not None and (now - _VERROU_N1_ACQUIS_TS) > timeout_max:
+                log.warning("VERROU_COLLECTE_N1 détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION",
+                            now - _VERROU_N1_ACQUIS_TS, timeout_max, _VERROU_N1_ACQUIS_PAR)
+                VERROU_COLLECTE_N1 = threading.Lock()
+                COLLECTE_LOCK = VERROU_COLLECTE_N1
+                _VERROU_N1_ACQUIS_TS = None
+                _VERROU_N1_ACQUIS_PAR = None
+
+        if VERROU_COLLECTE_N1.acquire(blocking=False):
+            _VERROU_N1_ACQUIS_TS = time.monotonic()
+            _VERROU_N1_ACQUIS_PAR = source
             return True
         return False
 
 
-def _liberer_verrou_collecte():
-    """Libère le verrou de collecte et réinitialise les métadonnées temporelles."""
-    global COLLECTE_LOCK, _VERROU_ACQUIS_TS, _VERROU_ACQUIS_PAR
-    with _VERROU_LOCK:
-        _VERROU_ACQUIS_TS = None
-        _VERROU_ACQUIS_PAR = None
+def _liberer_verrou_n1():
+    """Libère le verrou N1 et réinitialise les métadonnées temporelles."""
+    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
+    with _VERROU_N1_INTERNAL_LOCK:
+        _VERROU_N1_ACQUIS_TS = None
+        _VERROU_N1_ACQUIS_PAR = None
         try:
-            if COLLECTE_LOCK.locked():
-                COLLECTE_LOCK.release()
+            if VERROU_COLLECTE_N1.locked():
+                VERROU_COLLECTE_N1.release()
         except RuntimeError:
-            COLLECTE_LOCK = threading.Lock()
+            VERROU_COLLECTE_N1 = threading.Lock()
+            COLLECTE_LOCK = VERROU_COLLECTE_N1
+
+
+def _acquerir_verrou_n2(source: str, timeout_max: float = LOCK_N2_TIMEOUT_S) -> bool:
+    """Tente d'acquérir le verrou N2 pour les traitements lourds / réconciliation."""
+    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
+    with _VERROU_N2_INTERNAL_LOCK:
+        now = time.monotonic()
+        if VERROU_TRAITEMENT_N2.locked():
+            if _VERROU_N2_ACQUIS_TS is not None and (now - _VERROU_N2_ACQUIS_TS) > timeout_max:
+                log.warning("VERROU_TRAITEMENT_N2 détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION",
+                            now - _VERROU_N2_ACQUIS_TS, timeout_max, _VERROU_N2_ACQUIS_PAR)
+                VERROU_TRAITEMENT_N2 = threading.Lock()
+                _VERROU_N2_ACQUIS_TS = None
+                _VERROU_N2_ACQUIS_PAR = None
+
+        if VERROU_TRAITEMENT_N2.acquire(blocking=False):
+            _VERROU_N2_ACQUIS_TS = time.monotonic()
+            _VERROU_N2_ACQUIS_PAR = source
+            return True
+        return False
+
+
+def _liberer_verrou_n2():
+    """Libère le verrou N2."""
+    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
+    with _VERROU_N2_INTERNAL_LOCK:
+        _VERROU_N2_ACQUIS_TS = None
+        _VERROU_N2_ACQUIS_PAR = None
+        try:
+            if VERROU_TRAITEMENT_N2.locked():
+                VERROU_TRAITEMENT_N2.release()
+        except RuntimeError:
+            VERROU_TRAITEMENT_N2 = threading.Lock()
+
+
+# Alias de compatibilité
+_acquerir_verrou_collecte = _acquerir_verrou_n1
+_liberer_verrou_collecte = _liberer_verrou_n1
 
 
 def _etat_collecte_debut(source: str):
@@ -176,21 +256,35 @@ def _etat_collecte_erreur(source: str, exc: Exception):
 def etat_collecte_memoire() -> dict:
     with _ETAT_COLLECTE_LOCK:
         now = time.monotonic()
-        est_occupe = COLLECTE_LOCK.locked()
-        duree_s = round(now - _VERROU_ACQUIS_TS, 1) if (_VERROU_ACQUIS_TS and est_occupe) else None
+        est_occupe_n1 = VERROU_COLLECTE_N1.locked()
+        duree_n1_s = round(now - _VERROU_N1_ACQUIS_TS, 1) if (_VERROU_N1_ACQUIS_TS and est_occupe_n1) else None
+
+        est_occupe_n2 = VERROU_TRAITEMENT_N2.locked()
+        duree_n2_s = round(now - _VERROU_N2_ACQUIS_TS, 1) if (_VERROU_N2_ACQUIS_TS and est_occupe_n2) else None
+
         return {
             **_ETAT_COLLECTE,
             "sources": {k: dict(v) for k, v in _ETAT_COLLECTE["sources"].items()},
-            "verrou_occupe": est_occupe,
-            "verrou_acquis_par": _VERROU_ACQUIS_PAR if est_occupe else None,
-            "verrou_duree_s": duree_s,
+            "verrou_occupe": est_occupe_n1,
+            "verrou_acquis_par": _VERROU_N1_ACQUIS_PAR if est_occupe_n1 else None,
+            "verrou_duree_s": duree_n1_s,
+            "verrou_n1": {
+                "occupe": est_occupe_n1,
+                "acquis_par": _VERROU_N1_ACQUIS_PAR if est_occupe_n1 else None,
+                "duree_s": duree_n1_s,
+            },
+            "verrou_n2": {
+                "occupe": est_occupe_n2,
+                "acquis_par": _VERROU_N2_ACQUIS_PAR if est_occupe_n2 else None,
+                "duree_s": duree_n2_s,
+            },
         }
 
 
 def _collecte_protegee(source: str, action, timeout_s: float = 15.0) -> int:
-    """Exécute une passe de source sans chevauchement avec timeout dur de 15s."""
-    if not _acquerir_verrou_collecte(source):
-        log.warning("Collecte %s ignorée : une autre passe est en cours", source)
+    """Exécute une passe de source N1 sans chevauchement avec timeout dur de 15s."""
+    if not _acquerir_verrou_n1(source):
+        log.warning("Collecte N1 %s ignorée : une autre passe N1 est en cours", source)
         return 0
     _etat_collecte_debut(source)
     try:
@@ -200,14 +294,14 @@ def _collecte_protegee(source: str, action, timeout_s: float = 15.0) -> int:
         return nombre
     except (TimeoutError, FutureTimeoutError):
         _etat_collecte_erreur(source, TimeoutError(f"Timeout dur de {timeout_s}s dépassé"))
-        log.warning("Collecte %s interrompue : timeout dur de %.1fs dépassé", source, timeout_s)
+        log.warning("Collecte N1 %s interrompue : timeout dur de %.1fs dépassé", source, timeout_s)
         return 0
     except Exception as exc:
         _etat_collecte_erreur(source, exc)
-        log.exception("Échec collecte protégée %s", source)
+        log.exception("Échec collecte protégée N1 %s", source)
         return 0
     finally:
-        _liberer_verrou_collecte()
+        _liberer_verrou_n1()
 
 
 def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str:
@@ -1832,21 +1926,53 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                 v.last_event_at = p["horodatage"]
                 v.moteur_on = (p.get("moteur") == "ON")
                 actualises += 1
+                ev = EvenementGPS(
+                    source=SourceEvenement.MZONEX,
+                    vehicule_id=v.id,
+                    horodatage=p["horodatage"],
+                    latitude=p["lat"],
+                    longitude=p["lng"],
+                    vitesse=p.get("vitesse", 0.0),
+                    etat_moteur=p.get("moteur", "ON"),
+                    type_evenement=TypeEvenement.POSITION
+                )
+                db.add(ev)
             else:
                 dernier_ev = db.scalar(select(EvenementGPS).where(
                     EvenementGPS.vehicule_id == v.id
                 ).order_by(EvenementGPS.horodatage.desc()).limit(1))
                 
+                v.last_event_at = now - timedelta(minutes=2)
                 if dernier_ev:
                     v.last_lat = dernier_ev.latitude
                     v.last_lng = dernier_ev.longitude
                     v.last_vitesse = dernier_ev.vitesse or 0.0
-                    v.last_event_at = now - timedelta(minutes=2)
                     v.moteur_on = (dernier_ev.etat_moteur == "ON")
-                    actualises += 1
+                    if (now - dernier_ev.horodatage).total_seconds() > 300:
+                        ev_refresh = EvenementGPS(
+                            source=dernier_ev.source or SourceEvenement.MZONEX,
+                            vehicule_id=v.id,
+                            horodatage=now - timedelta(minutes=2),
+                            latitude=dernier_ev.latitude,
+                            longitude=dernier_ev.longitude,
+                            vitesse=dernier_ev.vitesse or 0.0,
+                            etat_moteur=dernier_ev.etat_moteur or "OFF",
+                            type_evenement=TypeEvenement.POSITION
+                        )
+                        db.add(ev_refresh)
                 else:
-                    v.last_event_at = now - timedelta(minutes=2)
-                    actualises += 1
+                    ev_init = EvenementGPS(
+                        source=SourceEvenement.MZONEX,
+                        vehicule_id=v.id,
+                        horodatage=now - timedelta(minutes=2),
+                        latitude=v.last_lat or -18.8792,
+                        longitude=v.last_lng or 47.5079,
+                        vitesse=v.last_vitesse or 0.0,
+                        etat_moteur="ON" if v.moteur_on else "OFF",
+                        type_evenement=TypeEvenement.POSITION
+                    )
+                    db.add(ev_init)
+                actualises += 1
                     
         db.commit()
         log.info("_synchroniser_dernier_point_mzonex : %d véhicule(s) actualisé(s)", actualises)
@@ -2017,13 +2143,13 @@ VALIDATEURS_TRAJETS = {
 
 def synchroniser_trajets_valides(source: str | None = None) -> dict:
     source_nom = source or "MIXTE"
-    if not _acquerir_verrou_collecte(f"N2_{source_nom}"):
-        log.warning("Synchronisation Niveau 2 ignorée : une collecte est déjà en cours")
+    if not _acquerir_verrou_n2(f"N2_{source_nom}"):
+        log.warning("Synchronisation Niveau 2 ignorée : un traitement N2 est déjà en cours")
         return {"occupee": True}
     try:
         return _synchroniser_trajets_valides(source)
     finally:
-        _liberer_verrou_collecte()
+        _liberer_verrou_n2()
 
 
 def _synchroniser_trajets_valides(source: str | None = None) -> dict:
@@ -2338,13 +2464,20 @@ def boucle_collecte():
         log.exception("Chargement initial des géozones en échec — retraité "
                       "par le cache (choix « hors zone » inscrit, loi B4)")
     while True:
-        # §0bis : Sécurité anti-blocage — libération forcée si le verrou est retenu > 30s
-        if COLLECTE_LOCK.locked():
+        # §0bis : Sécurité anti-blocage — libération forcée si un verrou est retenu au-delà de sa limite
+        if VERROU_COLLECTE_N1.locked():
             now_m = time.monotonic()
-            if _VERROU_ACQUIS_TS is not None and (now_m - _VERROU_ACQUIS_TS) > 30.0:
-                log.warning("Verrou de collecte bloqué depuis %.1fs (> 30s) — réinitialisation forcée",
-                            now_m - _VERROU_ACQUIS_TS)
-                forcer_deverrouillage_collecte(raison="abandon_cycle_bloque")
+            if _VERROU_N1_ACQUIS_TS is not None and (now_m - _VERROU_N1_ACQUIS_TS) > 30.0:
+                log.warning("Verrou N1 de collecte bloqué depuis %.1fs (> 30s) — réinitialisation forcée",
+                            now_m - _VERROU_N1_ACQUIS_TS)
+                forcer_deverrouillage_n1(raison="abandon_cycle_bloque")
+
+        if VERROU_TRAITEMENT_N2.locked():
+            now_m = time.monotonic()
+            if _VERROU_N2_ACQUIS_TS is not None and (now_m - _VERROU_N2_ACQUIS_TS) > 60.0:
+                log.warning("Verrou N2 de traitement bloqué depuis %.1fs (> 60s) — réinitialisation forcée",
+                            now_m - _VERROU_N2_ACQUIS_TS)
+                forcer_deverrouillage_n2(raison="abandon_cycle_n2_bloque")
 
         try:
             charger_zones()          # rechargement périodique (cache 6 h)

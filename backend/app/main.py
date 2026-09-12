@@ -74,15 +74,21 @@ async def _boucle_collecteur_reel():
     """Collecte réelle MZoneX / CamtrackPro (§10) — activée par COLLECTOR_SOURCE.
     Les points insérés transitent par le même `ingest_event()` (§7) : missions,
     temps réglementaires, infractions, alertes et temps réel s'enchaînent tels quels."""
-    from .scrapers import SOURCES, boucle_collecte, forcer_deverrouillage_collecte, etat_collecte_memoire
+    from .scrapers import (
+        SOURCES, boucle_collecte, forcer_deverrouillage_n1,
+        forcer_deverrouillage_n2, etat_collecte_memoire
+    )
     source = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
     if source not in SOURCES and source != "MIXTE":
         return
-    # Réinitialisation de sécurité du verrou au boot
+    # Réinitialisation de sécurité des verrous au boot
     st = etat_collecte_memoire()
     if st.get("verrou_occupe") and (st.get("verrou_duree_s") or 0) > 30.0:
-        log.warning("Verrou de collecte hérité bloqué — réinitialisation au démarrage de la boucle")
-        forcer_deverrouillage_collecte(raison="demarrage_boucle_collecte")
+        log.warning("Verrou N1 hérité bloqué — réinitialisation au démarrage de la boucle")
+        forcer_deverrouillage_n1(raison="demarrage_boucle_collecte")
+    if st.get("verrou_n2", {}).get("occupe") and (st.get("verrou_n2", {}).get("duree_s") or 0) > 60.0:
+        log.warning("Verrou N2 hérité bloqué — réinitialisation au démarrage de la boucle")
+        forcer_deverrouillage_n2(raison="demarrage_boucle_collecte")
     if SIM_ENABLE:
         log.warning("SIMULATEUR et COLLECTEUR %s actifs ensemble — "
                     "mettez SIM_ENABLE=0 pour la production réelle", source)
@@ -672,6 +678,7 @@ def sante(db: Session = Depends(get_db)):
         ) or 0
 
         statut_str = "COLLECTE_OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE"
+        etat_coll = etat_collecte_memoire()
 
         return {
             "statut": statut_str,
@@ -687,7 +694,12 @@ def sante(db: Session = Depends(get_db)):
             "dernier_evenement_gps": dernier_ev.isoformat() if dernier_ev else None,
             "retard_collecte_min": round(retard_s / 60, 1) if retard_s is not None else None,
             "vehicules_actifs": nb_vehicules_actifs,
-            "etat_collecteur": etat_collecte_memoire(),
+            "etat_collecteur": etat_coll,
+            "verrou_occupe": etat_coll.get("verrou_occupe", False),
+            "verrou_acquis_par": etat_coll.get("verrou_acquis_par"),
+            "verrou_duree_s": etat_coll.get("verrou_duree_s"),
+            "verrou_n1": etat_coll.get("verrou_n1"),
+            "verrou_n2": etat_coll.get("verrou_n2"),
         }
     except Exception as e:
         log.exception("Erreur dans /api/sante")
@@ -703,10 +715,16 @@ def sante(db: Session = Depends(get_db)):
 @app.get("/api/sante/reset-verrou")
 @app.post("/api/sante/reset-verrou")
 def reset_verrou_collecte(db: Session = Depends(get_db)):
-    """Force la réinitialisation du verrou COLLECTE_LOCK s'il a été bloqué."""
-    from .scrapers import forcer_deverrouillage_collecte
-    debloque = forcer_deverrouillage_collecte(raison="appel_api_reset")
-    return {"verrou_reinitialise": debloque, "etat": sante(db)}
+    """Force la réinitialisation des verrous N1 (COLLECTE) et N2 (TRAITEMENT)."""
+    from .scrapers import forcer_deverrouillage_n1, forcer_deverrouillage_n2
+    debloque_n1 = forcer_deverrouillage_n1(raison="appel_api_reset")
+    debloque_n2 = forcer_deverrouillage_n2(raison="appel_api_reset")
+    return {
+        "verrou_reinitialise": debloque_n1 or debloque_n2,
+        "verrou_n1_reinitialise": debloque_n1,
+        "verrou_n2_reinitialise": debloque_n2,
+        "etat": sante(db)
+    }
 
 
 @app.get("/api/sante/sync")
