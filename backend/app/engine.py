@@ -16,6 +16,7 @@ from datetime import date, datetime, time, timedelta
 from threading import RLock
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import (CORRIDORS, IDENT_PLAQUE_RE, bascule_du, calculer_tokens_set,
@@ -795,12 +796,17 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
             EvenementGPS.idempotence_key == idempotence_key)):
         return None
     if historique:
-        db.add(EvenementGPS(
-            vehicule_id=vehicule.id, horodatage=ts, latitude=lat,
-            longitude=lon, adresse=adresse, vitesse=round(float(vitesse or 0), 1),
-            etat_moteur=moteur, type_evenement=type_force or TypeEvenement.POSITION,
-            source=source, idempotence_key=idempotence_key,
-            received_at=now_local(), historique=True))
+        try:
+            with db.begin_nested():
+                db.add(EvenementGPS(
+                    vehicule_id=vehicule.id, horodatage=ts, latitude=lat,
+                    longitude=lon, adresse=adresse, vitesse=round(float(vitesse or 0), 1),
+                    etat_moteur=moteur, type_evenement=type_force or TypeEvenement.POSITION,
+                    source=source, idempotence_key=idempotence_key,
+                    received_at=now_local(), historique=True))
+                db.flush()
+        except IntegrityError:
+            pass
         return {"historique": True, "idempotence_key": idempotence_key}
     # Addendum v1.5 : le seuil « bruit GPS » (2 min) est englobé par la règle
     # de fusion des pauses < 20 min — plus de rôle distinct ici.
@@ -912,7 +918,12 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
         type_evenement=type_ev or TypeEvenement.POSITION, source=source,
         idempotence_key=idempotence_key, received_at=now_local(),
         historique=historique)
-    db.add(ev)
+    try:
+        with db.begin_nested():
+            db.add(ev)
+            db.flush()
+    except IntegrityError:
+        pass
 
     # Une relecture historique peut ingérer un événement dont l'heure est
     # antérieure au dernier signal déjà reçu. Elle ne doit jamais faire

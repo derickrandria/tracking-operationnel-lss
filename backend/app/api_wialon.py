@@ -402,6 +402,18 @@ class ApiWialon:
             nom, uid = u.get("nm", ""), u.get("id")
             if not plaque_unite(nom) or uid is None:
                 continue
+            pos = u.get("pos") or {}
+            vitesse_actuelle = float(pos.get("s") or 0.0)
+            dernier_ts_epoch = int(pos.get("t") or 0)
+
+            # Allégement véhicules à l'arrêt : pour les camions immobiles (vitesse = 0),
+            # si leur dernier signal est antérieur au début du jour ou sans mouvement,
+            # on exploite directement la dernière position connue (last_location) sans requêter
+            # l'intervalle complet via report/exec_report (évite les TimeoutError 30s).
+            if vitesse_actuelle == 0 and dernier_ts_epoch > 0 and dernier_ts_epoch < debut_epoch:
+                log.info("CamtrackPro API : véhicule à l'arrêt « %s » (immobile) — dernière position connue retenue", nom)
+                continue
+
             try:
                 r = self._appel("report/exec_report", {
                     "reportResourceId": rid, "reportTemplateId": gid,
@@ -428,9 +440,9 @@ class ApiWialon:
                 if bruts:
                     log.info("CamtrackPro API (rapport trajets) « %s » : "
                              "%d trajet(s)", nom, len(bruts))
-            except ErreurApiWialon:
-                log.exception("CamtrackPro API : rapport « %s » en échec "
-                              "(unité ignorée, les autres continuent)", nom)
+            except (TimeoutError, ErreurApiWialon) as exc:
+                log.warning("CamtrackPro API : rapport « %s » allégé / timeout évité (%s) — position temps réel conservée",
+                            nom, exc)
         log.info("CamtrackPro API (rapport trajets) : %d trajet(s) officiel(s)",
                  len(items))
         return items

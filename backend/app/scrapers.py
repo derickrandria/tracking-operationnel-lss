@@ -68,6 +68,7 @@ import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from .config import (normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
@@ -1194,19 +1195,28 @@ class CollectorBase:
                     if db.scalar(select(EvenementGPS.id).where(
                             EvenementGPS.idempotence_key == cle)):
                         continue
-                    db.add(EvenementGPS(
-                        vehicule_id=vehicule.id, horodatage=p["horodatage"],
-                        latitude=p["lat"], longitude=p["lng"],
-                        adresse=p.get("adresse"), vitesse=p["vitesse"],
-                        etat_moteur=p["moteur"],
-                        type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
-                        source=self.source, idempotence_key=cle,
-                        received_at=now_local(), historique=True))
-                    inseres += 1
+                    try:
+                        with db.begin_nested():
+                            db.add(EvenementGPS(
+                                vehicule_id=vehicule.id, horodatage=p["horodatage"],
+                                latitude=p["lat"], longitude=p["lng"],
+                                adresse=p.get("adresse"), vitesse=p["vitesse"],
+                                etat_moteur=p["moteur"],
+                                type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
+                                source=self.source, idempotence_key=cle,
+                                received_at=now_local(), historique=True))
+                            db.flush()
+                            inseres += 1
+                    except IntegrityError:
+                        pass
                     continue
-                ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
-                             p.get("adresse"), p["vitesse"], p["moteur"],
-                             p.get("type_evenement"), self.source)
+                try:
+                    ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
+                                 p.get("adresse"), p["vitesse"], p["moteur"],
+                                 p.get("type_evenement"), self.source)
+                    inseres += 1
+                except IntegrityError:
+                    pass
                 # §0septies B4/B5 (20/08/2026) — alertes conduite EN DIRECT :
                 # vitesse > seuil hors géozone (B4) ; roulage sans clé MZoneX
                 # (B5 — badge None pour les sources qui ne la publient pas :
@@ -1942,7 +1952,12 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                     etat_moteur=p.get("moteur", "ON"),
                     type_evenement=TypeEvenement.POSITION
                 )
-                db.add(ev)
+                try:
+                    with db.begin_nested():
+                        db.add(ev)
+                        db.flush()
+                except IntegrityError:
+                    pass
             else:
                 dernier_ev = db.scalar(select(EvenementGPS).where(
                     EvenementGPS.vehicule_id == v.id
@@ -1965,7 +1980,12 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                             etat_moteur=dernier_ev.etat_moteur or "OFF",
                             type_evenement=TypeEvenement.POSITION
                         )
-                        db.add(ev_refresh)
+                        try:
+                            with db.begin_nested():
+                                db.add(ev_refresh)
+                                db.flush()
+                        except IntegrityError:
+                            pass
                 else:
                     ev_init = EvenementGPS(
                         source=SourceEvenement.MZONEX,
@@ -1977,7 +1997,12 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                         etat_moteur="ON" if v.moteur_on else "OFF",
                         type_evenement=TypeEvenement.POSITION
                     )
-                    db.add(ev_init)
+                    try:
+                        with db.begin_nested():
+                            db.add(ev_init)
+                            db.flush()
+                    except IntegrityError:
+                        pass
                 actualises += 1
                     
         db.commit()
