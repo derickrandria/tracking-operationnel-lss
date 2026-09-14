@@ -431,16 +431,11 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             db.flush()
 
         # 5. Préparation et réinsertion propre des archives
-        suivis = db.scalars(select(SuiviJournalier).where(
-            SuiviJournalier.date_jour == jour,
-            SuiviJournalier.vehicule_id.in_(target_veh_ids)
-        )).all()
-        map_suivis = {s.vehicule_id: s for s in suivis}
-
         recalcules = 0
         for v in vehicules_cibles:
-            s = map_suivis.get(v.id)
-            h_old = map_anciens_hists.get(v.id)
+            s = ensure_suivi(db, v, jour)
+            recalculer_temps(db, s, cloture)
+            d = s_suivi(s, seuils)
 
             nb_inf = db.scalar(select(func.count(Infraction.id)).where(
                 Infraction.date_jour == jour, Infraction.vehicule_id == v.id,
@@ -449,17 +444,7 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
                 Alerte.vehicule_id == v.id,
                 Alerte.date_heure >= debut, Alerte.date_heure < fin)) or 0
 
-            cond_id = (s.conducteur_id if s else None) or (h_old.conducteur_id if h_old else None) or v.conducteur_actuel_id
-            if s and s.trajets:
-                recalculer_temps(db, s, cloture)
-                d = s_suivi(s, seuils)
-            elif h_old and h_old.donnees:
-                d = dict(h_old.donnees)
-            else:
-                if not s:
-                    s = ensure_suivi(db, v, jour)
-                recalculer_temps(db, s, cloture)
-                d = s_suivi(s, seuils)
+            cond_id = s.conducteur_id or v.conducteur_actuel_id
 
             tcj_sec = max(0, min(86400, int(d.get("tcj_s") or d.get("tcj_secondes") or 0)))
             ttj_sec = max(0, min(86400, int(d.get("ttj_s") or d.get("ttj_secondes") or (tcj_sec + int(d.get("total_pause_s") or d.get("pauses_secondes") or 0)))))
@@ -516,7 +501,7 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
         return {
             "date_jour": jour.isoformat(),
             "source_filtre": source_filtre,
-            "suivis_recalcules": len(suivis),
+            "suivis_recalcules": recalcules,
             "archives_mises_a_jour": recalcules,
             "trajets_consolides": n_consolides,
             "statut": "OK"

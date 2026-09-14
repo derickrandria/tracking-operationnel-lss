@@ -33,6 +33,12 @@ def fmt_hms(secondes) -> str | None:
     return f"{signe}{s // 3600:02d}:{(s % 3600) // 60:02d}"
 
 
+def _enum_val(obj):
+    if obj is None:
+        return None
+    return obj.value if hasattr(obj, "value") else str(obj)
+
+
 def s_conducteur(c: Conducteur | None, court=False):
     if c is None:
         return None
@@ -45,7 +51,7 @@ def s_conducteur(c: Conducteur | None, court=False):
         "tokens_set": getattr(c, "tokens_set", None),
         "code_badge_mzonex": getattr(c, "code_badge_mzonex", None),
         "telephone": c.telephone,
-        "statut": c.statut.value if c.statut else None,
+        "statut": _enum_val(c.statut),
     }
     if hasattr(c, "aliases") and c.aliases:
         d["aliases"] = [{"id": a.id, "alias_brut": a.alias_brut} for a in c.aliases]
@@ -63,7 +69,7 @@ def s_vehicule(v: Vehicule, avec_conducteur=True):
         "description": v.description,
         "marque": v.marque,
         "capacite": v.capacite,
-        "statut": v.statut.value if v.statut else None,
+        "statut": _enum_val(v.statut),
         "gps_associe": v.gps_associe,
         "plateforme_gps": getattr(v, "plateforme_gps", None) or "MZONEX",
         "conducteur_actuel_id": v.conducteur_actuel_id,
@@ -85,11 +91,11 @@ def s_trajet(t: Trajet):
         "heure_fin": iso(t.heure_fin),
         "pause_apres_s": t.pause_apres_s,
         # Addendum v1.4 §3.1 — statut de fiabilité + traçabilité plateforme
-        "statut_source": (t.statut_source.value if t.statut_source else "VALIDÉ"),
+        "statut_source": (_enum_val(t.statut_source) if t.statut_source else "VALIDÉ"),
         "source_plateforme": t.source_plateforme,
         "distance_km": t.distance_km,
         # Addendum v1.5 §7.1 — validité métier (REJETE = jamais dans TCC/TCJ/TTJ)
-        "statut_validation": (t.statut_validation.value
+        "statut_validation": (_enum_val(t.statut_validation)
                               if t.statut_validation else "EN_ATTENTE"),
         "conducteur_badge": t.conducteur_badge,
         "conducteur_badge_id": t.conducteur_badge_id,
@@ -354,7 +360,7 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         "conducteur_origine": getattr(s, "conducteur_origine", None),
         # Partie B
         "situation": s.situation,
-        "statut_camion": s.statut_camion.value if s.statut_camion else None,
+        "statut_camion": _enum_val(s.statut_camion),
         "depot_recepteur": s.depot_recepteur,
         "distributeur": s.distributeur,
         "produit": s.produit,
@@ -529,12 +535,12 @@ def s_infraction(i: Infraction):
         "vehicule_id": i.vehicule_id,
         "plaque": i.vehicule.plaque if i.vehicule else None,
         "type": type_v,
-        "gravite": i.gravite.value if i.gravite else None,
+        "gravite": _enum_val(i.gravite),
         "duree_s": i.duree_s,
         "valeur_mesuree": i.valeur_mesuree,
         "seuil_reference": i.seuil_reference,
         "mission_id": i.mission_id,
-        "source": i.source.value if i.source else None,
+        "source": _enum_val(i.source),
         "latitude": i.latitude, "longitude": i.longitude,
         "adresse": i.adresse,
         # --- I3/I4 (v1.35)
@@ -556,14 +562,14 @@ def s_alerte(a: Alerte):
     return {
         "id": a.id,
         "date_heure": iso(a.date_heure),
-        "type": a.type.value if a.type else None,
-        "gravite": a.gravite.value if a.gravite else None,
+        "type": _enum_val(a.type),
+        "gravite": _enum_val(a.gravite),
         "vehicule_id": a.vehicule_id,
         "plaque": a.vehicule.plaque if a.vehicule else None,
         "conducteur_id": a.conducteur_id,
         "conducteur": s_conducteur(a.conducteur, court=True),
         "message": a.message,
-        "statut": a.statut.value if a.statut else None,
+        "statut": _enum_val(a.statut),
         "lien_module": a.lien_module,
         "infraction_id": a.infraction_id,
     }

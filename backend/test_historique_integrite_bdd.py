@@ -52,6 +52,8 @@ def setup():
         if not db.scalar(select(User).where(User.username == "admin_test")):
             db.add(User(username="admin_test", password_hash=hash_password("Pass@123"),
                         nom_complet="Admin Test", role=Role.ADMIN))
+        for d in [date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)]:
+            recalculer_archives_journee(d, db=db)
         db.commit()
     finally:
         db.close()

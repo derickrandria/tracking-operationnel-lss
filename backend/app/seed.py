@@ -154,6 +154,7 @@ VEHICULES_CAMTRACKPRO = {
 
 
 def seed_si_vide():
+    from datetime import date, datetime, timedelta
     Base.metadata.create_all(bind=_engine)
     db = SessionLocal()
     try:
@@ -245,6 +246,8 @@ def seed_si_vide():
                      (TypeInfraction.ACCELERATION_BRUSQUE, GraviteInfraction.FAIBLE)]
             for recul in (6, 5, 4, 3, 2, 1):
                 jour = auj - timedelta(days=recul)
+                if jour in (date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)):
+                    continue
                 for v in rng.sample(list(vehicules), k=min(len(vehicules), rng.randint(30, 40))):
                     c = v.conducteur_actuel
                     tcj = rng.randint(3 * 3600, 8 * 3600 + 1800)
@@ -291,7 +294,12 @@ def seed_si_vide():
                             source=SourceEvenement.SIMULATEUR,
                             adresse=rng.choice(["RN2 · PK 74 (avant Moramanga)", "RN2 · PK 201 (après Beforona)",
                                                 "RN7 · PK 96 (avant Antsirabe)"])))
-            log.info("Historique de démonstration généré (6 jours archivés)")
+            log.info("Historique de démonstration généré (jours passés archivés)")
+
+        # Scellement garanti des archives réelles et certifiées 11, 12, 13/09/2026
+        from .daily import recalculer_archives_journee
+        for j_cert in (date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)):
+            recalculer_archives_journee(j_cert, db=db)
 
         db.commit()
     finally:
