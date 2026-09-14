@@ -296,11 +296,6 @@ def seed_si_vide():
                                                 "RN7 · PK 96 (avant Antsirabe)"])))
             log.info("Historique de démonstration généré (jours passés archivés)")
 
-        # Scellement garanti des archives réelles et certifiées 11, 12, 13/09/2026
-        from .daily import recalculer_archives_journee
-        for j_cert in (date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)):
-            recalculer_archives_journee(j_cert, db=db)
-
         db.commit()
     finally:
         db.close()
