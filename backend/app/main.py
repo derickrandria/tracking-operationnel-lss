@@ -631,43 +631,47 @@ async def lifespan(app: FastAPI):
         yield
         return
 
-    log.info("Démarrage — initialisation base + seed")
+    log.info("Démarrage — initialisation base + seed (ultra-rapide)")
     seed.seed_si_vide()
     migrer_schema()
-    try:    # §0octies C1 (20/08/2026) — correctif UNIQUE +3h des trajets N2
-        db_c = SessionLocal()   # CamtrackPro stockés en UTC par la v1.26
-        try:
-            engine.corriger_fuseau_camtrackpro(db_c)
-        finally:
-            db_c.close()
-    except Exception:
-        log.exception("§0octies C1 : correctif fuseau CamtrackPro en échec — "
-                      "aucune ligne touchée, nouvelle tentative au prochain "
-                      "démarrage")
-    reparer_identifiants()
-    reparer_conducteurs_non_personnes()    # §0quinquies D5 (14/08/2026)
-    try:
-        from . import reparation
-        reparation.migrer_schema_missions()
-        reparation.reparer_historique_conducteurs_passes()
-    except Exception:
-        log.exception("Réparation initiale historique / missions en échec")
-    
-    # Réconciliation et persistance des alertes missions non traitées des jours passés
-    try:
-        db_a = SessionLocal()
-        try:
-            reparation.reinitialiser_donnees_missions(db_a)
-            reparation.nettoyer_alertes_missions_invalides(db_a)
-        finally:
-            db_a.close()
-    except Exception:
-        log.exception("Réconciliation des alertes missions au démarrage en échec")
-
-    daily.rattraper_au_demarrage()
     event_bus.attacher_boucle(asyncio.get_running_loop())
 
+    async def _tache_fond_demarrage():
+        """Tâche de fond asynchrone non-bloquante pour les réparations et rattrapages GPS/Wialon."""
+        try:
+            log.info("Lancement des tâches de fond post-startup (non bloquantes)...")
+            try:
+                db_c = SessionLocal()
+                try:
+                    engine.corriger_fuseau_camtrackpro(db_c)
+                finally:
+                    db_c.close()
+            except Exception:
+                log.exception("§0octies C1 : correctif fuseau CamtrackPro en échec")
+
+            reparer_identifiants()
+            reparer_conducteurs_non_personnes()
+
+            try:
+                from . import reparation
+                reparation.migrer_schema_missions()
+                reparation.reparer_historique_conducteurs_passes()
+                db_a = SessionLocal()
+                try:
+                    reparation.reinitialiser_donnees_missions(db_a)
+                    reparation.nettoyer_alertes_missions_invalides(db_a)
+                finally:
+                    db_a.close()
+            except Exception:
+                log.exception("Réconciliation des alertes missions en échec")
+
+            daily.rattraper_au_demarrage()
+            log.info("Tâches de fond post-startup terminées avec succès.")
+        except Exception:
+            log.exception("Erreur lors de l'exécution des tâches de fond post-startup")
+
     taches = [
+        asyncio.create_task(_tache_fond_demarrage()),
         asyncio.create_task(daily.boucle_cycle_quotidien()),
         asyncio.create_task(_boucle_chien_de_garde()),
         asyncio.create_task(_rejeu_puis_rien()),
