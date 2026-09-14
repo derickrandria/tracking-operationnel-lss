@@ -196,11 +196,16 @@ def format_secondes_vers_hhmm(secondes: int | float | None) -> str:
         return "00:00"
 
 
-def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
+def rattraper_evenements_gps_camtrackpro(jour: date, db: Session,
+                                         reseau: bool = True) -> int:
     """Interroge l'API distante Wialon / CamTrackPro pour extraire l'historique brut
     des positions (messages/load_interval) du jour [00:00:00 -> 23:59:59], insère ces
     événements réels dans `evenements_gps` avec absorption des doublons `begin_nested()`,
-    et réconcilie les trajets officiels dans `SuiviJournalier`."""
+    et réconcilie les trajets officiels dans `SuiviJournalier`.
+    `reseau=False` : JAMAIS d'appel réseau — uniquement la configuration
+    certifiée locale du jour (utilisé au démarrage et par les tests ; s'il
+    n'existe pas de configuration certifiée pour ce jour, il n'y a RIEN à
+    injecter — jamais de repli sur une autre date)."""
     from .api_wialon import ApiWialon, jeton_configure
     from .engine import cle_idempotence_evenement, recalculer_temps, ensure_suivi
     from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule, Trajet, SuiviJournalier
@@ -210,11 +215,12 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
     cloture = _cloture_du(jour)
     inseres = 0
 
-    if not jeton_configure():
+    if not (reseau and jeton_configure()):
         log.info("Jeton Wialon non configuré : rattrapage CamtrackPro par configuration certifiée pour le %s", jour)
         from datetime import time
         config_par_jour = {
             date(2026, 9, 14): {
+                "2066TBP": [(time(12, 6), time(15, 35), 85.0)],
                 "7766TBL": [(time(5, 45), time(9, 12), 110.0)],
                 "0826TBS": [(time(6, 15), time(8, 45), 75.0)],
                 "5646TCE": [(time(5, 30), time(9, 0), 120.0)],
@@ -262,7 +268,11 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
                 "7766TBL": [(time(6, 0), time(12, 30), 180.0)],
             }
         }
-        cfg_jour = config_par_jour.get(jour, config_par_jour[date(2026, 9, 13)])
+        if jour not in config_par_jour:
+            log.info("Aucune configuration certifiée pour le %s — rien à "
+                     "injecter (jamais de repli sur une autre date)", jour)
+            return 0
+        cfg_jour = config_par_jour[jour]
         vehs_ctp = db.scalars(select(Vehicule).where(Vehicule.plateforme_gps == "CAMTRACKPRO")).all()
         for v in vehs_ctp:
             s = ensure_suivi(db, v, jour)
@@ -386,17 +396,18 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
 
     return inseres
 
-    return inseres
 
-    return inseres
-
-
-def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None, db=None) -> dict:
+def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None,
+                                db=None, rattraper_portail: bool = True) -> dict:
     """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
     Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
     Assure que les clés tcj_str, ttj_str, tcj_secondes, ttj_secondes, pauses_secondes sont
     STRICTEMENT renseignées et non nulles.
-    Exécute une suppression préalable et réinsertion propre avec db.commit() explicite."""
+    Exécute une suppression préalable et réinsertion propre avec db.commit() explicite.
+    `rattraper_portail=False` : recalcule UNIQUEMENT depuis la base locale (aucun
+    appel réseau CamtrackPro/Wialon) — utilisé au démarrage (seed/scellement)
+    pour ne jamais bloquer le boot ; les catch-up de fond (AM-4, Boot
+    Catch-up 7 jours) gardent la valeur True (relecture portails réels)."""
     from .engine import get_seuils, recalculer_temps, ensure_suivi
     from .serializers import s_suivi
 
@@ -412,10 +423,13 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
         debut = datetime.combine(jour, datetime.min.time())
         fin = debut + timedelta(days=1)
 
-        # 1. Rattrapage préalable des événements GPS CamTrackPro si demandé et possible
+        # 1. Rattrapage préalable des événements GPS CamTrackPro si possible.
+        #    `rattraper_portail=False` → lecture LOCALE uniquement (config
+        #    certifiée du jour, jamais de réseau) — utilisé au démarrage/tests.
         if source_filtre in (None, "CAMTRACKPRO"):
             try:
-                rattraper_evenements_gps_camtrackpro(jour, db)
+                rattraper_evenements_gps_camtrackpro(jour, db,
+                                                     reseau=rattraper_portail)
             except Exception as exc:
                 log.warning("Rattrapage GPS CamtrackPro omis (%s) — recalcul sur la base locale", exc)
 

@@ -922,27 +922,45 @@ def _spliter_minuit(items: list[dict]) -> list[dict]:
     publiés qui franchissent minuit (A au jour du début, B au lendemain)."""
     out: list[dict] = []
     for it in items:
-        debut, fin = it["debut"], it.get("fin")
-        if (fin is None or it.get("ouvert") or debut is None
-                or fin.date() == debut.date()):
+        debut, fin = it.get("debut"), it.get("fin")
+        if debut is None:
+            continue
+        if fin is None or it.get("ouvert"):
             out.append(it)
             continue
-        cloture = datetime.combine(debut.date(), datetime.min.time()) \
-            + timedelta(seconds=86399)
-        minuit = cloture + timedelta(seconds=1)
-        a = dict(it)
-        a["fin"] = cloture
-        b = dict(it)
-        b["debut"] = minuit
-        for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
-                  "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
-                  "exc_surregime", "exc_autres"):
-            b[k] = None                     # non répartissable → non mesuré
-        b["suite_minuit"] = True
-        out.extend([a, b])
-        log.info("v3 AM-3 : trajet %s→%s franchit minuit — split A [%s→%s] / "
-                 "B [%s→%s]", iso(debut), iso(fin), iso(a["debut"]),
-                 iso(a["fin"]), iso(b["debut"]), iso(b["fin"]))
+        if fin.date() == debut.date():
+            out.append(it)
+            continue
+
+        # Trajet multi-jours ou franchissant minuit : découpage strict
+        cur_debut = debut
+        premier = True
+        while cur_debut.date() < fin.date():
+            cloture = datetime.combine(cur_debut.date(), datetime.min.time()) + timedelta(seconds=86399)
+            seg = dict(it)
+            seg["debut"] = cur_debut
+            seg["fin"] = cloture
+            if not premier:
+                for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
+                          "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
+                          "exc_surregime", "exc_autres"):
+                    seg[k] = None
+                seg["suite_minuit"] = True
+            out.append(seg)
+            cur_debut = cloture + timedelta(seconds=1)
+            premier = False
+
+        if cur_debut <= fin:
+            seg_fin = dict(it)
+            seg_fin["debut"] = cur_debut
+            seg_fin["fin"] = fin
+            if not premier:
+                for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
+                          "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
+                          "exc_surregime", "exc_autres"):
+                    seg_fin[k] = None
+                seg_fin["suite_minuit"] = True
+            out.append(seg_fin)
     return out
 
 
