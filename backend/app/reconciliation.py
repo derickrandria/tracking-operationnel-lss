@@ -200,6 +200,22 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
     if change_pos:
         donnees.update(pos_apres)
         change = True
+    champs_suivi = (
+        "situation", "statut_camion", "depot_recepteur", "distributeur",
+        "produit", "numero_ot", "emplacement_j_moins_1", "arret_final",
+        "km_parcourus", "mission_id")
+    champs_apres = {}
+    for champ in champs_suivi:
+        valeur = getattr(suivi, champ, None)
+        if hasattr(valeur, "value"):
+            valeur = valeur.value
+        champs_apres[champ] = valeur
+    if any(donnees.get(c) != v for c, v in champs_apres.items()):
+        donnees.update(champs_apres)
+        change = True
+    if h.conducteur_id != suivi.conducteur_id:
+        h.conducteur_id = suivi.conducteur_id
+        h.conducteur = suivi.conducteur
     if change:
         _audit(db, "archive.raffraichie", None, {
             "plaque": suivi.vehicule.plaque if suivi.vehicule else None,
@@ -424,6 +440,26 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                 trajets.remove(t)
             epures += 1
             continue
+        # Un ouvert N1 provisoire peut commencer au milieu d'une ligne N2
+        # publiée après coup. Il s'agit du même trajet observé en direct :
+        # l'officiel couvre l'ouvert, même si sa fin officielle est plus tard.
+        if (t.heure_fin is None
+            and (t.statut_source == StatutSourceTrajet.PROVISOIRE
+                 or t.source_plateforme == "CAMTRACKPRO")
+                and any(d <= t.heure_debut <= (f or d)
+                        for d, f in intervalles)):
+            _audit(db, "trajet.orphelin_purge", t.id, {
+                "plaque": vehicule.plaque, "jour": jour.isoformat(),
+                "debut": iso(t.heure_debut), "fin": None,
+                "raison": "ouvert_recouvert",
+                "regle": "ouvert N1 provisoire recouvert par une ligne N2 "
+                         "officielle : l'officiel fait foi"})
+            log.info("Ligne ouverte recouverte purgée — %s %s",
+                     vehicule.plaque, iso(t.heure_debut))
+            db.delete(t)
+            trajets.remove(t)
+            epures += 1
+            continue
         fin_affichee = t.heure_fin or maintenant
         # un trajet MOTEUR (Niveau 1) vraiment vivant — fin provisoire fraîche
         # (< pause_min) ou pas encore de fin — n'est jamais touché ici
@@ -448,6 +484,17 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                     # lignes officielles ne se chevauchent jamais → fantôme
                     raison = "contenu"
                     break
+            # Règle d'épuration stricte : si le suivi possède des lignes officielles
+            # certifiées (conserves) et qu'un trajet PROVISOIRE terminé ne figure dans
+            # aucun intervalle officiel, il est qualifié de fantôme non officiel et purgé.
+            if (raison is None and conserves
+                    and t.statut_source == StatutSourceTrajet.PROVISOIRE
+                    and t.heure_fin is not None):
+                signal_recent = (vehicule.last_event_at is not None
+                                 and (maintenant - vehicule.last_event_at).total_seconds() <= 900
+                                 and (maintenant - t.heure_fin).total_seconds() < pause_min)
+                if not signal_recent:
+                    raison = "fantome_non_officiel"
         if raison is None:
             continue
         _audit(db, "trajet.orphelin_purge", t.id, {
@@ -875,27 +922,45 @@ def _spliter_minuit(items: list[dict]) -> list[dict]:
     publiés qui franchissent minuit (A au jour du début, B au lendemain)."""
     out: list[dict] = []
     for it in items:
-        debut, fin = it["debut"], it.get("fin")
-        if (fin is None or it.get("ouvert") or debut is None
-                or fin.date() == debut.date()):
+        debut, fin = it.get("debut"), it.get("fin")
+        if debut is None:
+            continue
+        if fin is None or it.get("ouvert"):
             out.append(it)
             continue
-        cloture = datetime.combine(debut.date(), datetime.min.time()) \
-            + timedelta(seconds=86399)
-        minuit = cloture + timedelta(seconds=1)
-        a = dict(it)
-        a["fin"] = cloture
-        b = dict(it)
-        b["debut"] = minuit
-        for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
-                  "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
-                  "exc_surregime", "exc_autres"):
-            b[k] = None                     # non répartissable → non mesuré
-        b["suite_minuit"] = True
-        out.extend([a, b])
-        log.info("v3 AM-3 : trajet %s→%s franchit minuit — split A [%s→%s] / "
-                 "B [%s→%s]", iso(debut), iso(fin), iso(a["debut"]),
-                 iso(a["fin"]), iso(b["debut"]), iso(b["fin"]))
+        if fin.date() == debut.date():
+            out.append(it)
+            continue
+
+        # Trajet multi-jours ou franchissant minuit : découpage strict
+        cur_debut = debut
+        premier = True
+        while cur_debut.date() < fin.date():
+            cloture = datetime.combine(cur_debut.date(), datetime.min.time()) + timedelta(seconds=86399)
+            seg = dict(it)
+            seg["debut"] = cur_debut
+            seg["fin"] = cloture
+            if not premier:
+                for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
+                          "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
+                          "exc_surregime", "exc_autres"):
+                    seg[k] = None
+                seg["suite_minuit"] = True
+            out.append(seg)
+            cur_debut = cloture + timedelta(seconds=1)
+            premier = False
+
+        if cur_debut <= fin:
+            seg_fin = dict(it)
+            seg_fin["debut"] = cur_debut
+            seg_fin["fin"] = fin
+            if not premier:
+                for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
+                          "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
+                          "exc_surregime", "exc_autres"):
+                    seg_fin[k] = None
+                seg_fin["suite_minuit"] = True
+            out.append(seg_fin)
     return out
 
 
@@ -942,11 +1007,12 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 mapping[str(v.id).strip().upper()] = v
                 if v.gps_associe:
                     mapping[str(v.gps_associe).strip().upper()] = v
-        if it.get("conducteur"):
+        if it.get("conducteur") or it.get("badge_code"):
             # §0septies B2 (20/08/2026) : les clés de SERVICE (« Nouveau
             # conducteur », « garage LSS ») ne créent JAMAIS de fiche — la
             # saisie manuelle fait le travail sur ces lignes-là
-            resoudre_badge(db, it["conducteur"])
+            resoudre_badge(db, it.get("conducteur"), badge_code=it.get("badge_code"),
+                           plateforme=it.get("source"))
 
     suivi_touches: set[str] = set()
 
@@ -1023,6 +1089,19 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
     for it in items:
         try:
             debut, fin = it["debut"], it.get("fin")
+            # GARDE D'INTÉGRITÉ STRICTE : une `fin` antérieure ou égale au `debut` est
+            # rejetée ou corrigée si un décalage de fuseau UTC/local (+3h) est détecté.
+            # Ne jamais transformer en trajet ouvert (fin None) pour éviter d'étendre
+            # artificiellement le trajet jusqu'à 23:59:59.
+            if fin is not None and fin <= debut:
+                from datetime import timedelta
+                if (fin + timedelta(hours=3)) > debut and (fin + timedelta(hours=3) - debut).total_seconds() <= 43200:
+                    fin = fin + timedelta(hours=3)
+                else:
+                    log.warning("Trajet validé rejeté car fin (%s) <= début (%s) pour %s",
+                                iso(fin), iso(debut), it.get("plaque"))
+                    stats["ignores"] += 1
+                    continue
             # Référence v2 §8.2/§8.3 — jour d'ATTRIBUTION du trajet (début
             # < 01h00 → veille ; la journée logistique court de 01h00 à 01h00)
             jour = jour_attribution(debut)
@@ -1042,6 +1121,11 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 stats["ignores"] += 1
                 log.info("Trajet validé sans véhicule connu (%r) — ignoré",
                          it.get("gps_associe") or it.get("plaque"))
+                continue
+            if vehicule.statut != "ACTIF":
+                stats["ignores"] += 1
+                log.info("Trajet validé pour véhicule non actif %s — ignoré",
+                         vehicule.plaque)
                 continue
 
             suivi = ensure_suivi(db, vehicule, jour)

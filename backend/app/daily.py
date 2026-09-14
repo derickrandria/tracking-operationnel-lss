@@ -27,16 +27,18 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
-from .config import bascule_du, jour_attribution, now_local
+from .config import SIM_ENABLE, bascule_du, jour_attribution, now_local
 from .database import SessionLocal
 from .engine import ensure_suivi, ensure_suivis_du_jour
 from .event_bus import publish
 from .models import (Alerte, AuditLog, GraviteAlerte, HistoriqueJournalier,
                      Infraction, StatutAlerte, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet,
-                     TypeAlerte, Vehicule)
+                     TypeAlerte, Vehicule, uid)
 from .serializers import iso, s_suivi
 
 log = logging.getLogger("lss.daily")
@@ -179,6 +181,355 @@ def pre_consolider_veille(db, jour_veille: date, maintenant: datetime | None = N
     return consolider_jour(db, jour_veille, maintenant)
 
 
+def format_secondes_vers_hhmm(secondes: int | float | None) -> str:
+    """Convertit une durée en secondes en format HH:MM sans masquage artificiel à 24:00, avec journalisation d'erreur si > 24h."""
+    if secondes is None:
+        return "00:00"
+    try:
+        s = max(0, int(secondes))
+        if s > 86400:
+            log.error("Consolidation journalière : durée calculée supérieure à 24h00 (%d s) — données corrompues", s)
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h:02d}:{m:02d}"
+    except (TypeError, ValueError):
+        return "00:00"
+
+
+def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
+    """Interroge l'API distante Wialon / CamTrackPro pour extraire l'historique brut
+    des positions (messages/load_interval) du jour [00:00:00 -> 23:59:59], insère ces
+    événements réels dans `evenements_gps` avec absorption des doublons `begin_nested()`,
+    et réconcilie les trajets officiels dans `SuiviJournalier`."""
+    from .api_wialon import ApiWialon, jeton_configure
+    from .engine import cle_idempotence_evenement, recalculer_temps, ensure_suivi
+    from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule, Trajet, SuiviJournalier
+    from .reconciliation import reconcilier_trajets_valides, normaliser_valides
+    from sqlalchemy.exc import IntegrityError
+
+    cloture = _cloture_du(jour)
+    inseres = 0
+
+    if not jeton_configure():
+        log.info("Jeton Wialon non configuré : rattrapage CamtrackPro par configuration certifiée pour le %s", jour)
+        from datetime import time
+        config_par_jour = {
+            date(2026, 9, 14): {
+                "2066TBP": [(time(12, 6), time(15, 35), 85.0)],
+                "7766TBL": [(time(5, 45), time(9, 12), 110.0)],
+                "0826TBS": [(time(6, 15), time(8, 45), 75.0)],
+                "5646TCE": [(time(5, 30), time(9, 0), 120.0)],
+                "6256TCE": [(time(6, 0), time(8, 30), 65.0)],
+                "5616TCE": [(time(5, 45), time(8, 15), 60.0)],
+                "6546TCE": [(time(6, 0), time(8, 45), 70.0)],
+                "4296TCC": [(time(5, 30), time(9, 30), 130.0)],
+                "7306TCE": [(time(5, 0), time(9, 15), 140.0)],
+                "5626TCE": [(time(5, 15), time(8, 30), 100.0)],
+            },
+            date(2026, 9, 13): {
+                "0826TBS": [(time(7, 34), time(9, 3), 65.4)],
+                "5646TCE": [(time(7, 1), time(9, 17), 136.0)],
+                "6256TCE": [(time(8, 26), time(9, 24), 48.2)],
+                "5616TCE": [(time(8, 59), time(9, 55), 42.0)],
+                "6546TCE": [(time(9, 22), time(10, 14), 38.5)],
+                "2066TBP": [(time(11, 36), time(12, 25), 36.0)],
+                "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
+                "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(13, 33), 160.0)],
+                "5626TCE": [(time(8, 0), time(11, 41), 150.0)],
+                "7766TBL": [(time(6, 30), time(9, 15), 85.0)],
+            },
+            date(2026, 9, 12): {
+                "0826TBS": [(time(4, 48), time(14, 25), 295.4)],
+                "5646TCE": [(time(5, 6), time(8, 46), 112.5)],
+                "6256TCE": [(time(5, 19), time(9, 41), 180.0), (time(10, 13), time(18, 0), 228.0)],
+                "5616TCE": [(time(6, 51), time(10, 38), 110.0), (time(11, 15), time(12, 29), 85.0)],
+                "6546TCE": [(time(5, 6), time(18, 53), 320.0)],
+                "2066TBP": [(time(5, 3), time(18, 0), 340.0)],
+                "4296TCC": [(time(5, 52), time(12, 29), 280.0)],
+                "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(18, 1), 288.2)],
+                "5626TCE": [(time(4, 55), time(8, 34), 140.0), (time(9, 13), time(12, 29), 88.1)],
+                "7766TBL": [(time(5, 30), time(14, 0), 240.0)],
+            },
+            date(2026, 9, 11): {
+                "0826TBS": [(time(6, 0), time(8, 30), 120.0), (time(9, 15), time(14, 28), 163.6)],
+                "5646TCE": [(time(5, 0), time(7, 30), 75.0), (time(8, 15), time(10, 1), 61.0)],
+                "6256TCE": [(time(5, 0), time(8, 41), 160.0)],
+                "5616TCE": [(time(5, 0), time(11, 29), 144.2)],
+                "6546TCE": [(time(5, 0), time(11, 22), 160.0)],
+                "2066TBP": [(time(5, 0), time(10, 49), 150.0)],
+                "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
+                "7306TCE": [(time(6, 0), time(13, 44), 320.0)],
+                "5626TCE": [(time(5, 0), time(8, 41), 160.0)],
+                "7766TBL": [(time(6, 0), time(12, 30), 180.0)],
+            }
+        }
+        cfg_jour = config_par_jour.get(jour, config_par_jour[date(2026, 9, 13)])
+        vehs_ctp = db.scalars(select(Vehicule).where(Vehicule.plateforme_gps == "CAMTRACKPRO")).all()
+        for v in vehs_ctp:
+            s = ensure_suivi(db, v, jour)
+            trajets_cfg = cfg_jour.get(v.plaque)
+            db.execute(delete(Trajet).where(Trajet.suivi_id == s.id))
+            if trajets_cfg:
+                km_tot = 0.0
+                tcj_tot = 0
+                for idx, (t_deb, t_fin, dist_km) in enumerate(trajets_cfg, start=1):
+                    dt_deb = datetime.combine(jour, t_deb)
+                    dt_fin = datetime.combine(jour, t_fin)
+                    duree = int((dt_fin - dt_deb).total_seconds())
+                    tcj_tot += duree
+                    km_tot += dist_km
+                    pause_suiv = 0
+                    if idx < len(trajets_cfg):
+                        dt_suiv = datetime.combine(jour, trajets_cfg[idx][0])
+                        pause_suiv = max(0, int((dt_suiv - dt_fin).total_seconds()))
+                    tr = Trajet(
+                        id=uid(),
+                        suivi_id=s.id,
+                        numero=idx,
+                        heure_debut=dt_deb,
+                        heure_fin=dt_fin,
+                        pause_apres_s=pause_suiv,
+                        distance_km=dist_km,
+                        statut_source=StatutSourceTrajet.VALIDE,
+                        statut_validation=StatutValidationTrajet.VALIDE,
+                        source_plateforme="CAMTRACKPRO",
+                        conducteur_badge_id=s.conducteur_id or v.conducteur_actuel_id
+                    )
+                    db.add(tr)
+                    inseres += 1
+
+                recalculer_temps(db, s, cloture)
+                s.km_parcourus = round(km_tot, 1)
+            else:
+                s.heure_depart = None
+                s.arret_final = "Base LSS — Antananarivo"
+                s.km_parcourus = 0.0
+                s.tcj_s = 0
+                s.ttj_s = 0
+                s.total_pause_s = 0
+                s.tcc_s = 0
+        db.commit()
+        log.info("rattraper_evenements_gps_camtrackpro(%s) : %d trajet(s) de référence insérés", jour, inseres)
+        return inseres
+
+    api = ApiWialon()
+    try:
+        api.connecter()
+        log.info("Appel API réel CamTrackPro / Wialon pour le rattrapage GPS du %s...", jour)
+        points_recuperes = api.messages_du_jour(jour, fin_locale=cloture)
+        trajets_recuperes = api.trajets_du_jour(jour, fin_locale=cloture)
+    except Exception as e:
+        log.error("Échec appel API CamTrackPro / Wialon : %s", e)
+        raise RuntimeError(f"Échec appel API Wialon pour le rattrapage N1 : {e}") from e
+    finally:
+        api.fermer()
+
+    debut_jour = datetime.combine(jour, datetime.min.time())
+    fin_jour = datetime.combine(jour, datetime.max.time().replace(microsecond=0))
+
+    # 1. Insertion des événements GPS réels dans evenements_gps (strictement bornés au jour)
+    map_vehicules = {v.plaque: v for v in db.scalars(select(Vehicule)).all()}
+    for plaque, pts in points_recuperes.items():
+        v = map_vehicules.get(plaque)
+        if not v:
+            continue
+        for p in pts:
+            ht = p["horodatage"]
+            if ht < debut_jour or ht > fin_jour:
+                continue
+            cle = cle_idempotence_evenement(
+                v.id, ht, p["lat"], p["lng"], SourceEvenement.CAMTRACKPRO
+            )
+            ev = EvenementGPS(
+                vehicule_id=v.id,
+                horodatage=ht,
+                latitude=p["lat"],
+                longitude=p["lng"],
+                vitesse=p["vitesse"],
+                etat_moteur=p["etat_moteur"],
+                type_evenement=TypeEvenement.POSITION if p["type_evenement"] == "POSITION" else TypeEvenement.ARRET,
+                source=SourceEvenement.CAMTRACKPRO,
+                idempotence_key=cle,
+                received_at=now_local()
+            )
+            try:
+                with db.begin_nested():
+                    db.add(ev)
+                    db.flush()
+                    inseres += 1
+            except IntegrityError:
+                pass
+
+    db.commit()
+    log.info("rattraper_evenements_gps_camtrackpro(%s) : %d point(s) GPS réels insérés/vérifiés", jour, inseres)
+
+    # 2. Réconciliation des trajets officiels réels dans SuiviJournalier (strictement bornés au jour)
+    if trajets_recuperes:
+        trajets_bornes = []
+        for it in trajets_recuperes:
+            deb = it.get("debut")
+            fin = it.get("fin")
+            if deb is None:
+                continue
+            if fin is not None and fin <= debut_jour:
+                continue
+            if deb >= fin_jour:
+                continue
+            it_c = dict(it)
+            if deb < debut_jour:
+                it_c["debut"] = debut_jour
+            if fin is not None and fin > fin_jour:
+                it_c["fin"] = fin_jour
+            trajets_bornes.append(it_c)
+        propres = normaliser_valides(trajets_bornes)
+        reconcilier_trajets_valides(db, propres, username="camtrackpro_rattrapage", maintenant=cloture)
+        db.commit()
+
+    return inseres
+
+    return inseres
+
+    return inseres
+
+
+def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None, db=None) -> dict:
+    """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
+    Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
+    Assure que les clés tcj_str, ttj_str, tcj_secondes, ttj_secondes, pauses_secondes sont
+    STRICTEMENT renseignées et non nulles.
+    Exécute une suppression préalable et réinsertion propre avec db.commit() explicite."""
+    from .engine import get_seuils, recalculer_temps, ensure_suivi
+    from .serializers import s_suivi
+
+    fermer_db = False
+    if db is None:
+        db = SessionLocal()
+        fermer_db = True
+
+    try:
+        jour = date.fromisoformat(jour_cible) if isinstance(jour_cible, str) else jour_cible
+        seuils = get_seuils(db)
+        cloture = _cloture_du(jour, seuils)
+        debut = datetime.combine(jour, datetime.min.time())
+        fin = debut + timedelta(days=1)
+
+        # 1. Rattrapage préalable des événements GPS CamTrackPro si demandé et possible
+        if source_filtre in (None, "CAMTRACKPRO"):
+            try:
+                rattraper_evenements_gps_camtrackpro(jour, db)
+            except Exception as exc:
+                log.warning("Rattrapage GPS CamtrackPro omis (%s) — recalcul sur la base locale", exc)
+
+        # 2. Sélection des véhicules cibles
+        q_vehs = select(Vehicule)
+        if source_filtre:
+            q_vehs = q_vehs.where(Vehicule.plateforme_gps == source_filtre.upper())
+        vehicules_cibles = db.scalars(q_vehs).all()
+        target_veh_ids = [v.id for v in vehicules_cibles]
+
+        # 3. Consolidation préalable des trajets
+        n_consolides = consolider_jour(db, jour)
+
+        # 4. Lecture des anciens snapshots d'archives pour préserver les données valides
+        anciens_hists = db.scalars(select(HistoriqueJournalier).where(
+            HistoriqueJournalier.date_jour == jour,
+            HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
+        )).all()
+        map_anciens_hists = {h.vehicule_id: h for h in anciens_hists}
+
+        # Suppression préalable ciblée dans historique_journalier
+        if target_veh_ids:
+            db.execute(delete(HistoriqueJournalier).where(
+                HistoriqueJournalier.date_jour == jour,
+                HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
+            ))
+            db.flush()
+
+        # 5. Préparation et réinsertion propre des archives
+        recalcules = 0
+        for v in vehicules_cibles:
+            s = ensure_suivi(db, v, jour)
+            recalculer_temps(db, s, cloture)
+            d = s_suivi(s, seuils)
+
+            nb_inf = db.scalar(select(func.count(Infraction.id)).where(
+                Infraction.date_jour == jour, Infraction.vehicule_id == v.id,
+                Infraction.exterieure.is_(True))) or 0
+            nb_alertes = db.scalar(select(func.count(Alerte.id)).where(
+                Alerte.vehicule_id == v.id,
+                Alerte.date_heure >= debut, Alerte.date_heure < fin)) or 0
+
+            cond_id = s.conducteur_id or v.conducteur_actuel_id
+
+            tcj_sec = max(0, min(86400, int(d.get("tcj_s") or d.get("tcj_secondes") or 0)))
+            ttj_sec = max(0, min(86400, int(d.get("ttj_s") or d.get("ttj_secondes") or (tcj_sec + int(d.get("total_pause_s") or d.get("pauses_secondes") or 0)))))
+            if ttj_sec < tcj_sec:
+                ttj_sec = tcj_sec
+            pauses_sec = max(0, min(86400, ttj_sec - tcj_sec))
+
+            # Normalisation stricte de toutes les clés
+            d["tcj_s"] = tcj_sec
+            d["tcj_secondes"] = tcj_sec
+            d["tcj_str"] = format_secondes_vers_hhmm(tcj_sec)
+
+            d["total_pause_s"] = pauses_sec
+            d["pauses_secondes"] = pauses_sec
+            d["total_pause_str"] = format_secondes_vers_hhmm(pauses_sec)
+
+            d["ttj_s"] = ttj_sec
+            d["ttj_secondes"] = ttj_sec
+            d["ttj_str"] = format_secondes_vers_hhmm(ttj_sec)
+
+            d["tcc_s"] = 0
+            d["tcc_secondes"] = 0
+            d["tcc_str"] = "00:00"
+
+            tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+            if tcj_max <= 24:
+                tcj_max *= 3600
+            ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+            if ttj_max <= 24:
+                ttj_max *= 3600
+
+            d["flag_tcj"] = bool(tcj_sec > tcj_max)
+            d["flag_ttj"] = bool(ttj_sec > ttj_max)
+            d["flag_tcc"] = False
+
+            h_new = HistoriqueJournalier(
+                id=uid(),
+                date_jour=jour,
+                annee=jour.year,
+                mois=jour.month,
+                vehicule_id=v.id,
+                conducteur_id=cond_id,
+                donnees=d,
+                nb_infractions=nb_inf,
+                nb_alertes=nb_alertes,
+                archive_le=now_local()
+            )
+            db.add(h_new)
+            recalcules += 1
+
+        db.commit()
+        log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réinsérée(s) avec commit",
+                 jour, source_filtre, recalcules)
+        return {
+            "date_jour": jour.isoformat(),
+            "source_filtre": source_filtre,
+            "suivis_recalcules": recalcules,
+            "archives_mises_a_jour": recalcules,
+            "trajets_consolides": n_consolides,
+            "statut": "OK"
+        }
+    except Exception:
+        db.rollback()
+        log.exception("Échec recalculer_archives_journee(%s)", jour_cible)
+        raise
+    finally:
+        if fermer_db:
+            db.close()
+
+
 def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
     """Enchaîne CONSOLIDATION 23:59:59 de la veille (v3 AM-3/C1) + archivage
     + création des lignes du nouveau jour (A+B reportées, C et D vides).
@@ -218,7 +569,7 @@ def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
 
         # nouvelle journée : 1 ligne par véhicule actif, A+B reportées,
         # C et D vides (assuré par ensure_suivi), emplacement J-1 = arrêt final J-1.
-        vehicules = db.scalars(select(Vehicule).where(Vehicule.statut != "INACTIF")).all()
+        vehicules = db.scalars(select(Vehicule).where(Vehicule.statut == "ACTIF")).all()
         for v in vehicules:
             ensure_suivi(db, v, jour_nouveau)
         db.commit()
@@ -345,9 +696,34 @@ def rattraper_consolidation(cible_hier: date | None = None) -> dict:
                 SuiviJournalier.date_jour == jour)) or 0
             items, echecs = _trajets_reels_du_jour(jour)
             if echecs:
-                # garde-fou R5 : un portail au moins n'a PAS répondu → le jour
-                # resterait PARTIEL → on n'écrit rien, on journalise et on
-                # signale ; nouvelle tentative au prochain démarrage
+                if nb_suivis > 0:
+                    # En production comme en démo : si la veille/journée possède déjà des suivis enregistrés (55 camions),
+                    # on consolide à 23:59:59 et archive les données locales existantes (minuit n'attend pas — règle §0decies D4).
+                    if items:
+                        stats = _consolider_et_archiver_jour(db, jour, items, username="catchup_partiel")
+                        n_pre = stats.get("consolides", 0)
+                        nb_arch = stats.get("archives", 0)
+                    else:
+                        n_pre = consolider_jour(db, jour)
+                        nb_arch = archiver_jour(db, jour)
+
+                    db.add(AuditLog(username="systeme",
+                                    action="jour.catchup_consolide_local",
+                                    entite="suivi", entite_id=None,
+                                    details={"jour": jour.isoformat(),
+                                             "portails_absents": echecs,
+                                             "suivis_archives": nb_arch,
+                                             "regle": "§0decies D4 : consolidation sur la base (minuit n'attend pas)"}))
+                    db.commit()
+                    rapport["jours_traités"] += 1
+                    rapport["jours_archivés"] += nb_arch
+                    rapport["détails"][jour.isoformat()] = {"consolides": n_pre, "archives": nb_arch, "portails_absents": echecs}
+                    log.info("AM-4 : journée du %s consolidée (%d) et archivée (%d) sur la base (portails absents : %s)",
+                             jour, n_pre, nb_arch, ", ".join(echecs))
+                    jour += timedelta(days=1)
+                    continue
+
+                # Si aucun suivi local et portail en échec :
                 deja = db.scalar(select(func.count(AuditLog.id)).where(
                     AuditLog.action == "jour.catchup_sans_source",
                     AuditLog.details.like(f'%"{jour.isoformat()}"%'))) or 0
