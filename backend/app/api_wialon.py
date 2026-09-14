@@ -230,6 +230,13 @@ def item_depuis_ligne_rapport(nom_unite: str, cellules: list, col_map: dict[str,
         return None
 
     fin = _parse_instant(cellules[idx_fin]) if idx_fin < len(cellules) else None
+    if fin is not None and fin <= debut:
+        if (fin + timedelta(hours=3)) > debut and (fin + timedelta(hours=3) - debut).total_seconds() <= 43200:
+            fin = fin + timedelta(hours=3)
+        else:
+            log.warning("Wialon API : trajet ignoré pour %s car fin (%s) <= début (%s)", plaque, fin, debut)
+            return None
+
     dist_txt = _texte(cellules[idx_dist]) if idx_dist < len(cellules) else ""
     distance_km = _parse_distance(dist_txt)
 

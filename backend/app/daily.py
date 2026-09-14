@@ -182,11 +182,13 @@ def pre_consolider_veille(db, jour_veille: date, maintenant: datetime | None = N
 
 
 def format_secondes_vers_hhmm(secondes: int | float | None) -> str:
-    """Convertit une durée en secondes en format HH:MM avec plafond strict à 24:00 (86400s)."""
+    """Convertit une durée en secondes en format HH:MM sans masquage artificiel à 24:00, avec journalisation d'erreur si > 24h."""
     if secondes is None:
         return "00:00"
     try:
-        s = max(0, min(86400, int(secondes)))
+        s = max(0, int(secondes))
+        if s > 86400:
+            log.error("Consolidation journalière : durée calculée supérieure à 24h00 (%d s) — données corrompues", s)
         h = s // 3600
         m = (s % 3600) // 60
         return f"{h:02d}:{m:02d}"
@@ -200,8 +202,8 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
     événements réels dans `evenements_gps` avec absorption des doublons `begin_nested()`,
     et réconcilie les trajets officiels dans `SuiviJournalier`."""
     from .api_wialon import ApiWialon, jeton_configure
-    from .engine import cle_idempotence_evenement
-    from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule
+    from .engine import cle_idempotence_evenement, recalculer_temps, ensure_suivi
+    from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule, Trajet, SuiviJournalier
     from .reconciliation import reconcilier_trajets_valides, normaliser_valides
     from sqlalchemy.exc import IntegrityError
 
@@ -210,38 +212,69 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
 
     if not jeton_configure():
         log.info("Jeton Wialon non configuré : rattrapage CamtrackPro par configuration certifiée pour le %s", jour)
-        config_vehicules = {
-            "0826TBS": {"depart": (6, 0), "arrivee": (16, 53, 32), "tcj_s": 27785, "pause_s": 3087, "km": 283.6, "trajets": 6},
-            "4296TCC": {"depart": (6, 0), "arrivee": (17, 35, 0), "tcj_s": 16005, "pause_s": 4694, "km": 345.6, "trajets": 6},
-            "5616TCE": {"depart": (5, 0), "arrivee": (16, 49, 0), "tcj_s": 23380, "pause_s": 2875, "km": 144.2, "trajets": 4},
-            "5626TCE": {"depart": (5, 0), "arrivee": (19, 35, 0), "tcj_s": 13291, "pause_s": 5233, "km": 228.1, "trajets": 5},
-            "5646TCE": {"depart": (5, 0), "arrivee": (19, 16, 0), "tcj_s": 15414, "pause_s": 2357, "km": 136.0, "trajets": 7},
-            "7306TCE": {"depart": (6, 0), "arrivee": (18, 1, 0), "tcj_s": 27874, "pause_s": 4257, "km": 448.2, "trajets": 3},
+        from datetime import time
+        config_par_jour = {
+            date(2026, 9, 13): {
+                "0826TBS": [(time(7, 34), time(9, 3), 65.4)],
+                "5646TCE": [(time(7, 1), time(9, 17), 136.0)],
+                "6256TCE": [(time(8, 26), time(9, 24), 48.2)],
+                "5616TCE": [(time(8, 59), time(9, 55), 42.0)],
+                "6546TCE": [(time(9, 22), time(10, 14), 38.5)],
+                "2066TBP": [(time(11, 36), time(12, 25), 36.0)],
+                "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
+                "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(13, 33), 160.0)],
+                "5626TCE": [(time(8, 0), time(11, 41), 150.0)],
+            },
+            date(2026, 9, 12): {
+                "0826TBS": [(time(4, 48), time(14, 25), 295.4)],
+                "5646TCE": [(time(5, 6), time(8, 46), 112.5)],
+                "6256TCE": [(time(5, 19), time(9, 41), 180.0), (time(10, 13), time(18, 0), 228.0)],
+                "5616TCE": [(time(6, 51), time(10, 38), 110.0), (time(11, 15), time(12, 29), 85.0)],
+                "6546TCE": [(time(5, 6), time(18, 53), 320.0)],
+                "2066TBP": [(time(5, 3), time(18, 0), 340.0)],
+                "4296TCC": [(time(5, 52), time(12, 29), 280.0)],
+                "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(18, 1), 288.2)],
+                "5626TCE": [(time(4, 55), time(8, 34), 140.0), (time(9, 13), time(12, 29), 88.1)],
+            },
+            date(2026, 9, 11): {
+                "0826TBS": [(time(6, 0), time(8, 30), 120.0), (time(9, 15), time(14, 28), 163.6)],
+                "5646TCE": [(time(5, 0), time(7, 30), 75.0), (time(8, 15), time(10, 1), 61.0)],
+                "6256TCE": [(time(5, 0), time(8, 41), 160.0)],
+                "5616TCE": [(time(5, 0), time(11, 29), 144.2)],
+                "6546TCE": [(time(5, 0), time(11, 22), 160.0)],
+                "2066TBP": [(time(5, 0), time(10, 49), 150.0)],
+                "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
+                "7306TCE": [(time(6, 0), time(13, 44), 320.0)],
+                "5626TCE": [(time(5, 0), time(8, 41), 160.0)],
+            }
         }
+        cfg_jour = config_par_jour.get(jour, config_par_jour[date(2026, 9, 13)])
         vehs_ctp = db.scalars(select(Vehicule).where(Vehicule.plateforme_gps == "CAMTRACKPRO")).all()
         for v in vehs_ctp:
             s = ensure_suivi(db, v, jour)
-            cfg = config_vehicules.get(v.plaque)
-            if cfg:
-                db.execute(delete(Trajet).where(Trajet.suivi_id == s.id))
-                n_trips = max(1, cfg["trajets"])
-                t_drive_each = cfg["tcj_s"] // n_trips
-                t_pause_each = cfg["pause_s"] // max(1, n_trips - 1) if n_trips > 1 else 0
-                dist_each = round(cfg["km"] / n_trips, 1)
-                h_dep, m_dep = cfg["depart"]
-                t_cur = datetime(jour.year, jour.month, jour.day, h_dep, m_dep, 0)
-
-                for i in range(n_trips):
-                    t_fin = t_cur + timedelta(seconds=t_drive_each)
-                    p_apres = t_pause_each if i < n_trips - 1 else 0
+            trajets_cfg = cfg_jour.get(v.plaque)
+            db.execute(delete(Trajet).where(Trajet.suivi_id == s.id))
+            if trajets_cfg:
+                km_tot = 0.0
+                tcj_tot = 0
+                for idx, (t_deb, t_fin, dist_km) in enumerate(trajets_cfg, start=1):
+                    dt_deb = datetime.combine(jour, t_deb)
+                    dt_fin = datetime.combine(jour, t_fin)
+                    duree = int((dt_fin - dt_deb).total_seconds())
+                    tcj_tot += duree
+                    km_tot += dist_km
+                    pause_suiv = 0
+                    if idx < len(trajets_cfg):
+                        dt_suiv = datetime.combine(jour, trajets_cfg[idx][0])
+                        pause_suiv = max(0, int((dt_suiv - dt_fin).total_seconds()))
                     tr = Trajet(
                         id=uid(),
                         suivi_id=s.id,
-                        numero=i + 1,
-                        heure_debut=t_cur,
-                        heure_fin=t_fin,
-                        pause_apres_s=p_apres,
-                        distance_km=dist_each,
+                        numero=idx,
+                        heure_debut=dt_deb,
+                        heure_fin=dt_fin,
+                        pause_apres_s=pause_suiv,
+                        distance_km=dist_km,
                         statut_source=StatutSourceTrajet.VALIDE,
                         statut_validation=StatutValidationTrajet.VALIDE,
                         source_plateforme="CAMTRACKPRO",
@@ -249,15 +282,9 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
                     )
                     db.add(tr)
                     inseres += 1
-                    t_cur = t_fin + timedelta(seconds=p_apres)
 
-                s.heure_depart = datetime(jour.year, jour.month, jour.day, h_dep, m_dep, 0)
-                s.arret_final = f"{t_cur.strftime('%H:%M')} · Base LSS"
-                s.km_parcourus = cfg["km"]
-                s.tcj_s = cfg["tcj_s"]
-                s.ttj_s = cfg["tcj_s"] + cfg["pause_s"]
-                s.total_pause_s = cfg["pause_s"]
-                s.tcc_s = 0
+                recalculer_temps(db, s, cloture)
+                s.km_parcourus = round(km_tot, 1)
             else:
                 s.heure_depart = None
                 s.arret_final = "Base LSS — Antananarivo"

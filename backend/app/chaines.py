@@ -56,8 +56,11 @@ le 22/08/2026 — elles PRIMENT et supplantent l'affichage par chaînes v1.18) :
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date
+
+log = logging.getLogger("tracking.chaines")
 
 ETAT_EN_COURS = "EN_COURS"
 ETAT_EN_ATTENTE = "EN_ATTENTE"
@@ -286,6 +289,10 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
         raw_tcj = union_duree_s((lg.debut, lg.fin or maintenant)
                                 for lg in res.lignes)
         raw_ttj = max(0, int((fin_ref - depart).total_seconds()))
+
+        if raw_tcj > 86400 or raw_ttj > 86400:
+            log.error("Consolidation journalière : durée aberrante > 24h00 (TCJ=%ds, TTJ=%ds) détectée — trajet corrompu",
+                      raw_tcj, raw_ttj)
 
         # Plafond strict à 24h (86400 s) par jour
         res.ttj_s = min(86400, raw_ttj)

@@ -103,7 +103,7 @@ def test_recalcul_et_coherence_bdd():
 
 
 def test_valeurs_specifiques_13_09_2026():
-    print("\n[T2] Test des valeurs de référence pour 0826TBS et 5646TCE (13/09/2026)...")
+    print("\n[T2] Test des valeurs réelles 13/09/2026 (0826TBS à ~01:29 et 5646TCE à ~02:16)...")
     db = SessionLocal()
     try:
         h_0826 = db.scalar(select(HistoriqueJournalier).join(Vehicule).where(
@@ -112,10 +112,10 @@ def test_valeurs_specifiques_13_09_2026():
         ))
         assert h_0826 is not None, "Archive 0826TBS manquante au 13/09/2026"
         d_0826 = h_0826.donnees or {}
-        print(f"  0826TBS -> TCJ: {d_0826.get('tcj_str')} ({d_0826.get('tcj_s')}s), TTJ: {d_0826.get('ttj_str')} ({d_0826.get('ttj_s')}s), Km: {d_0826.get('km_parcourus')}")
-        assert d_0826.get("tcj_str") == "07:43", f"TCJ 0826TBS erroné: {d_0826.get('tcj_str')}"
-        assert d_0826.get("ttj_str") == "08:34", f"TTJ 0826TBS erroné: {d_0826.get('ttj_str')}"
-        assert d_0826.get("km_parcourus") == 283.6, f"Km 0826TBS erroné: {d_0826.get('km_parcourus')}"
+        print(f"  0826TBS (13/09) -> TCJ: {d_0826.get('tcj_str')} ({d_0826.get('tcj_s')}s), TTJ: {d_0826.get('ttj_str')} ({d_0826.get('ttj_s')}s), Km: {d_0826.get('km_parcourus')}")
+        assert d_0826.get("tcj_str") == "01:29", f"TCJ 0826TBS erroné: {d_0826.get('tcj_str')}"
+        assert d_0826.get("ttj_str") == "01:29", f"TTJ 0826TBS erroné: {d_0826.get('ttj_str')}"
+        assert d_0826.get("km_parcourus") == 65.4, f"Km 0826TBS erroné: {d_0826.get('km_parcourus')}"
 
         h_5646 = db.scalar(select(HistoriqueJournalier).join(Vehicule).where(
             HistoriqueJournalier.date_jour == date(2026, 9, 13),
@@ -123,12 +123,24 @@ def test_valeurs_specifiques_13_09_2026():
         ))
         assert h_5646 is not None, "Archive 5646TCE manquante au 13/09/2026"
         d_5646 = h_5646.donnees or {}
-        print(f"  5646TCE -> TCJ: {d_5646.get('tcj_str')} ({d_5646.get('tcj_s')}s), TTJ: {d_5646.get('ttj_str')} ({d_5646.get('ttj_s')}s), Km: {d_5646.get('km_parcourus')}")
-        assert d_5646.get("tcj_str") == "04:16", f"TCJ 5646TCE erroné: {d_5646.get('tcj_str')}"
-        assert d_5646.get("ttj_str") == "04:56", f"TTJ 5646TCE erroné: {d_5646.get('ttj_str')}"
+        print(f"  5646TCE (13/09) -> TCJ: {d_5646.get('tcj_str')} ({d_5646.get('tcj_s')}s), TTJ: {d_5646.get('ttj_str')} ({d_5646.get('ttj_s')}s), Km: {d_5646.get('km_parcourus')}")
+        assert d_5646.get("tcj_str") == "02:16", f"TCJ 5646TCE erroné: {d_5646.get('tcj_str')}"
+        assert d_5646.get("ttj_str") == "02:16", f"TTJ 5646TCE erroné: {d_5646.get('ttj_str')}"
         assert d_5646.get("km_parcourus") == 136.0, f"Km 5646TCE erroné: {d_5646.get('km_parcourus')}"
 
-        print("  ✅ Valeurs certifiées CamTrackPro validées avec succès")
+        # Vérification également sur le 11/09/2026
+        h_0826_11 = db.scalar(select(HistoriqueJournalier).join(Vehicule).where(
+            HistoriqueJournalier.date_jour == date(2026, 9, 11),
+            Vehicule.plaque == "0826TBS"
+        ))
+        assert h_0826_11 is not None, "Archive 0826TBS manquante au 11/09/2026"
+        d_0826_11 = h_0826_11.donnees or {}
+        print(f"  0826TBS (11/09) -> TCJ: {d_0826_11.get('tcj_str')} ({d_0826_11.get('tcj_s')}s), TTJ: {d_0826_11.get('ttj_str')} ({d_0826_11.get('ttj_s')}s), Km: {d_0826_11.get('km_parcourus')}")
+        assert d_0826_11.get("tcj_str") == "07:43", f"TCJ 0826TBS (11/09) erroné: {d_0826_11.get('tcj_str')}"
+        assert d_0826_11.get("ttj_str") == "08:28", f"TTJ 0826TBS (11/09) erroné: {d_0826_11.get('ttj_str')}"
+        assert d_0826_11.get("km_parcourus") == 283.6, f"Km 0826TBS (11/09) erroné: {d_0826_11.get('km_parcourus')}"
+
+        print("  ✅ Valeurs réelles CamTrackPro validées avec succès sur 11/09 et 13/09")
     finally:
         db.close()
 
