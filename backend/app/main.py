@@ -899,10 +899,15 @@ async def websocket_endpoint(websocket: WebSocket):
 class SPAStaticFiles(StaticFiles):
     """Sert le build React et renvoie index.html pour les routes inconnues hors API."""
     async def get_response(self, path: str, scope):
+        if path.startswith("api/") or path.startswith("api") or path.startswith("ws"):
+            raise StarletteHTTPException(status_code=404, detail="Not Found")
         try:
-            return await super().get_response(path, scope)
+            response = await super().get_response(path, scope)
+            if response.status_code == 404:
+                return await super().get_response("index.html", scope)
+            return response
         except StarletteHTTPException as e:
-            if e.status_code == 404 and not path.startswith("api/") and not path.startswith("api"):
+            if e.status_code == 404:
                 return await super().get_response("index.html", scope)
             raise
 
