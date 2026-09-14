@@ -2118,12 +2118,16 @@ def _collecter_n2_camtrackpro(jours: list | None = None) -> tuple:
     if jeton_configure():
         try:
             c = CamtrackProTrajetsApiCollector()
-            return c.collecter_valides(jours), list(c.recensement or [])
+            try:
+                valides = c.collecter_valides(jours)
+            except TypeError:
+                valides = c.collecter_valides()
+            return valides, list(c.recensement or [])
         except Exception:
             log.exception("CamtrackPro API (rapport trajets) en échec")
-            if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "0") != "1":
+            if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "1") != "1":
                 return [], []
-    if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "0") == "1":
+    if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "1") == "1":
         c = CamtrackProTrajetsCollector()
         return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
     return [], []

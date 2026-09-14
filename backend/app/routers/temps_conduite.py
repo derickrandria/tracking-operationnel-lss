@@ -470,52 +470,29 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                 else:
                     merged_spans.append([deb, fin])
 
-        # Recherche du dernier reset :
-        # Période continue de repos >= 24h (86 400 s) sans aucun trajet valide.
-        # Règle réglementaire TCH : un cycle hebdomadaire court sur 6 périodes de conduite max
-        # (plafonné à 7 jours glissants).
-        dernier_reset_debut: datetime | None = None
-        date_dernier_reset_str: str | None = None
-        tch_cumul_s = 0
-
-        # Borne réglementaire hebdomadaire (au plus 6 jours avant aujourd'hui)
+        # Borne réglementaire hebdomadaire (6 jours précédents + aujourd'hui, soit 7 jours glissants)
         borne_hebdo_date = jour_courant - timedelta(days=6)
 
-        if not merged_spans:
-            dernier_reset_debut = None
-            date_dernier_reset_str = None
-            tch_cumul_s = 0
-        else:
-            dernier_fin = merged_spans[-1][1]
-            repos_depuis_fin = (maintenant - dernier_fin).total_seconds()
+        # Détection du dernier reset 24h (repos continu >= 24h / 86400s sans trajet valide)
+        date_dernier_reset = borne_hebdo_date
+        if merged_spans:
+            for idx in range(len(merged_spans) - 1, 0, -1):
+                fin_prec = merged_spans[idx - 1][1]
+                deb_suiv = merged_spans[idx][0]
+                repos_s = (deb_suiv - fin_prec).total_seconds()
+                if repos_s >= SEUIL_RESET_REPOS_S:
+                    date_dernier_reset = deb_suiv.date()
+                    break
 
-            if repos_depuis_fin >= SEUIL_RESET_REPOS_S:
-                # Le chauffeur est au repos depuis plus de 24h jusqu'à maintenant :
-                # Son TCH actif est remis à 0.
-                dernier_reset_debut = None
-                date_dernier_reset_str = dernier_fin.isoformat()
-                tch_cumul_s = 0
-            else:
-                # Recherche de la dernière coupure >= 24h en remontant la chaîne
-                dernier_reset_debut = merged_spans[0][0]
-                date_dernier_reset_str = merged_spans[0][0].isoformat()
+        debut_cycle_tch = max(date_dernier_reset, borne_hebdo_date)
 
-                for i in range(len(merged_spans) - 1, 0, -1):
-                    gap = (merged_spans[i][0] - merged_spans[i - 1][1]).total_seconds()
-                    if gap >= SEUIL_RESET_REPOS_S:
-                        dernier_reset_debut = merged_spans[i][0]
-                        date_dernier_reset_str = merged_spans[i][0].isoformat()
-                        break
+        # Somme directe et robuste des TCJ sur la fenêtre active sans écraser ni échouer sur 0h
+        tch_cumul_s = 0
+        for j_date, j_info in jours_dict.items():
+            if debut_cycle_tch <= j_date <= jour_courant:
+                tch_cumul_s += int(j_info.get("tcj_s") or 0)
 
-                # Borne de début de calcul : la plus récente entre le dernier reset 24h et le début du cycle hebdo (J-6)
-                date_effective_debut = max(dernier_reset_debut.date(), borne_hebdo_date)
-
-                # Somme des TCJ pour les journées à partir de la borne effective
-                for j_date, j_info in jours_dict.items():
-                    if j_date >= date_effective_debut and j_date <= jour_courant:
-                        tch_cumul_s += int(j_info["tcj_s"] or 0)
-
-        tch_restant_s = SEUIL_TCH_MAX_S - tch_cumul_s
+        tch_restant_s = max(0, SEUIL_TCH_MAX_S - tch_cumul_s)
 
         if tch_cumul_s >= SEUIL_TCH_MAX_S:
             alerte_statut = "LIMITE_ATTEINTE"
@@ -528,13 +505,13 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         hist_grid = {}
         for d in dates_fenetre:
             d_str = d.isoformat()
+            inclus = (debut_cycle_tch <= d <= jour_courant)
             if d in jours_dict:
                 j_info = jours_dict[d]
-                inclus = (dernier_reset_debut is not None and d >= max(dernier_reset_debut.date(), borne_hebdo_date) and d <= jour_courant)
                 hist_grid[d_str] = {
-                    "tcj_s": j_info["tcj_s"],
-                    "ttj_s": j_info["ttj_s"],
-                    "vehicules": sorted(list(j_info["vehicules"])),
+                    "tcj_s": int(j_info.get("tcj_s") or 0),
+                    "ttj_s": int(j_info.get("ttj_s") or 0),
+                    "vehicules": sorted(list(j_info.get("vehicules") or set())),
                     "inclus_dans_tch": inclus,
                     "en_cours": j_info.get("en_cours", False),
                 }
@@ -543,7 +520,7 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
                     "tcj_s": 0,
                     "ttj_s": 0,
                     "vehicules": [],
-                    "inclus_dans_tch": False,
+                    "inclus_dans_tch": inclus,
                     "en_cours": False,
                 }
 
@@ -551,6 +528,8 @@ def extraire_donnees_chauffeurs(db: Session, debut_fenetre: date, fin_fenetre: d
         vehicules_actifs = sorted(list(
             jours_dict.get(jour_courant, {}).get("vehicules", set())
         ))
+
+        date_dernier_reset_str = debut_cycle_tch.isoformat()
 
         resultats_lignes.append({
             "conducteur_id": cond.id,

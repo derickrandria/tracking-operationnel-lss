@@ -517,16 +517,21 @@ async def _boucle_reconciliation_reelle():
 async def _am4_puis_reparation_v130():
     """Chaîne de fond du démarrage (dans cette order) :
     1. v3 AM-4 — catch-up des jours non consolidés (données réelles portails) ;
-    2. §0decies D1/D3 (24/08/2026) — réparation embarquée des journées abîmées
+    2. Boot Catch-up 7 jours glissants (rattrapage samedi/dimanche et jours incomplets) ;
+    3. §0decies D1/D3 (24/08/2026) — réparation embarquée des journées abîmées
        par l'ancienne bascule 01h00 : contrôle 19/08→veille, réparation des
        seules journées à écart, une fois, avec reprise au boot suivant ;
-    3. §0undecies E5 (24/08/2026) — rattrapage UNIQUE de la colonne J-1 du
+    4. §0undecies E5 (24/08/2026) — rattrapage UNIQUE de la colonne J-1 du
        jour courant (libellé de la dernière position GPS de la veille)."""
     from . import reparation
     try:
         await asyncio.to_thread(daily.rattraper_consolidation)
     except Exception:
         log.exception("AM-4 : échec (la réparation v1.30 tente quand même)")
+    try:
+        await asyncio.to_thread(rattraper_7_derniers_jours)
+    except Exception:
+        log.exception("Boot Catch-up (7 derniers jours) en échec")
     try:
         await asyncio.to_thread(reparation.executer_reparation_v130)
     except Exception:
@@ -559,6 +564,54 @@ async def _am4_puis_reparation_v130():
     except Exception:
         log.exception("v146 : réparation fins incohérentes en échec — reprise "
                       "au prochain démarrage")
+
+
+def rattraper_7_derniers_jours():
+    """Boot Catch-up au démarrage : boucle sur les 7 derniers jours civils glissants (J-7 -> J-1).
+    Vérifie l'existence et la complétude des archives dans HistoriqueJournalier (y compris samedi/dimanche).
+    Pour chaque jour manquant ou incomplet, relance la collecte N1 (CamTrackPro, MZoneX, Ym@ne)
+    puis recalcule et fige l'archive avec recalculer_archives_journee."""
+    from datetime import date, timedelta
+    from .config import now_local, jour_attribution
+    from .database import SessionLocal
+    from .models import HistoriqueJournalier, Vehicule
+    from .daily import recalculer_archives_journee
+
+    db = SessionLocal()
+    try:
+        aujour = jour_attribution(now_local())
+        nb_vehs = db.scalar(select(func.count(Vehicule.id))) or 0
+        seuil_archive_complete = max(1, nb_vehs - 5) if nb_vehs > 0 else 1
+
+        for offset in range(7, 0, -1):
+            jour_cible = aujour - timedelta(days=offset)
+            nb_arch = db.scalar(select(func.count(HistoriqueJournalier.id)).where(
+                HistoriqueJournalier.date_jour == jour_cible
+            )) or 0
+
+            # Si le jour est manquant ou incomplet dans HistoriqueJournalier (ex: samedi, dimanche, jour off)
+            if nb_arch < seuil_archive_complete:
+                log.info("Boot Catch-up: Journée du %s incomplète (%d/%d archives) — lancement de la récupération...",
+                         jour_cible.isoformat(), nb_arch, nb_vehs)
+
+                # 1. Collecte Ym@ne pour ce jour
+                try:
+                    from .ymane_import import importer_infractions_ymane
+                    importer_infractions_ymane(db, debut=jour_cible, fin=jour_cible)
+                except Exception as e:
+                    log.warning("Boot Catch-up Ym@ne pour %s : %s", jour_cible, e)
+
+                # 2. Collecte et recalcul de l'archive (CamTrackPro / MZoneX)
+                try:
+                    res_recalc = recalculer_archives_journee(jour_cible, db=db)
+                    log.info("Boot Catch-up: Journée du %s rattrapée avec succès (%s)",
+                             jour_cible.isoformat(), res_recalc)
+                except Exception as e:
+                    log.warning("Boot Catch-up: Échec recalcul archive pour %s : %s", jour_cible, e)
+    except Exception:
+        log.exception("Boot Catch-up: Erreur globale lors du rattrapage des 7 derniers jours")
+    finally:
+        db.close()
 
 
 def _rattrapage_j1():

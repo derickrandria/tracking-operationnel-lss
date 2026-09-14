@@ -37,6 +37,7 @@ import os
 import threading
 import urllib.parse
 from datetime import datetime, timedelta, timezone
+import time
 import httpx
 
 from .config import TZ, plaque_depuis_libelle_portail
@@ -398,7 +399,10 @@ class ApiWialon:
         fin_epoch = int(fin_loc.replace(tzinfo=TZ).astimezone(
             timezone.utc).timestamp())
         items: list[dict] = []
-        for u in self.unites():
+        unites_list = self.unites()
+        log.info("CamtrackPro API : %d unités détectées pour le rapport trajets (%s, timestamps UTC: %d -> %d)",
+                 len(unites_list), jour, debut_epoch, fin_epoch)
+        for u in unites_list:
             nom, uid = u.get("nm", ""), u.get("id")
             if not plaque_unite(nom) or uid is None:
                 continue
@@ -415,6 +419,7 @@ class ApiWialon:
                 continue
 
             try:
+                log.info("CamtrackPro API: Exécution rapport trajets pour « %s » (uid=%s)...", nom, uid)
                 r = self._appel("report/exec_report", {
                     "reportResourceId": rid, "reportTemplateId": gid,
                     "reportTemplate": None, "reportObjectId": uid,
@@ -423,10 +428,12 @@ class ApiWialon:
                                  "flags": 0}})
                 tables = (r.get("reportResult") or {}).get("tables", [])
                 if not tables:
+                    log.info("CamtrackPro API : aucune table dans le résultat du rapport pour « %s »", nom)
                     continue
                 headers = tables[0].get("header") or []
                 col_map = detecter_colonnes_wialon(headers)
                 n_lig = int(tables[0].get("rows") or 0)
+                log.info("CamtrackPro API : rapport « %s » -> %d ligne(s) détectée(s)", nom, n_lig)
                 if n_lig <= 0:
                     continue
                 lignes = self._appel("report/get_result_rows", {
@@ -441,8 +448,98 @@ class ApiWialon:
                     log.info("CamtrackPro API (rapport trajets) « %s » : "
                              "%d trajet(s)", nom, len(bruts))
             except (TimeoutError, ErreurApiWialon) as exc:
-                log.warning("CamtrackPro API : rapport « %s » allégé / timeout évité (%s) — position temps réel conservée",
-                            nom, exc)
+                log.warning("CamtrackPro API : rapport « %s » en erreur ou timeout (%s)", nom, exc)
         log.info("CamtrackPro API (rapport trajets) : %d trajet(s) officiel(s)",
                  len(items))
         return items
+
+    def messages_du_jour(self, jour, fin_locale: datetime | None = None) -> dict[str, list[dict]]:
+        """Historique brut des messages GPS (Niveau 1) du jour pour toute la flotte CamtrackPro.
+        Utilise svc=messages/load_interval et svc=messages/get_messages.
+        Retourne {plaque: [ {plaque, horodatage, lat, lng, vitesse, etat_moteur, type_evenement}, ... ]}."""
+        self._exiger_session()
+        debut_local = datetime(jour.year, jour.month, jour.day, 0, 0, 0)
+        debut_epoch = int(debut_local.replace(tzinfo=TZ).astimezone(timezone.utc).timestamp())
+        fin_loc = fin_locale or datetime(jour.year, jour.month, jour.day, 23, 59, 59)
+        fin_epoch = int(fin_loc.replace(tzinfo=TZ).astimezone(timezone.utc).timestamp())
+
+        resultats: dict[str, list[dict]] = {}
+        unites_list = self.unites()
+        log.info("CamtrackPro API : %d unités détectées pour messages_du_jour (%s, timestamps UTC: %d -> %d)",
+                 len(unites_list), jour, debut_epoch, fin_epoch)
+        for u in unites_list:
+            nom, uid = u.get("nm", ""), u.get("id")
+            plaque = plaque_unite(nom)
+            if not plaque or uid is None:
+                continue
+
+            try:
+                log.info("CamtrackPro API: Requête messages/load_interval pour %s (id=%s) [%d -> %d]...",
+                         plaque, uid, debut_epoch, fin_epoch)
+                r = self._appel("messages/load_interval", {
+                    "itemId": int(uid),
+                    "timeFrom": debut_epoch,
+                    "timeTo": fin_epoch,
+                    "flags": 0,
+                    "flagsMask": 0xFF00,
+                    "loadCount": 0xFFFFFFFF
+                })
+                total = int((r or {}).get("count", 0) or 0)
+                msgs = (r or {}).get("messages") or []
+                log.info("CamtrackPro API: Réponse Wialon pour %s -> total=%d, messages_inline=%d",
+                         plaque, total, len(msgs))
+
+                # Si messages non retournés directement en inline mais count > 0, on pagine avec messages/get_messages
+                if not msgs and total > 0:
+                    saute = 0
+                    page_size = 2000
+                    while saute < total:
+                        lot = self._appel("messages/get_messages", {
+                            "indexFrom": saute,
+                            "indexTo": min(total, saute + page_size)
+                        })
+                        page_msgs = lot if isinstance(lot, list) else (lot.get("messages", []) if isinstance(lot, dict) else [])
+                        if not page_msgs:
+                            break
+                        msgs.extend(page_msgs)
+                        saute += page_size
+                        time.sleep(0.05)
+
+                points_unite: list[dict] = []
+                for m in msgs:
+                    if not isinstance(m, dict):
+                        continue
+                    pos = m.get("pos")
+                    if not pos or pos.get("y") is None or pos.get("x") is None:
+                        continue
+                    t_epoch = int(m.get("t", 0))
+                    if t_epoch <= 0:
+                        continue
+                    ts = datetime.fromtimestamp(t_epoch, tz=timezone.utc).astimezone(TZ).replace(tzinfo=None)
+                    lat = float(pos["y"])
+                    lng = float(pos["x"])
+                    vitesse = max(0.0, float(pos.get("s") or 0.0))
+                    p_params = m.get("p") if isinstance(m.get("p"), dict) else {}
+                    acc = p_params.get("acc", 1 if vitesse > 0 else 0)
+                    etat_moteur = "ON" if (vitesse > 0 or acc == 1) else "OFF"
+
+                    points_unite.append({
+                        "plaque": plaque,
+                        "horodatage": ts,
+                        "lat": lat,
+                        "lng": lng,
+                        "vitesse": vitesse,
+                        "etat_moteur": etat_moteur,
+                        "type_evenement": "POSITION" if vitesse > 0 else "ARRET"
+                    })
+
+                if points_unite:
+                    resultats[plaque] = points_unite
+                    log.info("CamtrackPro API (messages) « %s » : %d point(s) GPS extraits", plaque, len(points_unite))
+                else:
+                    log.warning("CamtrackPro API (messages) « %s » : 0 point GPS trouvé sur la plage [%s -> %s]",
+                                plaque, debut_local, fin_loc)
+            except Exception as exc:
+                log.error("CamtrackPro API : échec extraction messages « %s » (id=%s) : %s", nom, uid, exc, exc_info=True)
+
+        return resultats
