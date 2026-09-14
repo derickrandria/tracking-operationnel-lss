@@ -8,10 +8,9 @@ backend/data/
 sauvegardes/
 archive/
 
-# Node & Build
+# Node (garder frontend/dist pour le déploiement direct sans compilation)
 node_modules/
-dist/
-frontend/dist/
+frontend/node_modules/
 
 # Divers
 .env
