@@ -137,9 +137,12 @@ def journee_suivi(s: SuiviJournalier, seuils: dict | None = None,
     OFFICIELLE — jamais de PROVISOIRE dans l'historique."""
     seuils = seuils or {}
     maintenant = maintenant or now_local()
+    if s.date_jour and maintenant.date() > s.date_jour:
+        maintenant = datetime.combine(s.date_jour, datetime.max.time().replace(microsecond=0))
     roule, fin_sub = etat_roulage(s.vehicule, maintenant, seuils)
     journee = construire_journee(
         _segments_de(s), maintenant=maintenant,
+        date_jour=s.date_jour,
         pause_min=float(seuils.get("DUREE_MIN_PAUSE_VALIDE", 1200)),
         seuil_km=float(seuils.get("SEUIL_DISTANCE_MIN_TRAJET_KM", 0.3)),
         roule=roule, fin_substitution=fin_sub,
@@ -322,10 +325,12 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
     if ttj_max <= 24:
         ttj_max *= 3600
 
-    tcj_val = journee.tcj_s if (journee and journee.tcj_s is not None) else (s.tcj_s or 0)
-    ttj_val = journee.ttj_s if (journee and journee.ttj_s is not None) else (s.ttj_s or 0)
-    tcc_val = s.tcc_s or 0
-    pause_val = journee.total_pause_s if (journee and journee.total_pause_s is not None) else (s.total_pause_s or 0)
+    tcj_val = min(86400, max(0, journee.tcj_s if (journee and journee.tcj_s is not None) else (s.tcj_s or 0)))
+    ttj_val = min(86400, max(0, journee.ttj_s if (journee and journee.ttj_s is not None) else (s.ttj_s or 0)))
+    if ttj_val < tcj_val:
+        ttj_val = tcj_val
+    tcc_val = min(86400, max(0, s.tcc_s or 0))
+    pause_val = max(0, ttj_val - tcj_val)
 
     return {
         "id": s.id,

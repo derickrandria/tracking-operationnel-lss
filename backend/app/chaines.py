@@ -162,6 +162,7 @@ def _fin_effective(seg: Segment, vivant_possible: bool, roule: bool,
 
 
 def construire_journee(segments: list[Segment], *, maintenant: datetime,
+                       date_jour: date | None = None,
                        pause_min: float = 1200, seuil_km: float = 0.3,
                        roule: bool = False,
                        fin_substitution: datetime | None = None,
@@ -182,28 +183,64 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     if not segs:
         return res
 
-    # ---- 0 · hygiène des segments OUVERTS (heure_fin NULL) : inchangée —
-    # seul l'ouvert le plus récent peut être vivant ; les débris ouverts
-    # antérieurs sont écartés de l'affichage (l'enregistrement reste en base).
-    debut_max = max((s.debut for s in segs if not s.rejete), default=None)
-    if debut_max is None:
-        return res                        # que des manœuvres : aucune ligne
+    # Détermination de la date cible pour le bornage strict 00:00:00 - 23:59:59
+    if date_jour is not None:
+        target_date = date_jour
+    else:
+        valid_dates = [s.debut.date() for s in segs if s.debut and not s.rejete]
+        if valid_dates:
+            target_date = max(valid_dates)
+        else:
+            target_date = maintenant.date()
 
-    # Borne temporelle stricte : si tous les segments sont d'un jour passé (J < maintenant.date()),
-    # le calcul ne doit JAMAIS déborder sur le lendemain (plafond à J 23:59:59).
-    jour_max_segs = max(s.debut.date() for s in segs if s.debut)
-    if maintenant.date() > jour_max_segs:
-        maintenant = datetime.combine(jour_max_segs, datetime.max.time().replace(microsecond=0))
+    debut_jour = datetime.combine(target_date, datetime.min.time())
+    fin_jour = datetime.combine(target_date, datetime.max.time().replace(microsecond=0))
+
+    if maintenant.date() > target_date:
+        maintenant = fin_jour
         est_jour_passe = True
+        roule = False
     else:
         est_jour_passe = False
 
-    segs = [s for s in segs if not (s.fin is None and s.debut < debut_max)]
-    segs.sort(key=lambda s: (s.debut, s.fin or datetime.max))
+    # Filtrage et découpage strict des segments dans la fenêtre de la journée cible [00:00:00 -> 23:59:59]
+    segs_filtres: list[Segment] = []
+    for s in segs:
+        if s.debut is None:
+            continue
+        # Segment entièrement en dehors de la journée
+        if s.fin is not None and s.fin <= debut_jour:
+            continue
+        if s.debut > fin_jour:
+            continue
+
+        # Bornage au jour
+        deb_borne = max(s.debut, debut_jour)
+        fin_borne = min(s.fin, fin_jour) if s.fin is not None else (fin_jour if est_jour_passe else None)
+        if fin_borne is not None and fin_borne < deb_borne:
+            continue
+
+        segs_filtres.append(Segment(
+            debut=deb_borne,
+            fin=fin_borne,
+            distance_km=s.distance_km,
+            rejete=s.rejete,
+            ref=s.ref
+        ))
+
+    if not segs_filtres:
+        return res
+
+    debut_max = max((s.debut for s in segs_filtres if not s.rejete), default=None)
+    if debut_max is None:
+        return res                        # que des manœuvres : aucune ligne
+
+    segs_filtres = [s for s in segs_filtres if not (s.fin is None and s.debut < debut_max)]
+    segs_filtres.sort(key=lambda s: (s.debut, s.fin or datetime.max))
 
     # ---- 1 · lignes = segments non rejetés (AM-2 : aucune fusion) ; une
     # ligne OUVERTE toujours affichée (v1.16 : verdict manœuvre à la clôture)
-    for s in segs:
+    for s in segs_filtres:
         if s.rejete:
             continue
         fin_s = _fin_effective(s, vivant_possible=((s.debut >= debut_max) and not est_jour_passe),
@@ -246,8 +283,12 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     if res.lignes:
         depart = res.lignes[0].debut
         fin_ref = max(lg.fin or maintenant for lg in res.lignes)
-        res.tcj_s = union_duree_s((lg.debut, lg.fin or maintenant)
-                                  for lg in res.lignes)
-        res.ttj_s = max(0, int((fin_ref - depart).total_seconds()))
+        raw_tcj = union_duree_s((lg.debut, lg.fin or maintenant)
+                                for lg in res.lignes)
+        raw_ttj = max(0, int((fin_ref - depart).total_seconds()))
+
+        # Plafond strict à 24h (86400 s) par jour
+        res.ttj_s = min(86400, raw_ttj)
+        res.tcj_s = min(res.ttj_s, raw_tcj)
         res.total_pause_s = max(0, res.ttj_s - res.tcj_s)
     return res

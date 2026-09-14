@@ -249,8 +249,12 @@ def seed_si_vide():
                     c = v.conducteur_actuel
                     tcj = rng.randint(3 * 3600, 8 * 3600 + 1800)
                     pauses = rng.randint(1800, 5400)
+                    ttj = min(86400, tcj + pauses)
                     dep = datetime.combine(jour, datetime.min.time()).replace(hour=rng.randint(5, 7))
                     nb_inf = rng.choices([0, 1, 2], weights=[70, 22, 8])[0]
+                    tcj_str = f"{tcj // 3600:02d}:{(tcj % 3600) // 60:02d}"
+                    ttj_str = f"{ttj // 3600:02d}:{(ttj % 3600) // 60:02d}"
+                    pause_str = f"{pauses // 3600:02d}:{(pauses % 3600) // 60:02d}"
                     db.add(HistoriqueJournalier(
                         date_jour=jour, annee=jour.year, mois=jour.month,
                         vehicule_id=v.id, conducteur_id=c.id if c else None,
@@ -264,10 +268,15 @@ def seed_si_vide():
                             "numero_ot": None,
                             "heure_depart": dep.isoformat(),
                             "arret_final": f"{rng.randint(15, 19):02d}:{rng.randint(0, 59):02d} · Base LSS — Antananarivo",
-                            "tcc_s": rng.randint(3600, 3 * 3600), "tcj_s": tcj,
-                            "ttj_s": tcj + pauses, "total_pause_s": pauses,
+                            "tcc_s": 0, "tcc_secondes": 0, "tcc_str": "00:00",
+                            "tcj_s": tcj, "tcj_secondes": tcj, "tcj_str": tcj_str,
+                            "ttj_s": ttj, "ttj_secondes": ttj, "ttj_str": ttj_str,
+                            "total_pause_s": pauses, "pauses_secondes": pauses, "total_pause_str": pause_str,
                             "km_parcourus": round(rng.uniform(120, 480), 1),
                             "nb_trajets": rng.randint(3, 7), "trajets": [],
+                            "flag_tcj": bool(tcj > 36000),
+                            "flag_ttj": bool(ttj > 43200),
+                            "flag_tcc": False,
                         },
                         nb_infractions=nb_inf, nb_alertes=rng.randint(0, 3)))
                     for _ in range(nb_inf):

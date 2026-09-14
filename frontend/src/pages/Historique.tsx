@@ -17,7 +17,7 @@ import { Badge, Btn, Card, Spinner, Vide } from "../components/ui";
 import { addToast } from "../components/toast";
 import Infractions from "./Infractions";
 import Alertes from "./Alertes";
-import { cls, fmtDateFr, fmtDuree, fmtHeure, todayISO } from "../utils";
+import { cls, fmtDateFr, fmtDuree, fmtHeure, parseDureeEnSecondes, todayISO } from "../utils";
 
 const CLE_MODE = "lss_suivi_mode_detail";
 
@@ -374,6 +374,10 @@ export default function Historique() {
                     {data.items.map((h: any) => {
                       const relais = extraireConducteursRelaisHist(h);
                       const nomPrincipal = h.conducteur?.prenom_usuel || h.conducteur?.nom_prenom;
+                      const tcjSec = parseDureeEnSecondes(h.tcj_s ?? h.donnees?.tcj_s);
+                      const ttjSec = parseDureeEnSecondes(h.ttj_s ?? h.donnees?.ttj_s);
+                      const depasseTcj = tcjSec > 36000;
+                      const depasseTtj = ttjSec > 43200;
                       return (
                       <tr key={h.id} className="cursor-pointer"
                         title="Voir la grille complète de cette journée (identique au Suivi Journalier)"
@@ -401,8 +405,12 @@ export default function Historique() {
                         <td>{h.depot_recepteur || "—"}</td>
                         <td>{h.produit || "—"}</td>
                         <td className="tabular-nums">{fmtHeure(h.heure_depart)}</td>
-                        <td className="tabular-nums">{fmtDuree(h.tcj_s)}</td>
-                        <td className="tabular-nums">{fmtDuree(h.ttj_s)}</td>
+                        <td className={cls("tabular-nums font-semibold", depasseTcj ? "text-red-600 dark:text-red-400 font-bold" : "")}>
+                          {fmtDuree(tcjSec, true)}
+                        </td>
+                        <td className={cls("tabular-nums font-semibold", depasseTtj ? "text-red-600 dark:text-red-400 font-bold" : "")}>
+                          {fmtDuree(ttjSec, true)}
+                        </td>
                         <td className="tabular-nums">
                           {h.nb_trajets || "—"}
                           {h.nb_trajets > 9 && (

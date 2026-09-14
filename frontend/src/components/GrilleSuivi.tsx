@@ -47,11 +47,14 @@ function CellText({ valeur, onChange, className, placeholder, disabled }: {
   );
 }
 
-function Temps({ secondes, depasse }: { secondes: number; depasse?: boolean }) {
-  if (!secondes) return <span className="text-slate-400">—</span>;
+function Temps({ secondes, depasse }: { secondes: number | string | null | undefined; depasse?: boolean }) {
+  if (secondes === null || secondes === undefined) return <span className="text-slate-400">—</span>;
+  const sNum = typeof secondes === "number" ? secondes : (Number(secondes) || 0);
+  if (!sNum) return <span className="text-slate-400">—</span>;
+  const isDepasse = Boolean(depasse || sNum > 36000);
   return (
-    <span className={cls("font-bold tabular-nums", depasse ? "text-red-500" : "text-slate-700 dark:text-slate-200")}>
-      {fmtDuree(secondes)}
+    <span className={cls("font-bold tabular-nums", isDepasse ? "text-red-500 font-extrabold" : "text-slate-700 dark:text-slate-200")}>
+      {fmtDuree(sNum, true)}
     </span>
   );
 }

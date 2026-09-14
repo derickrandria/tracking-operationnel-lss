@@ -3,14 +3,35 @@
 export const cls = (...parts: (string | false | null | undefined)[]) =>
   parts.filter(Boolean).join(" ");
 
-/** 16200 -> "4h30" ; 720 -> "12 min" */
-export function fmtDuree(s: number | null | undefined): string {
-  /** Durée au format H:MM (Addendum v1.8 §CA-6) : 1500 → « 0:25 »,
-   *  16200 → « 4:30 » ; les HEURES restent en HH:MM (fmtHeure). */
+export function parseDureeEnSecondes(val: number | string | null | undefined): number {
+  if (val === null || val === undefined) return 0;
+  if (typeof val === "number") return isNaN(val) ? 0 : Math.round(val);
+  const s = String(val).trim();
+  if (!s || s === "—") return 0;
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  const m = s.match(/^(-)?(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?$/);
+  if (m) {
+    const neg = Boolean(m[1]);
+    const h = parseInt(m[2], 10) || 0;
+    const min = parseInt(m[3], 10) || 0;
+    const sec = parseInt(m[4] || "0", 10) || 0;
+    const total = h * 3600 + min * 60 + sec;
+    return neg ? -total : total;
+  }
+  const n = Number(s);
+  return isNaN(n) ? 0 : Math.round(n);
+}
+
+/** Durée au format H:MM (ex: 1500 -> "0:25", 27785 -> "7:43") */
+export function fmtDuree(s: number | string | null | undefined, max24h: boolean = false): string {
   if (s === null || s === undefined) return "—";
-  const neg = s < 0;
-  const v = Math.abs(Math.round(s));
-  if (v < 60) return `${neg ? "-" : ""}0:${String(v).padStart(2, "0")}`;
+  let sec = parseDureeEnSecondes(s);
+  if (sec === 0 && (s === null || s === undefined || s === "")) return "—";
+  if (max24h) {
+    sec = Math.min(86400, Math.max(0, sec));
+  }
+  const neg = sec < 0;
+  const v = Math.abs(sec);
   const h = Math.floor(v / 3600);
   const m = Math.floor((v % 3600) / 60);
   return `${neg ? "-" : ""}${h}:${String(m).padStart(2, "0")}`;

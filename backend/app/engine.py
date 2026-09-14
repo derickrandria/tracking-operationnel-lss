@@ -353,6 +353,11 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
     pause_min = float(seuils["DUREE_MIN_PAUSE_VALIDE"])
     pause_tcc = float(seuils.get("SEUIL_PAUSE_COUPURE_TCC", 1800))
     seuil_km = float(seuils.get("SEUIL_DISTANCE_MIN_TRAJET_KM", 0.3))
+
+    # Isolation stricte de la date passée
+    if suivi.date_jour and maintenant.date() > suivi.date_jour:
+        maintenant = datetime.combine(suivi.date_jour, datetime.max.time().replace(microsecond=0))
+
     # requête EXPLICITE (session longue, expire_on_commit=False : la collection
     # suivi.trajets peut être périmée — le calcul réglementaire exige l'état
     # courant de la base, y compris juste après fusions/rejets v1.5)
@@ -372,7 +377,9 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
                  for t in tous if t.heure_debut is not None]
     journee = construire_journee(
         segs_tous,
-        maintenant=maintenant, pause_min=pause_min, seuil_km=seuil_km,
+        maintenant=maintenant,
+        date_jour=suivi.date_jour,
+        pause_min=pause_min, seuil_km=seuil_km,
         roule=roule, fin_substitution=fin_sub,
         pause_affichee_min=pause_tcc)
 
@@ -382,9 +389,9 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
         return
 
     suivi.heure_depart = journee.lignes[0].debut      # AM-6 : 1er mouvement valide
-    suivi.tcj_s = journee.tcj_s                        # AM-1/§0duodecies F1 : UNION
-    suivi.ttj_s = journee.ttj_s                        # T1 : amplitude brute
-    suivi.total_pause_s = journee.total_pause_s        # Σ de TOUS les arrêts
+    suivi.tcj_s = min(86400, max(0, journee.tcj_s))   # AM-1/§0duodecies F1 : UNION (plafond 24h)
+    suivi.ttj_s = min(86400, max(0, journee.ttj_s))   # T1 : amplitude brute (plafond 24h)
+    suivi.total_pause_s = max(0, suivi.ttj_s - suivi.tcj_s) # Σ de TOUS les arrêts
 
     # §0duodecies F1 (arbitrage LSS 25/08/2026) — journal de transparence :
     # si des lignes se RECOUVRENT (Σ durées > union), la garde F1 a évité un
