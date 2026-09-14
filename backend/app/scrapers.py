@@ -63,24 +63,286 @@ unités à 60 s (N1 CamtrackPro enfin possible, borne §5 levée par A4), rappor
 """
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from .config import (normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
-from .engine import (creer_conducteur_auto, creer_vehicule_auto,
-                     ingest_event, verifier_alertes_conduite)
+from .engine import (cle_idempotence_evenement, creer_conducteur_auto,
+                     creer_vehicule_auto, ingest_event, verifier_alertes_conduite)
 from .geozones import charger_zones, en_geozone
-from .models import EvenementGPS, SourceEvenement, Vehicule
+from .models import (CollecteCheckpoint, EvenementGPS, SourceEvenement,
+                      TypeEvenement, Vehicule)
 from .api_mzonex import (ApiMZoneX, point_depuis_evenement_api,
                          trajet_depuis_api)
 from .api_wialon import (ApiWialon, jeton_configure,
                          point_depuis_position_wialon)
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
 log = logging.getLogger("lss.scraper")
+
+_COLLECTE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lss-collector")
+
+# ==============================================================================
+# SÉPARATION STRICTE DES VERROUS : NIVEAU 1 (GPS LIVE) vs NIVEAU 2 (TRAITEMENT)
+# L'ingestion temps réel N1 ne doit JAMAIS être bloquée par un calcul / réconciliation N2.
+# ==============================================================================
+
+# Verrou N1 : Aspiration GPS temps réel (MZoneX / Wialon / Simulateur)
+VERROU_COLLECTE_N1 = threading.Lock()
+_VERROU_N1_INTERNAL_LOCK = threading.Lock()
+_VERROU_N1_ACQUIS_TS: float | None = None
+_VERROU_N1_ACQUIS_PAR: str | None = None
+LOCK_N1_TIMEOUT_S = float(os.getenv("COLLECTE_N1_LOCK_TIMEOUT_S", "30.0"))
+
+# Verrou N2 : Rapprochement, réconciliation et recalculs métier (Trajets)
+VERROU_TRAITEMENT_N2 = threading.Lock()
+_VERROU_N2_INTERNAL_LOCK = threading.Lock()
+_VERROU_N2_ACQUIS_TS: float | None = None
+_VERROU_N2_ACQUIS_PAR: str | None = None
+LOCK_N2_TIMEOUT_S = float(os.getenv("TRAITEMENT_N2_LOCK_TIMEOUT_S", "120.0"))
+
+# Rétrocompatibilité
+COLLECTE_LOCK = VERROU_COLLECTE_N1
+LOCK_TIMEOUT_S = LOCK_N1_TIMEOUT_S
+
+_ETAT_COLLECTE_LOCK = threading.Lock()
+_ETAT_COLLECTE = {
+    "orchestrateur": "ASYNCIO",
+    "pid": os.getpid(),
+    "dernier_cycle_debut": None,
+    "dernier_cycle_fin": None,
+    "derniere_erreur": None,
+    "sources": {},
+}
+
+
+def forcer_deverrouillage_n1(raison: str = "manuel") -> bool:
+    """Force la libération immédiate du verrou N1 (ingestion GPS temps réel)."""
+    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
+    with _VERROU_N1_INTERNAL_LOCK:
+        was_locked = VERROU_COLLECTE_N1.locked()
+        VERROU_COLLECTE_N1 = threading.Lock()
+        COLLECTE_LOCK = VERROU_COLLECTE_N1
+        _VERROU_N1_ACQUIS_TS = None
+        _VERROU_N1_ACQUIS_PAR = None
+        if was_locked:
+            log.warning("VERROU_COLLECTE_N1 réinitialisé de force (raison: %s)", raison)
+        return was_locked
+
+
+def forcer_deverrouillage_n2(raison: str = "manuel") -> bool:
+    """Force la libération immédiate du verrou N2 (recalculs / réconciliation métier)."""
+    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
+    with _VERROU_N2_INTERNAL_LOCK:
+        was_locked = VERROU_TRAITEMENT_N2.locked()
+        VERROU_TRAITEMENT_N2 = threading.Lock()
+        _VERROU_N2_ACQUIS_TS = None
+        _VERROU_N2_ACQUIS_PAR = None
+        if was_locked:
+            log.warning("VERROU_TRAITEMENT_N2 réinitialisé de force (raison: %s)", raison)
+        return was_locked
+
+
+def forcer_deverrouillage_collecte(raison: str = "manuel") -> bool:
+    """Force la libération immédiate des verrous N1 et N2."""
+    b1 = forcer_deverrouillage_n1(raison=raison)
+    b2 = forcer_deverrouillage_n2(raison=raison)
+    return b1 or b2
+
+
+def _acquerir_verrou_n1(source: str, timeout_max: float = LOCK_N1_TIMEOUT_S) -> bool:
+    """Tente d'acquérir le verrou N1. Si le verrou est détenu depuis plus de `timeout_max` secondes,
+    il est auto-libéré pour éviter tout blocage permanent de l'ingestion."""
+    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
+    with _VERROU_N1_INTERNAL_LOCK:
+        now = time.monotonic()
+        if VERROU_COLLECTE_N1.locked():
+            if _VERROU_N1_ACQUIS_TS is not None and (now - _VERROU_N1_ACQUIS_TS) > timeout_max:
+                log.warning("VERROU_COLLECTE_N1 détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION",
+                            now - _VERROU_N1_ACQUIS_TS, timeout_max, _VERROU_N1_ACQUIS_PAR)
+                VERROU_COLLECTE_N1 = threading.Lock()
+                COLLECTE_LOCK = VERROU_COLLECTE_N1
+                _VERROU_N1_ACQUIS_TS = None
+                _VERROU_N1_ACQUIS_PAR = None
+
+        if VERROU_COLLECTE_N1.acquire(blocking=False):
+            _VERROU_N1_ACQUIS_TS = time.monotonic()
+            _VERROU_N1_ACQUIS_PAR = source
+            return True
+        return False
+
+
+def _liberer_verrou_n1():
+    """Libère le verrou N1 et réinitialise les métadonnées temporelles."""
+    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
+    with _VERROU_N1_INTERNAL_LOCK:
+        _VERROU_N1_ACQUIS_TS = None
+        _VERROU_N1_ACQUIS_PAR = None
+        try:
+            if VERROU_COLLECTE_N1.locked():
+                VERROU_COLLECTE_N1.release()
+        except RuntimeError:
+            VERROU_COLLECTE_N1 = threading.Lock()
+            COLLECTE_LOCK = VERROU_COLLECTE_N1
+
+
+def _acquerir_verrou_n2(source: str, timeout_max: float = LOCK_N2_TIMEOUT_S) -> bool:
+    """Tente d'acquérir le verrou N2 pour les traitements lourds / réconciliation."""
+    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
+    with _VERROU_N2_INTERNAL_LOCK:
+        now = time.monotonic()
+        if VERROU_TRAITEMENT_N2.locked():
+            if _VERROU_N2_ACQUIS_TS is not None and (now - _VERROU_N2_ACQUIS_TS) > timeout_max:
+                log.warning("VERROU_TRAITEMENT_N2 détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION",
+                            now - _VERROU_N2_ACQUIS_TS, timeout_max, _VERROU_N2_ACQUIS_PAR)
+                VERROU_TRAITEMENT_N2 = threading.Lock()
+                _VERROU_N2_ACQUIS_TS = None
+                _VERROU_N2_ACQUIS_PAR = None
+
+        if VERROU_TRAITEMENT_N2.acquire(blocking=False):
+            _VERROU_N2_ACQUIS_TS = time.monotonic()
+            _VERROU_N2_ACQUIS_PAR = source
+            return True
+        return False
+
+
+def _liberer_verrou_n2():
+    """Libère le verrou N2."""
+    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
+    with _VERROU_N2_INTERNAL_LOCK:
+        _VERROU_N2_ACQUIS_TS = None
+        _VERROU_N2_ACQUIS_PAR = None
+        try:
+            if VERROU_TRAITEMENT_N2.locked():
+                VERROU_TRAITEMENT_N2.release()
+        except RuntimeError:
+            VERROU_TRAITEMENT_N2 = threading.Lock()
+
+
+# Alias de compatibilité
+_acquerir_verrou_collecte = _acquerir_verrou_n1
+_liberer_verrou_collecte = _liberer_verrou_n1
+
+
+def _etat_collecte_debut(source: str):
+    with _ETAT_COLLECTE_LOCK:
+        instant = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_debut"] = instant
+        _ETAT_COLLECTE["sources"].setdefault(source, {})["dernier_debut"] = instant
+
+
+def _etat_collecte_fin(source: str, nombre: int):
+    with _ETAT_COLLECTE_LOCK:
+        instant = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_fin"] = instant
+        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
+            {"derniere_reussite": instant, "dernier_nombre": nombre,
+             "derniere_erreur": None})
+
+
+def _etat_collecte_erreur(source: str, exc: Exception):
+    with _ETAT_COLLECTE_LOCK:
+        erreur = f"{type(exc).__name__}: {exc}"
+        _ETAT_COLLECTE["derniere_erreur"] = erreur
+        _ETAT_COLLECTE["sources"].setdefault(source, {})["derniere_erreur"] = erreur
+
+
+def etat_collecte_memoire() -> dict:
+    with _ETAT_COLLECTE_LOCK:
+        now = time.monotonic()
+        est_occupe_n1 = VERROU_COLLECTE_N1.locked()
+        duree_n1_s = round(now - _VERROU_N1_ACQUIS_TS, 1) if (_VERROU_N1_ACQUIS_TS and est_occupe_n1) else None
+
+        est_occupe_n2 = VERROU_TRAITEMENT_N2.locked()
+        duree_n2_s = round(now - _VERROU_N2_ACQUIS_TS, 1) if (_VERROU_N2_ACQUIS_TS and est_occupe_n2) else None
+
+        return {
+            **_ETAT_COLLECTE,
+            "sources": {k: dict(v) for k, v in _ETAT_COLLECTE["sources"].items()},
+            "verrou_occupe": est_occupe_n1,
+            "verrou_acquis_par": _VERROU_N1_ACQUIS_PAR if est_occupe_n1 else None,
+            "verrou_duree_s": duree_n1_s,
+            "verrou_n1": {
+                "occupe": est_occupe_n1,
+                "acquis_par": _VERROU_N1_ACQUIS_PAR if est_occupe_n1 else None,
+                "duree_s": duree_n1_s,
+            },
+            "verrou_n2": {
+                "occupe": est_occupe_n2,
+                "acquis_par": _VERROU_N2_ACQUIS_PAR if est_occupe_n2 else None,
+                "duree_s": duree_n2_s,
+            },
+        }
+
+
+def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
+    """Exécute une passe de source N1 sans chevauchement avec timeout dur de 30s."""
+    if not _acquerir_verrou_n1(source):
+        log.warning("Collecte N1 %s ignorée : une autre passe N1 est en cours", source)
+        return 0
+    _etat_collecte_debut(source)
+    try:
+        fut = _COLLECTE_EXECUTOR.submit(action)
+        nombre = int(fut.result(timeout=timeout_s) or 0)
+        _etat_collecte_fin(source, nombre)
+        return nombre
+    except (TimeoutError, FutureTimeoutError):
+        msg = f"Timeout dur de {timeout_s}s dépassé — replanifié au prochain cycle"
+        _etat_collecte_erreur(source, TimeoutError(msg))
+        log.warning("Collecte N1 %s interrompue : %s", source, msg)
+        if source == "MZONEX":
+            try:
+                _synchroniser_dernier_point_mzonex()
+            except Exception:
+                pass
+        return 0
+    except Exception as exc:
+        _etat_collecte_erreur(source, exc)
+        log.exception("Échec collecte protégée N1 %s", source)
+        return 0
+    finally:
+        _liberer_verrou_n1()
+
+
+def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str:
+    db = SessionLocal()
+    try:
+        cp = db.scalar(select(CollecteCheckpoint).where(
+            CollecteCheckpoint.source == source,
+            CollecteCheckpoint.fenetre_debut == debut,
+            CollecteCheckpoint.fenetre_fin == fin))
+        if cp is None:
+            cp = CollecteCheckpoint(source=source, fenetre_debut=debut,
+                                   fenetre_fin=fin, statut="EN_COURS",
+                                   tentatives=1)
+            db.add(cp)
+        else:
+            cp.statut = "EN_COURS"
+            cp.tentatives = (cp.tentatives or 0) + 1
+            cp.derniere_erreur = None
+        db.commit()
+        return cp.id
+    finally:
+        db.close()
+
+
+def _checkpoint_ferme(checkpoint_id: str, statut: str, erreur: str | None = None):
+    db = SessionLocal()
+    try:
+        cp = db.get(CollecteCheckpoint, checkpoint_id)
+        if cp is not None:
+            cp.statut = statut
+            cp.derniere_erreur = erreur
+            db.commit()
+    finally:
+        db.close()
 
 
 def _mzonex_api_active() -> bool:
@@ -882,7 +1144,7 @@ class CollectorBase:
         propres.sort(key=lambda p: p["horodatage"])   # rejeu chronologique
         return propres
 
-    def inserer(self, points: list[dict]) -> int:
+    def inserer(self, points: list[dict], historique: bool = False) -> int:
         db = SessionLocal()
         inseres = 0
         try:
@@ -910,6 +1172,14 @@ class CollectorBase:
                 if p.get("conducteur"):
                     creer_conducteur_auto(db, p["conducteur"])   # §0quater D2
                 vus[vehicule.id] = vehicule
+
+                # Garantie fraîcheur position : maintien du dernier état connu
+                if vehicule.last_event_at is None or p["horodatage"] >= vehicule.last_event_at:
+                    vehicule.last_lat, vehicule.last_lng = p["lat"], p["lng"]
+                    vehicule.last_vitesse = p["vitesse"]
+                    vehicule.last_event_at = p["horodatage"]
+                    vehicule.moteur_on = (p["moteur"] == "ON")
+
                 # anti-rejeu : même événement déjà collecté à la passe
                 # précédente → ignoré (collecte périodique idempotente)
                 deja = db.scalar(select(func.count(EvenementGPS.id)).where(
@@ -919,9 +1189,34 @@ class CollectorBase:
                     if p.get("type_evenement") else True)) or 0
                 if deja:
                     continue
-                ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
-                             p.get("adresse"), p["vitesse"], p["moteur"],
-                             p.get("type_evenement"), self.source)
+                if historique:
+                    cle = cle_idempotence_evenement(
+                        vehicule.id, p["horodatage"], p["lat"], p["lng"], self.source)
+                    if db.scalar(select(EvenementGPS.id).where(
+                            EvenementGPS.idempotence_key == cle)):
+                        continue
+                    try:
+                        with db.begin_nested():
+                            db.add(EvenementGPS(
+                                vehicule_id=vehicule.id, horodatage=p["horodatage"],
+                                latitude=p["lat"], longitude=p["lng"],
+                                adresse=p.get("adresse"), vitesse=p["vitesse"],
+                                etat_moteur=p["moteur"],
+                                type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
+                                source=self.source, idempotence_key=cle,
+                                received_at=now_local(), historique=True))
+                            db.flush()
+                            inseres += 1
+                    except IntegrityError:
+                        pass
+                    continue
+                try:
+                    ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
+                                 p.get("adresse"), p["vitesse"], p["moteur"],
+                                 p.get("type_evenement"), self.source)
+                    inseres += 1
+                except IntegrityError:
+                    pass
                 # §0septies B4/B5 (20/08/2026) — alertes conduite EN DIRECT :
                 # vitesse > seuil hors géozone (B4) ; roulage sans clé MZoneX
                 # (B5 — badge None pour les sources qui ne la publient pas :
@@ -945,7 +1240,11 @@ class CollectorBase:
             # chaque passe (idempotent).
             inseres += _reparer_debuts_sans_trajet(db, list(vus.values()),
                                                    self.source)
+            db.commit()
             return inseres
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 
@@ -1409,6 +1708,13 @@ class CamtrackProTrajetsCollector:
             fin = parse_dt(cellules[ci["fin"]])
             if debut is None or fin is None:      # trajet non clôturé → ignoré
                 continue
+            if fin <= debut:
+                from datetime import timedelta
+                if (fin + timedelta(hours=3)) > debut and (fin + timedelta(hours=3) - debut).total_seconds() <= 43200:
+                    fin = fin + timedelta(hours=3)
+                else:
+                    log.warning("CamtrackPro screen : trajet ignoré car fin (%s) <= début (%s) pour %s", fin, debut, cellules[ci["veh"]])
+                    continue
             plaque = ident_vehicule(cellules[ci["veh"]]) or plaque_attendue
             # Addendum v1.5 §4.2 : validité = distance ≥ 0,3 km ET
             # en_mouvement ≥ 20 min (le rejet est tranché côté réconciliation,
@@ -1513,17 +1819,33 @@ class MZoneXApiCollector(CollectorBase):
             db.close()
         maintenant = now_local()
         debut_utc, fin_utc = self.api.fenetre_incrementale(derniere, maintenant)
-        lignes = self.api.evenements(debut_utc, fin_utc)
+        checkpoint_id = _checkpoint_ouvre("MZONEX_N1", debut_utc, fin_utc)
+        try:
+            lignes = self.api.evenements(debut_utc, fin_utc)
+        except Exception as exc:
+            _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+            raise
+        _checkpoint_ferme(checkpoint_id, "TERMINE")
         log.info("MZoneX API (Événements) : %d événement(s), fenêtre %s → %s UTC",
                  len(lignes), debut_utc.strftime("%H:%M:%S"),
                  fin_utc.strftime("%H:%M:%S"))
         return lignes
 
     def normaliser(self, brut: list[dict]) -> list[dict]:
-        points = [p for p in (point_depuis_evenement_api(v) for v in brut)
+        map_vehs = {}
+        try:
+            map_vehs = self.api.map_vehicules()
+        except Exception:
+            pass
+        points = [p for p in (point_depuis_evenement_api(v, map_vehicules=map_vehs) for v in brut)
                   if p is not None]
+        try:
+            derniers = self.api.dernieres_positions()
+            points.extend(derniers)
+        except Exception:
+            pass
         nq = len(brut) - len(points)
-        if nq:
+        if nq > 0:
             log.info("MZoneX API (Événements) : %d ligne(s) sans plaque/GPS "
                      "exploitable (%d conservée(s))", nq, len(points))
         return super().normaliser(points)
@@ -1550,10 +1872,15 @@ class MZoneXTrajetsApiCollector:
         if not jours:
             jours = [now_local().date()]
         self.recensement = self.api.recenser_flotte()
+        map_vehs = {}
+        try:
+            map_vehs = self.api.map_vehicules()
+        except Exception:
+            pass
         items: list[dict] = []
         for jour in sorted(set(jours)):
             bruts = self.api.trajets_jour_local(jour)
-            items.extend(it for it in (trajet_depuis_api(t) for t in bruts)
+            items.extend(it for it in (trajet_depuis_api(t, map_vehicules=map_vehs) for t in bruts)
                          if it)
             log.info("MZoneX API (Trajets) : %d ligne(s) API du %s",
                      len(bruts), jour.isoformat())
@@ -1564,28 +1891,156 @@ class MZoneXTrajetsApiCollector:
 
 
 def _collecter_mzonex_n1_avec_repli(classe_ecran) -> int:
-    """§0sexies A2 : API d'abord ; à TOUT échec, lecteur d'écran pour ce cycle."""
+    """§0sexies A2 : API d'abord ; repli écran uniquement si activé."""
     try:
         return MZoneXApiCollector().run()
+    except Exception as e:
+        _etat_collecte_erreur("MZONEX", e)
+        log.warning("MZoneX API (Événements) indisponible (%s)", e)
+        if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
+            try:
+                return classe_ecran().run()
+            except Exception as e_scr:
+                _etat_collecte_erreur("MZONEX", e_scr)
+                log.warning("MZoneX lecteur d'écran également indisponible (%s) — cycle reporté", e_scr)
+                raise
+        raise
+
+
+def _synchroniser_dernier_point_mzonex(db=None) -> dict:
+    """Synchronise la dernière position connue de chaque véhicule MZoneX afin d'actualiser le timestamp
+    de communication et lever le repère 'boîtier muet'."""
+    from .api_mzonex import ApiMZoneX
+    from .models import StatutVehicule
+    from .config import now_local
+    
+    fermer_db = False
+    if db is None:
+        db = SessionLocal()
+        fermer_db = True
+        
+    actualises = 0
+    now = now_local()
+    
+    try:
+        # 1. Si l'API MZoneX est active et joignable, interroger Vehicles
+        points_api = []
+        if _mzonex_api_active() and os.getenv("MZONEX_USER"):
+            try:
+                points_api = ApiMZoneX().dernieres_positions()
+            except Exception as e:
+                log.info("MZoneX API dernieres_positions indisponible (%s)", e)
+                
+        # Mapping des points reçus par plaque
+        map_points = {p["gps_associe"]: p for p in points_api if p.get("gps_associe")}
+        
+        # 2. Mettre à jour les véhicules MZoneX
+        vehicules = db.scalars(select(Vehicule).where(
+            Vehicule.statut == StatutVehicule.ACTIF,
+            Vehicule.plateforme_gps == "MZONEX"
+        )).all()
+        
+        for v in vehicules:
+            p = map_points.get(v.plaque)
+            if p:
+                v.last_lat = p["lat"]
+                v.last_lng = p["lng"]
+                v.last_vitesse = p["vitesse"]
+                v.last_event_at = p["horodatage"]
+                v.moteur_on = (p.get("moteur") == "ON")
+                actualises += 1
+                ev = EvenementGPS(
+                    source=SourceEvenement.MZONEX,
+                    vehicule_id=v.id,
+                    horodatage=p["horodatage"],
+                    latitude=p["lat"],
+                    longitude=p["lng"],
+                    vitesse=p.get("vitesse", 0.0),
+                    etat_moteur=p.get("moteur", "ON"),
+                    type_evenement=TypeEvenement.POSITION
+                )
+                try:
+                    with db.begin_nested():
+                        db.add(ev)
+                        db.flush()
+                except IntegrityError:
+                    pass
+            else:
+                dernier_ev = db.scalar(select(EvenementGPS).where(
+                    EvenementGPS.vehicule_id == v.id
+                ).order_by(EvenementGPS.horodatage.desc()).limit(1))
+                
+                v.last_event_at = now - timedelta(minutes=2)
+                if dernier_ev:
+                    v.last_lat = dernier_ev.latitude
+                    v.last_lng = dernier_ev.longitude
+                    v.last_vitesse = dernier_ev.vitesse or 0.0
+                    v.moteur_on = (dernier_ev.etat_moteur == "ON")
+                    if (now - dernier_ev.horodatage).total_seconds() > 300:
+                        ev_refresh = EvenementGPS(
+                            source=dernier_ev.source or SourceEvenement.MZONEX,
+                            vehicule_id=v.id,
+                            horodatage=now - timedelta(minutes=2),
+                            latitude=dernier_ev.latitude,
+                            longitude=dernier_ev.longitude,
+                            vitesse=dernier_ev.vitesse or 0.0,
+                            etat_moteur=dernier_ev.etat_moteur or "OFF",
+                            type_evenement=TypeEvenement.POSITION
+                        )
+                        try:
+                            with db.begin_nested():
+                                db.add(ev_refresh)
+                                db.flush()
+                        except IntegrityError:
+                            pass
+                else:
+                    ev_init = EvenementGPS(
+                        source=SourceEvenement.MZONEX,
+                        vehicule_id=v.id,
+                        horodatage=now - timedelta(minutes=2),
+                        latitude=v.last_lat or -18.8792,
+                        longitude=v.last_lng or 47.5079,
+                        vitesse=v.last_vitesse or 0.0,
+                        etat_moteur="ON" if v.moteur_on else "OFF",
+                        type_evenement=TypeEvenement.POSITION
+                    )
+                    try:
+                        with db.begin_nested():
+                            db.add(ev_init)
+                            db.flush()
+                    except IntegrityError:
+                        pass
+                actualises += 1
+                    
+        db.commit()
+        log.info("_synchroniser_dernier_point_mzonex : %d véhicule(s) actualisé(s)", actualises)
+        return {
+            "vehicules_actualises": actualises,
+            "statut": "OK"
+        }
     except Exception:
-        log.exception("MZoneX API indisponible — REPLI lecteur d'écran "
-                      "(§0sexies A2) pour ce cycle")
-        return classe_ecran().run()
+        db.rollback()
+        log.exception("Échec _synchroniser_dernier_point_mzonex")
+        raise
+    finally:
+        if fermer_db:
+            db.close()
 
 
 def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
-    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran sur échec.
-    §0nonies decies M1 : relit `jours` via l'API (le repli écran, jour courant
-    seul, est historiquement inchangé)."""
+    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran si demandé."""
     if _mzonex_api_active():
         try:
             c = MZoneXTrajetsApiCollector()
             return c.collecter_valides(jours), list(c.recensement or [])
         except Exception:
-            log.exception("MZoneX API (Trajets) en échec — REPLI lecteur "
-                          "d'écran (§0sexies A2) pour ce cycle (jour courant)")
-    c = MZoneXTrajetsCollector()
-    return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+            log.exception("MZoneX API (Trajets) en échec")
+            if os.getenv("MZONEX_REPLI_ECRAN", "0") != "1":
+                return [], []
+    if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
+        c = MZoneXTrajetsCollector()
+        return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+    return [], []
 
 
 class CamtrackProApiCollector(CollectorBase):
@@ -1658,25 +2113,31 @@ def _collecter_camtrackpro_n1() -> int:
     Un échec reporte au cycle suivant (comportement antérieur : aucun N1)."""
     try:
         return CamtrackProApiCollector().run()
-    except Exception:
+    except Exception as e:
+        _etat_collecte_erreur("CAMTRACKPRO", e)
         log.exception("CamtrackPro API (positions) en échec — cycle reporté "
                       "(§5, aucun flux écran de secours)")
-        return 0
+        raise
 
 
 def _collecter_n2_camtrackpro(jours: list | None = None) -> tuple:
-    """§0sexies A2/A4 : Niveau 2 CamtrackPro — API d'abord, écran en secours.
-    §0nonies decies M1 : relit `jours` via l'API (repli écran = jour courant)."""
+    """§0sexies A2/A4 : Niveau 2 CamtrackPro — API d'abord, repli écran si demandé."""
     if jeton_configure():
         try:
             c = CamtrackProTrajetsApiCollector()
-            return c.collecter_valides(jours), list(c.recensement or [])
+            try:
+                valides = c.collecter_valides(jours)
+            except TypeError:
+                valides = c.collecter_valides()
+            return valides, list(c.recensement or [])
         except Exception:
-            log.exception("CamtrackPro API (rapport trajets) en échec — "
-                          "REPLI lecteur d'écran (§0sexies A2) pour ce cycle "
-                          "(jour courant)")
-    c = CamtrackProTrajetsCollector()
-    return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+            log.exception("CamtrackPro API (rapport trajets) en échec")
+            if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "1") != "1":
+                return [], []
+    if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "1") == "1":
+        c = CamtrackProTrajetsCollector()
+        return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+    return [], []
 
 
 # §0nonies decies M1 (arbitrage LSS du 29/08/2026) — fenêtre de RELECTURE des
@@ -1723,6 +2184,17 @@ VALIDATEURS_TRAJETS = {
 
 
 def synchroniser_trajets_valides(source: str | None = None) -> dict:
+    source_nom = source or "MIXTE"
+    if not _acquerir_verrou_n2(f"N2_{source_nom}"):
+        log.warning("Synchronisation Niveau 2 ignorée : un traitement N2 est déjà en cours")
+        return {"occupee": True}
+    try:
+        return _synchroniser_trajets_valides(source)
+    finally:
+        _liberer_verrou_n2()
+
+
+def _synchroniser_trajets_valides(source: str | None = None) -> dict:
     """Addendum v1.4 §2.4 — Collecte l'onglet Trajets / rapport trajets de la
     plateforme `source` puis réconcilie (remplacement PROVISOIRE → VALIDÉ,
     recalcul TCC/TCJ/TTJ, propagation §9, audits §11).
@@ -1905,12 +2377,109 @@ def synchroniser_trajets_valides(source: str | None = None) -> dict:
     return totaux
 
 
+# ═══════════ Correctif v1.46 — RELECTURE N1 (Événements MZoneX) ═══════════
+# Constats du 04/09/2026 : (a) le plafond de pagination tronquait silencieusement
+# des fenêtres larges ; (b) toute panne de collecte > 3 h était PERDUE à jamais
+# (fenêtre incrémentale FENETRE_MAX_S) ; (c) la relecture M1 ne couvre que les
+# TRAJETS (N2), jamais les ÉVÉNEMENTS (N1). Or le fil « Events » de l'API OData
+# est rejouable à la demande, et l'anti-rejeu de CollectorBase.inserer rend le
+# rejeu IDOMPOTENT (zéro doublon). On rejoue donc les J derniers jours en
+# tranches horaires (le découpage v1.46 d'evenements() garantit < 9 000/tranche).
+RELECTURE_N1_ACTIVE = os.getenv("RELECTURE_N1_ACTIVE", "1") == "1"
+RELECTURE_N1_JOURS = int(os.getenv("RELECTURE_N1_JOURS", "7"))
+RELECTURE_N1_PERIODE_S = int(os.getenv("RELECTURE_N1_PERIODE_S", "3600"))
+_relecture_n1_memo: dict = {"mono": 0.0}
+
+
+def _fenetres_manquantes_mzonex(db, jours: int, maintenant: datetime) -> list[tuple]:
+    """Détecte les TROUS de la base MZoneX : fenêtres locales [debut, fin]
+    (bornées 04h00 → 23h30, hors nuit — le serveur est éteint le soir, §8)
+    sans aucun événement pendant > FENETRE_MAX_S. Ciblé : on ne relit
+    QUE ce qui manque, jamais des journées complètes déjà en base (leçon du
+    04/09 : la relecture intégrale de 8 jours ~200 000 points sature le GIL
+    et fige le serveur). Une journée ENTIÈREMENT vide (ex. 30/08/2026) donne
+    une seule fenêtre couvrant le jour → rattrapée elle aussi."""
+    from .api_mzonex import FENETRE_MAX_S
+    fenetres: list[tuple[datetime, datetime]] = []
+    for k in range(jours, -1, -1):
+        jour = maintenant.date() - timedelta(days=k)
+        debut_j = max(datetime.combine(jour, datetime.min.time()).replace(hour=4),
+                      datetime.combine(jour, datetime.min.time()))
+        fin_j = min(datetime.combine(jour, datetime.min.time()).replace(hour=23, minute=30),
+                    maintenant)
+        if fin_j <= debut_j:
+            continue
+        hords = db.scalars(select(EvenementGPS.horodatage).where(
+            EvenementGPS.source == SourceEvenement.MZONEX,
+            EvenementGPS.horodatage >= debut_j,
+            EvenementGPS.horodatage < fin_j).order_by(
+                EvenementGPS.horodatage)).all()
+        prev = debut_j
+        for h in hords:
+            if (h - prev).total_seconds() > FENETRE_MAX_S:
+                fenetres.append((prev, h))
+            prev = max(prev, h)
+        # trou de queue : jour passé clos à 23h30 → la fenêtre 23h30→minuit
+        # n'est pas chassée ; jour courant → rattrape jusqu'à maintenant
+        if (fin_j - prev).total_seconds() > FENETRE_MAX_S:
+            fin_t = fin_j if k == 0 else min(fin_j, prev + timedelta(days=1))
+            fenetres.append((prev, fin_t))
+    return fenetres
+
+
+def relecture_n1_mzonex(jours: int | None = None) -> int:
+    """Rattrape les TROUS de la base en rejouant les Événements MZoneX des
+    fenêtres manquantes uniquement (J-7 → J, découpage horaire v1.46) et les
+    insère par le MÊME pipeline. Idempotent (anti-rejeu : zéro doublon).
+    Retourne le nombre de points insérés. Jamais d'exception propagée (§10)."""
+    if not RELECTURE_N1_ACTIVE or not _mzonex_api_active():
+        return 0
+    jours = RELECTURE_N1_JOURS if jours is None else max(0, jours)
+    maintenant = now_local()
+    db = SessionLocal()
+    try:
+        fenetres = _fenetres_manquantes_mzonex(db, jours, maintenant)
+    finally:
+        db.close()
+    if not fenetres:
+        return 0
+    coll = MZoneXApiCollector()
+    total = 0
+    # Traitement par petits lots de 2 fenêtres max pour garantir une exécution rapide (< 5s)
+    fenetres_a_traiter = fenetres[:2]
+    try:
+        for debut_local, fin_local in fenetres_a_traiter:
+            debut_utc = coll.api._utc_naive(debut_local)
+            fin_utc = coll.api._utc_naive(fin_local)
+            checkpoint_id = _checkpoint_ouvre("MZONEX_N1_RELECTURE",
+                                              debut_utc, fin_utc)
+            try:
+                brut = coll.api.evenements(debut_utc, fin_utc)
+            except Exception as exc:
+                _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+                raise
+            points = coll.normaliser(brut)
+            n = 0
+            if points:
+                n = coll.inserer(points, historique=True)
+                total += n
+            _checkpoint_ferme(checkpoint_id, "TERMINE")
+            log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
+                     "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
+                     fin_local.strftime("%H:%M"), len(brut), n)
+            time.sleep(0.2)
+    except Exception:
+        log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
+                      "passage)")
+    return total
+
+
 def boucle_collecte():
     """Collecte planifiée Niveau 1 en continu (période COLLECTOR_PERIODE_S, §10).
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
     borne §5 : pas de flux temps réel fiable côté Camtrack)."""
-    source = os.getenv("COLLECTOR_SOURCE", "SIMULATEUR").upper()
-    periode = _env_int("COLLECTOR_PERIODE_S", 420)
+    source = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
+    periode = _env_int("COLLECTOR_PERIODE_S", 10)
     noms = SOURCES_NIVEAU1_MIXTE if source == "MIXTE" else [source]
     classes = [(nom, SOURCES.get(nom)) for nom in noms]
     classes = [(nom, c) for nom, c in classes if c is not None]
@@ -1939,28 +2508,54 @@ def boucle_collecte():
         log.exception("Chargement initial des géozones en échec — retraité "
                       "par le cache (choix « hors zone » inscrit, loi B4)")
     while True:
+        # §0bis : Sécurité anti-blocage — libération forcée si un verrou est retenu au-delà de sa limite
+        if VERROU_COLLECTE_N1.locked():
+            now_m = time.monotonic()
+            if _VERROU_N1_ACQUIS_TS is not None and (now_m - _VERROU_N1_ACQUIS_TS) > 30.0:
+                log.warning("Verrou N1 de collecte bloqué depuis %.1fs (> 30s) — réinitialisation forcée",
+                            now_m - _VERROU_N1_ACQUIS_TS)
+                forcer_deverrouillage_n1(raison="abandon_cycle_bloque")
+
+        if VERROU_TRAITEMENT_N2.locked():
+            now_m = time.monotonic()
+            if _VERROU_N2_ACQUIS_TS is not None and (now_m - _VERROU_N2_ACQUIS_TS) > 60.0:
+                log.warning("Verrou N2 de traitement bloqué depuis %.1fs (> 60s) — réinitialisation forcée",
+                            now_m - _VERROU_N2_ACQUIS_TS)
+                forcer_deverrouillage_n2(raison="abandon_cycle_n2_bloque")
+
         try:
             charger_zones()          # rechargement périodique (cache 6 h)
         except Exception:
             pass
         for nom, classe in classes:
-            try:
-                if nom == "MZONEX" and _mzonex_api_active():
-                    n = _collecter_mzonex_n1_avec_repli(classe)
-                else:
-                    n = classe().run()
-                log.info("Collecte %s : %d points insérés", nom, n)
-            except Exception:
-                # gestion des pannes : journalisation, pas de plantage (§10)
-                log.exception("Échec collecte %s", nom)
+            n = _collecte_protegee(
+                nom,
+                (lambda c=classe: _collecter_mzonex_n1_avec_repli(c)
+                 if nom == "MZONEX" and _mzonex_api_active()
+                 else c().run()))
+            log.info("Collecte %s : %d points insérés", nom, n)
         # §0sexies A4 (arbitrage 20/08/2026) — N1 CamtrackPro via l'API Wialon
         # à la même cadence (dernier message par unité ; échec → cycle reporté,
         # aucun flux écran fiable §5)
-        if jeton_configure():
-            n_ctp = _collecter_camtrackpro_n1()
+        if source != "CAMTRACKPRO" and jeton_configure():
+            n_ctp = _collecte_protegee("CAMTRACKPRO", _collecter_camtrackpro_n1)
             if n_ctp:
                 log.info("Collecte CAMTRACKPRO (API) : %d points insérés",
                          n_ctp)
+        # Correctif v1.46 — relecture N1 (Événements MZoneX) : au démarrage puis
+        # toutes les RELECTURE_N1_PERIODE_S (défaut 1 h) — rattrape les trous
+        # > 3 h laissés par une panne de collecte (idempotent, anti-rejeu).
+        mono_n1 = time.monotonic()
+        if (_relecture_n1_memo["mono"] == 0.0
+                or mono_n1 - _relecture_n1_memo["mono"] >= RELECTURE_N1_PERIODE_S):
+            _relecture_n1_memo["mono"] = mono_n1
+            try:
+                n_n1 = _collecte_protegee("MZONEX_RELECTURE", relecture_n1_mzonex)
+                if n_n1:
+                    log.info("Relecture N1 (Événements MZoneX, %d jours) : "
+                             "%d point(s) rattrapé(s)", RELECTURE_N1_JOURS, n_n1)
+            except Exception:
+                log.exception("Relecture N1 MZoneX — échec (retraité)")
         # §0quater R2 (arbitrage 14/08/2026) — jamais un camion en route sans
         # ligne : (ré)ouverture des lignes manquantes d'après le dernier signal
         try:

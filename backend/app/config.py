@@ -120,7 +120,7 @@ def mots_ignores_conducteur() -> frozenset:
     mots ne créent JAMAIS de fiche chauffeur. Surcharge possible :
     CONDUCTEUR_MOTS_IGNORES="mot1,mot2" (dans backend/.env)."""
     brut = os.getenv("CONDUCTEUR_MOTS_IGNORES",
-                     "garage,dépôt,depot,station,parking,atelier")
+                     "garage,dépôt,depot,station,parking,atelier,service,maintenance,inconnu,aucun")
     return frozenset(m.strip().lower() for m in brut.split(",") if m.strip())
 
 
@@ -139,6 +139,21 @@ def normaliser_libelle(texte: str | None) -> str:
     return " ".join(brut.lower().split())
 
 
+def calculer_tokens_set(texte: str | None) -> str:
+    """Calcule le sac de mots normalisé (ordonné alphabétiquement et dédupliqué).
+    Permet une comparaison insensible à l'ordre Nom / Prénom :
+    « RAKOTO Jean » -> « jean rakoto »
+    « Jean RAKOTO » -> « jean rakoto »
+    Retire la ponctuation (- / ' . ,) pour une robustesse maximale."""
+    import re
+    if not texte:
+        return ""
+    norm = normaliser_libelle(texte)
+    sans_ponct = re.sub(r"[^\w\s]", " ", norm)
+    mots = sorted(set(m for m in sans_ponct.split() if len(m) > 1 or m.isalnum()))
+    return " ".join(mots)
+
+
 def mots_ignores_badge() -> frozenset:
     """§0septies B2 (arbitrage LSS 20/08/2026) — EXCEPTION à « le badge fait
     foi » : les clés de SERVICE ne désignent pas un chauffeur (« Nouveau
@@ -147,8 +162,27 @@ def mots_ignores_badge() -> frozenset:
     travail. Comparaison sur le libellé normalisé (casse/accents ignorés).
     Surcharge : CONDUCTEUR_BADGE_IGNORES="a,b" (dans backend/.env)."""
     brut = os.getenv("CONDUCTEUR_BADGE_IGNORES",
-                     "nouveau conducteur,garage lss")
+                     "nouveau conducteur,nouveau chauffeur,nouveau conducteurs,garage lss,garage,depot,dépôt,atelier,service,maintenance,sans chauffeur,sans badge,non assigne,non assigné,non affecte,non affecté,cle de service,clé de service,inconnu,aucun,aucun chauffeur,aucun conducteur")
     return frozenset(normaliser_libelle(m) for m in brut.split(",") if m.strip())
+
+
+def est_libelle_service_ou_garage(nom: str | None) -> bool:
+    """Vérifie si un libellé désigne une clé de service, un garage ou un état non-chauffeur."""
+    if not nom:
+        return False
+    norm = normaliser_libelle(nom)
+    if not norm:
+        return False
+    mots = set(norm.split())
+    if mots & mots_ignores_conducteur():
+        return True
+    ignores = mots_ignores_badge()
+    if norm in ignores:
+        return True
+    for ign in ignores:
+        if ign in norm or norm.startswith(ign):
+            return True
+    return False
 
 
 # §0quinquies (14/08/2026) — un « Début du trajet » connu mais resté sans
@@ -172,8 +206,9 @@ TOKEN_TTL_MIN = int(os.getenv("TOKEN_TTL_MIN", "10080"))  # 7 jours (choix méti
 # ---------------------------------------------------------------- simulateur
 # Le simulateur remplace le scraping MZoneX/CamtrackPro tant que les identifiants
 # ne sont pas fournis. SIM_ENABLE=0 pour le désactiver (mode production réelle).
-SIM_ENABLE = os.getenv("SIM_ENABLE", "1") == "1"
+SIM_ENABLE = os.getenv("SIM_ENABLE", "0") == "1"
 SIM_TICK_S = int(os.getenv("SIM_TICK_S", "20"))       # cadence de remontée live (s)
+COLLECTOR_SOURCE = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
 
 # ---------------------------------------------------------------- frontend
 FRONTEND_DIST = os.getenv("FRONTEND_DIST", str(ROOT_DIR.parent / "frontend" / "dist"))
@@ -181,17 +216,19 @@ FRONTEND_DIST = os.getenv("FRONTEND_DIST", str(ROOT_DIR.parent / "frontend" / "d
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
 
 # ---------------------------------------------------------------- géographie
-# Points logistiques (coordonnées approximatives, Madagascar).
+# Points logistiques officiels (Madagascar).
+# Chargement : GRT (GALANA RAFINERIE TERMINALE) unique.
+# Déchargement : 7 dépôts officiels stricts (DSNR, DABI, DMMG, DFIA, DMDV, DMKR, DABE).
 GEO = {
-    "BASE_TANA": (-18.8792, 47.5079, "Base LSS — Antananarivo"),
-    "DEPOT_DABI": (-18.8100, 47.4450, "Dépôt DABI — Ambohibao, Tana"),
-    "RAFF_TMT": (-18.1492, 49.4023, "Raffinerie TMT — Toamasina"),
-    "DMMG": (-18.9489, 48.2257, "Dépôt DMMG — Moramanga"),
-    "DABE": (-19.8659, 47.0333, "Dépôt DABE — Antsirabe"),
-    "DFIA": (-21.4536, 47.0857, "Dépôt DFIA — Fianarantsoa"),
-    "DSNR": (-12.2787, 49.2917, "Dépôt DSNR — Antsiranana"),
-    "DMKR": (-22.1486, 48.0106, "Dépôt DMKR — Manakara"),
-    "DMDV": (-15.7167, 46.3167, "Dépôt DMDV — Mahajanga"),
+    "BASE_TANA": (-18.9537, 47.5449, "Base LSS — Antananarivo"),
+    "GRT": (-18.1492, 49.4023, "GRT (GALANA RAFINERIE TERMINALE)"),
+    "DSNR": (-18.9300, 47.5200, "Depot Soanierana (DSNR)"),
+    "DABI": (-18.8100, 47.4450, "Depot Alarobia (DABI)"),
+    "DMMG": (-18.9489, 48.2257, "Depot Moramanga (DMMG)"),
+    "DFIA": (-21.4536, 47.0857, "Depot Fianarantsoa (DFIA)"),
+    "DMDV": (-20.2833, 44.2833, "Depot Morondava (DMDV)"),
+    "DMKR": (-22.1486, 48.0106, "Depot Manakara (DMKR)"),
+    "DABE": (-19.8659, 47.0333, "Depot Antsirabe (DABE)"),
 }
 
 # Corridors logistiques (polylignes simplifiées) utilisés pour l'alerte
@@ -217,32 +254,47 @@ ROUTES = {
         ("Ambohimangakely", -18.8650, 47.5900),
         ("Manjakandriana", -18.9167, 47.8000),
         ("Ambanidia", -18.9350, 48.0100),
-        ("Moramanga", -18.9489, 48.2257),
+        ("Depot Moramanga (DMMG)", -18.9489, 48.2257),
     ],
     "MMG_TMT": [
-        ("Moramanga", -18.9489, 48.2257),
+        ("Depot Moramanga (DMMG)", -18.9489, 48.2257),
         ("Andasibe", -18.8741, 48.4521),
         ("Beforona", -18.7270, 48.7240),
         ("Brickaville", -18.4445, 49.0880),
         ("Ranomainty", -18.1820, 49.2680),
-        ("Toamasina (TMT)", -18.1492, 49.4023),
+        ("GRT (GALANA RAFINERIE TERMINALE)", -18.1492, 49.4023),
     ],
     "TANA_ABE": [
-        ("Antananarivo", -18.8792, 47.5079),
+        ("Base LSS — Antananarivo", -18.8792, 47.5079),
         ("Ambatolampy", -19.3833, 47.4333),
-        ("Antsirabe", -19.8659, 47.0333),
+        ("Depot Antsirabe (DABE)", -19.8659, 47.0333),
     ],
     "ABE_FNR": [
-        ("Antsirabe", -19.8659, 47.0333),
+        ("Depot Antsirabe (DABE)", -19.8659, 47.0333),
         ("Ambositra", -20.5303, 47.2434),
-        ("Fianarantsoa", -21.4536, 47.0857),
+        ("Depot Fianarantsoa (DFIA)", -21.4536, 47.0857),
     ],
     "TANA_DABI": [
         ("Base LSS — Antananarivo", -18.8792, 47.5079),
-        ("Ambohibao (DABI)", -18.8100, 47.4450),
+        ("Depot Alarobia (DABI)", -18.8100, 47.4450),
     ],
 }
 
-DEPOTS = ["DABI", "DMMG", "DSNR", "DFIA", "DABE", "DMKR", "DMDV"]
+DEPOTS_OFFICIELS_DECHARGEMENT = {
+    "DSNR": "Depot Soanierana (DSNR)",
+    "DABI": "Depot Alarobia (DABI)",
+    "DMMG": "Depot Moramanga (DMMG)",
+    "DFIA": "Depot Fianarantsoa (DFIA)",
+    "DMDV": "Depot Morondava (DMDV)",
+    "DMKR": "Depot Manakara (DMKR)",
+    "DABE": "Depot Antsirabe (DABE)",
+}
+
+DEPOT_OFFICIEL_CHARGEMENT = {
+    "code": "GRT",
+    "nom": "GRT (GALANA RAFINERIE TERMINALE)",
+}
+
+DEPOTS = ["DSNR", "DABI", "DMMG", "DFIA", "DMDV", "DMKR", "DABE"]
 DISTRIBUTEURS = ["GALANA", "VIVO", "JOVENA", "TOTAL"]
 PRODUITS = ["SP95", "GO", "PL"]

@@ -21,15 +21,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
-import http.cookiejar
 import json
 import logging
 import os
 import re
+import socket
 import threading
 import time
 import urllib.parse
-import urllib.request
+import httpx
+
+socket.setdefaulttimeout(30.0)
 
 log = logging.getLogger("lss.api_mzonex")
 
@@ -41,7 +43,7 @@ URI_REDIRECTION = os.getenv("MZONEX_API_REDIRECT_URI",
                             "https://live.mzoneweb.net/mzonex/")
 _UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
-_TIMEOUT = 30
+_TIMEOUT = float(os.getenv("MZONEX_AUTH_TIMEOUT_S", "30.0"))
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "data")
@@ -53,62 +55,26 @@ class ErreurAuthMZoneX(RuntimeError):
     """Échec d'authentification OAuth2 MZoneX (SSO, jeton, réseau)."""
 
 
-# ------------------------------------------------------------------ helpers
-class _StopRedirection(urllib.request.HTTPRedirectHandler):
-    """Opener qui NE suit PAS les redirections (les codes sont derrière)."""
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-def _opener(jar: http.cookiejar.CookieJar, suivre: bool):
-    gest = [] if suivre else [_StopRedirection()]
-    op = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(jar), *gest)
-    op.addheaders = [("User-Agent", _UA)]
-    return op
-
-
-def _lire_sans_suivre(op, url: str):
-    """GET sans suivre les redirections → (code_http, location, corps)."""
+def _post_formulaire(url: str, donnees: dict, timeout: float = _TIMEOUT) -> dict:
     try:
-        r = op.open(url, timeout=_TIMEOUT)
-        return r.status, r.headers.get("Location"), r.read().decode(
-            "utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        return e.code, e.headers.get("Location"), e.read().decode(
-            "utf-8", "replace")[:200]
-
-
-def _post_formulaire(url: str, donnees: dict, timeout: int = _TIMEOUT) -> dict:
-    req = urllib.request.Request(
-        url, data=urllib.parse.urlencode(donnees).encode(),
-        headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        corps = e.read().decode("utf-8", "replace")[:200]
-        raise ErreurAuthMZoneX(f"POST {url} → HTTP {e.code} : {corps}") from e
+        with httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0)) as client:
+            resp = client.post(
+                url, data=donnees,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": _UA}
+            )
+            if resp.status_code != 200:
+                raise ErreurAuthMZoneX(f"POST {url} → HTTP {resp.status_code} : {resp.text[:200]}")
+            return resp.json()
+    except httpx.TimeoutException as e:
+        raise TimeoutError(f"POST {url} timeout après {timeout}s : {e}") from e
     except Exception as e:
-        raise ErreurAuthMZoneX(f"POST {url} injoignable : "
-                               f"{type(e).__name__}") from e
+        raise ErreurAuthMZoneX(f"POST {url} injoignable : {type(e).__name__} {e}") from e
 
 
 # ------------------------------------------------------------------ métier
 def flux_code_pkce(username: str, password: str,
                    url_autorisation: str | None = None) -> dict:
-    """Rejoue le flux officiel « code + PKCE » du portail MZoneX (navigateur).
-
-    Strictement identique au parcours d'un navigateur : page de connexion
-    IdentityServer, POST des identifiants, redirections, code, échange PKCE —
-    validé le 20/08/2026 contre l'environnement de production MZone avec le
-    compte LSS (jeton d'accès 1 h + jeton d'actualisation obtenus).
-    Renvoie le dictionnaire jeton brut du serveur.
-    """
-    jar = http.cookiejar.CookieJar()
-    op_suivi = _opener(jar, suivre=True)
-    op_stop = _opener(jar, suivre=False)
-
+    """Rejoue le flux officiel « code + PKCE » du portail MZoneX (navigateur)."""
     verificateur = base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode()
     defi = base64.urlsafe_b64encode(
         hashlib.sha256(verificateur.encode()).digest()).rstrip(b"=").decode()
@@ -120,51 +86,51 @@ def flux_code_pkce(username: str, password: str,
             "state": etat, "nonce": etat, "code_challenge": defi,
             "code_challenge_method": "S256"}))
 
-    # 1) page de connexion (en suivant la redirection authorize → login)
-    r = op_suivi.open(url_auth, timeout=_TIMEOUT)
-    page = r.read().decode("utf-8", "replace")
-    url_login = r.url
-    if "Username" not in page:
-        raise ErreurAuthMZoneX("page de connexion SSO inattendue "
-                               "(champ Username absent)")
-    caches = {k: html.unescape(v) for k, v in
-              re.findall(r'name="([^"]+)"[^>]*value="([^"]*)"', page)}
-    for k in ("Username", "Password"):
-        caches.pop(k, None)
-    post = {"Username": username, "Password": password, "button": "login",
-            **caches}
-
-    # 2) POST identifiants (sans suivre) puis chaîne de redirections
-    req = urllib.request.Request(
-        url_login, data=urllib.parse.urlencode(post).encode(),
-        headers={"Content-Type": "application/x-www-form-urlencoded"})
+    timeout_cfg = httpx.Timeout(_TIMEOUT, connect=5.0)
     try:
-        r2 = op_stop.open(req, timeout=_TIMEOUT)
-        code_http, loc = r2.status, r2.headers.get("Location")
-    except urllib.error.HTTPError as e:
-        code_http, loc = e.code, e.headers.get("Location")
-    if not loc:
-        raise ErreurAuthMZoneX(f"connexion SSO refusée (HTTP {code_http}) — "
-                               "identifiants portail à vérifier")
-    for _ in range(8):                      # chaîne SSO bornée
-        if loc.startswith(URI_REDIRECTION):
-            break
-        if loc.startswith("/"):
-            loc = urllib.parse.urljoin(SSO_URL, loc)
-        _st, loc2, _corps = _lire_sans_suivre(op_stop, loc)
-        if not loc2:
-            break
-        loc = loc2
-    code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get(
-        "code", [None])[0]
-    if not code:
-        raise ErreurAuthMZoneX("flux SSO terminé sans code d'autorisation")
+        with httpx.Client(timeout=timeout_cfg, follow_redirects=True) as client:
+            # 1) page de connexion
+            r = client.get(url_auth, headers={"User-Agent": _UA})
+            page = r.text
+            url_login = str(r.url)
+            if "Username" not in page:
+                raise ErreurAuthMZoneX("page de connexion SSO inattendue (champ Username absent)")
+            caches = {k: html.unescape(v) for k, v in
+                      re.findall(r'name="([^"]+)"[^>]*value="([^"]*)"', page)}
+            for k in ("Username", "Password"):
+                caches.pop(k, None)
+            post = {"Username": username, "Password": password, "button": "login", **caches}
 
-    # 3) échange du code (+ preuve PKCE) contre les jetons
-    return _post_formulaire(SSO_URL + "/connect/token", {
-        "grant_type": "authorization_code", "client_id": CLIENT_ID,
-        "redirect_uri": URI_REDIRECTION, "code": code,
-        "code_verifier": verificateur})
+        with httpx.Client(timeout=timeout_cfg, follow_redirects=False) as client_stop:
+            # 2) POST identifiants (sans suivre) puis chaîne de redirections
+            r2 = client_stop.post(
+                url_login, data=post,
+                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": _UA}
+            )
+            loc = r2.headers.get("Location")
+            if not loc:
+                raise ErreurAuthMZoneX(f"connexion SSO refusée (HTTP {r2.status_code}) — identifiants portail à vérifier")
+            for _ in range(8):
+                if loc.startswith(URI_REDIRECTION):
+                    break
+                if loc.startswith("/"):
+                    loc = urllib.parse.urljoin(SSO_URL, loc)
+                r3 = client_stop.get(loc, headers={"User-Agent": _UA})
+                loc2 = r3.headers.get("Location")
+                if not loc2:
+                    break
+                loc = loc2
+            code = urllib.parse.parse_qs(urllib.parse.urlparse(loc).query).get("code", [None])[0]
+            if not code:
+                raise ErreurAuthMZoneX("flux SSO terminé sans code d'autorisation")
+
+        # 3) échange du code (+ preuve PKCE) contre les jetons
+        return _post_formulaire(SSO_URL + "/connect/token", {
+            "grant_type": "authorization_code", "client_id": CLIENT_ID,
+            "redirect_uri": URI_REDIRECTION, "code": code,
+            "code_verifier": verificateur})
+    except httpx.TimeoutException as e:
+        raise TimeoutError(f"SSO MZoneX timeout après {_TIMEOUT}s : {e}") from e
 
 
 class GestionnaireJetonsMZoneX:
@@ -232,9 +198,10 @@ class GestionnaireJetonsMZoneX:
             if stock and stock.get("refresh_token"):
                 try:
                     brut = self._fournir_refresh(stock["refresh_token"])
-                except ErreurAuthMZoneX:
-                    log.info("MZoneX API : actualisation refusée — "
-                             "reconnexion complète")
+                except Exception as exc:
+                    log.info("MZoneX API : actualisation refusée (%s) — "
+                             "invalidation du jeton et reconnexion complète", exc)
+                    self.invalider()
                 else:
                     stock = {"access_token": brut["access_token"],
                              # rotation IS4 : conserver le NOUVEAU refresh s'il
@@ -246,7 +213,11 @@ class GestionnaireJetonsMZoneX:
                     self._sauver(stock)
                     log.info("MZoneX API : jeton actualisé (valide ~1 h)")
                     return stock["access_token"]
-            brut = self._fournir_login()
+            try:
+                brut = self._fournir_login()
+            except Exception:
+                self.invalider()
+                raise
             stock = {"access_token": brut["access_token"],
                      "refresh_token": brut.get("refresh_token"),
                      "expire": time.time() + int(brut.get("expires_in", 3600))}

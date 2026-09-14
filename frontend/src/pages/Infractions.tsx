@@ -61,7 +61,13 @@ export default function Infractions() {
   }
 
   async function charger() {
-    setData(await api(`/api/infractions?${query()}`));
+    try {
+      const res = await api(`/api/infractions?${query()}`);
+      setData(res || { items: [], total: 0, compteurs: { non_traitees: 0, validees: 0, invalidees: 0, comptabilisees: 0 } as any });
+    } catch (e) {
+      console.error("Erreur chargement infractions:", e);
+      setData({ items: [], total: 0, compteurs: { non_traitees: 0, validees: 0, invalidees: 0, comptabilisees: 0 } as any });
+    }
   }
 
   useEffect(() => { charger(); }, [du, au, vehiculeId, conducteurId, niveau, validation, famille]);
@@ -77,7 +83,7 @@ export default function Infractions() {
       timer.current = window.setTimeout(charger, 1200);
     });
     return off;
-  });
+  }, []);
 
   async function decider(i: Infraction, decision: "VALIDE" | "INVALIDE", obs?: string) {
     setEnCours(true);

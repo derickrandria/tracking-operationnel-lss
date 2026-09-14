@@ -105,11 +105,20 @@ export default function Suivi() {
   /** Déclaré à chaque modification de cellule : optimiste + debounce 1,5 s (§2.2.1). */
   const programmer = useCallback((ligne: SuiviLigne, champ: string, valeur: string | null) => {
     if (lectureSeule) return;
+    const isPassageLibre = champ === "statut_camion" && valeur === "LIBRE";
     setData((d) => d && ({
       ...d,
-      lignes: d.lignes.map((l) => (l.id === ligne.id ? { ...l, [champ]: valeur } : l)),
+      lignes: d.lignes.map((l) => (l.id === ligne.id ? {
+        ...l,
+        [champ]: valeur,
+        ...(isPassageLibre ? { numero_ot: null, distributeur: null, produit: null, depot_recepteur: null } : {})
+      } : l)),
     }));
-    pendingRef.current[ligne.id] = { ...pendingRef.current[ligne.id], [champ]: valeur };
+    pendingRef.current[ligne.id] = {
+      ...pendingRef.current[ligne.id],
+      [champ]: valeur,
+      ...(isPassageLibre ? { numero_ot: null, distributeur: null, produit: null, depot_recepteur: null } : {})
+    };
     persisterBrouillon();
     setSave({ etat: "attente", nb: nbEnAttente() });
     window.clearTimeout(debounceRef.current[ligne.id]);
@@ -136,12 +145,12 @@ export default function Suivi() {
         restaureRef.current = true;
         try {
           const brouillon: PendingMap = JSON.parse(localStorage.getItem(CLE_BROUILLON) || "{}");
-          const ids = new Set(d.lignes.map((l: SuiviLigne) => l.id));
+          const ids = new Set((d.lignes || []).map((l: SuiviLigne) => l.id));
           const recuperes = Object.entries(brouillon).filter(([id, c]) => ids.has(id) && Object.keys(c).length);
           if (recuperes.length) {
             pendingRef.current = Object.fromEntries(recuperes);
             persisterBrouillon();
-            d.lignes = d.lignes.map((l: SuiviLigne) =>
+            d.lignes = (d.lignes || []).map((l: SuiviLigne) =>
               pendingRef.current[l.id] ? { ...l, ...pendingRef.current[l.id] } : l);
             setSave({ etat: "attente", nb: nbEnAttente() });
             timersRef.current.push(window.setTimeout(() => vider(), 800));
@@ -153,6 +162,9 @@ export default function Suivi() {
         } catch { /* brouillon illisible : on l'ignore */ }
       }
       setData(d);
+    } catch (e) {
+      console.error("Erreur chargement suivi:", e);
+      setData({ lignes: [], seuils: {} });
     } finally {
       setChargement(false);
     }
@@ -179,6 +191,27 @@ export default function Suivi() {
     const off2 = on("data.refresh", () => charger(true));
     return () => { off(); off2(); };
   }, [charger]);
+
+  const [syncing, setSyncing] = useState(false);
+
+  async function syncGPS() {
+    setSyncing(true);
+    try {
+      const r = await api("/api/suivi/sync-gps", { method: "POST" });
+      const totalPoints = (r.mzonex_n1_points || 0) + (r.camtrackpro_n1_points || 0);
+      const recusN2 = r.n2_trajets?.recus || 0;
+      addToast({
+        type: "succes",
+        titre: "Synchronisation GPS effectuée",
+        message: `${totalPoints} point(s) N1 collecté(s), ${recusN2} trajet(s) N2 actualisé(s).`
+      });
+      charger(true);
+    } catch (e: any) {
+      addToast({ type: "erreur", titre: "Synchronisation impossible", message: e.message });
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   async function prefillGPS() {
     try {
@@ -267,9 +300,14 @@ export default function Suivi() {
             className="rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-2.5 py-1.5 text-[13px]" />
           <Btn variante="secondaire" onClick={() => { setDate(todayISO()); setParams({}); }}>Aujourd'hui</Btn>
           {!lectureSeule && (
-            <Btn variante="secondaire" onClick={prefillGPS} title="Remplit la Partie C depuis les positions GPS">
-              <Icon nom="localisation" /> Pré-remplir (GPS)
-            </Btn>
+            <>
+              <Btn variante="primaire" onClick={syncGPS} disabled={syncing} title="Force la synchronisation immédiate avec les serveurs GPS MZoneX et CamtrackPro">
+                {syncing ? <Spinner className="h-3.5 w-3.5" /> : <Icon nom="rafraichir" />} Sync GPS
+              </Btn>
+              <Btn variante="secondaire" onClick={prefillGPS} title="Remplit la Partie C depuis les positions GPS">
+                <Icon nom="localisation" /> Pré-remplir (GPS)
+              </Btn>
+            </>
           )}
           <Btn variante={modeDetail ? "primaire" : "secondaire"} title="27 colonnes trajets (exigence audit) : Heure de départ, Fin T1, Pause 1, Début/Fin/Pause T2→T9"
             onClick={() => { const v = !modeDetail; setModeDetail(v); localStorage.setItem(CLE_MODE, v ? "1" : "0"); }}>
@@ -311,7 +349,7 @@ export default function Suivi() {
             refs={refs} lectureSeule={lectureSeule}
             onEdit={lectureSeule ? undefined : programmer} pendingUI={pendingUI}
             /* §0vicies decies N1 — TCC « 0:00 » dès que le jour n'est plus le jour en cours */
-            masquerTCC={date !== todayISO()} />
+            masquerTCC={date !== todayISO()} onRefresh={charger} />
         )}
       </div>
     </div>
