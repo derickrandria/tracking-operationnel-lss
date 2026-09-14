@@ -13,6 +13,16 @@ def iso(dt):
     return dt.isoformat() if dt else None
 
 
+def fmt_hms_journee(secondes: int | float | None) -> str:
+    """Formatte une durée journalière (00:00 à 24:00 maximum)."""
+    if secondes is None:
+        return "00:00"
+    s = max(0, min(86400, int(secondes)))
+    h = s // 3600
+    m = (s % 3600) // 60
+    return f"{h:02d}:{m:02d}"
+
+
 def fmt_hms(secondes) -> str | None:
     """16200 -> '04:30' (affiche aussi > 24 h : '26:05')."""
     if secondes is None:
@@ -564,6 +574,11 @@ def s_historique(h: HistoriqueJournalier, detail=False):
     # d'archive (dont ceux d'avant v1.31, stockés non fusionnés) : copie,
     # jamais de mutation ; aucune archive n'est réécrite (§A.2).
     d = fusionner_snapshot(h.donnees)
+    tcj_val = min(86400, max(0, int(d.get("tcj_s") or d.get("tcj_secondes") or 0)))
+    ttj_val = min(86400, max(0, int(d.get("ttj_s") or d.get("ttj_secondes") or 0)))
+    if ttj_val < tcj_val:
+        ttj_val = tcj_val
+    pause_val = max(0, min(86400, int(d.get("total_pause_s") or d.get("pauses_secondes") or (ttj_val - tcj_val))))
     out = {
         "id": h.id,
         "date_jour": h.date_jour.isoformat(),
@@ -578,14 +593,34 @@ def s_historique(h: HistoriqueJournalier, detail=False):
         "numero_ot": d.get("numero_ot"),
         "heure_depart": d.get("heure_depart"),
         "arret_final": d.get("arret_final"),
-        "km_parcourus": d.get("km_parcourus"),
-        "tcc_s": d.get("tcc_s"), "tcj_s": d.get("tcj_s"), "ttj_s": d.get("ttj_s"),
+        "km_parcourus": round(d.get("km_parcourus") or 0, 1),
+        "tcc_s": 0,
+        "tcj_s": tcj_val,
+        "tcj_secondes": tcj_val,
+        "tcj_str": fmt_hms_journee(tcj_val),
+        "ttj_s": ttj_val,
+        "ttj_secondes": ttj_val,
+        "ttj_str": fmt_hms_journee(ttj_val),
+        "total_pause_s": pause_val,
+        "total_pause_str": fmt_hms_journee(pause_val),
         "trajets": d.get("trajets") or [],
-        "nb_trajets": d.get("nb_trajets"),
+        "nb_trajets": d.get("nb_trajets") or len(d.get("trajets") or []),
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,
+        "flag_tcj": bool(tcj_val > 36000),
+        "flag_ttj": bool(ttj_val > 43200),
+        "flag_tcc": False,
         "archive_le": iso(h.archive_le),
     }
     if detail:
-        out["donnees"] = d
+        d_out = dict(d)
+        d_out["tcj_s"] = tcj_val
+        d_out["tcj_secondes"] = tcj_val
+        d_out["tcj_str"] = fmt_hms_journee(tcj_val)
+        d_out["ttj_s"] = ttj_val
+        d_out["ttj_secondes"] = ttj_val
+        d_out["ttj_str"] = fmt_hms_journee(ttj_val)
+        d_out["total_pause_s"] = pause_val
+        d_out["total_pause_str"] = fmt_hms_journee(pause_val)
+        out["donnees"] = d_out
     return out
