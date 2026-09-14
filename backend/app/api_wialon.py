@@ -117,7 +117,7 @@ def point_depuis_position_wialon(u: dict) -> dict | None:
     """Unité (dernier message) → point du contrat CollectorBase.
 
     `pos.t` = epoch UTC du DERNIER message du boîtier ; `pos.s` = vitesse km/h.
-    Type None : la machine états §7.1 (v>3 km/h, §0ter) reste souveraine.
+    Filtre strict bruit GPS : vitesse > 3.0 km/h requise pour le roulage et l'incrémentation TCJ.
     """
     plaque = plaque_unite(u.get("nm"))
     pos = u.get("pos") or {}
@@ -126,10 +126,13 @@ def point_depuis_position_wialon(u: dict) -> dict | None:
         return None
     ts = datetime.fromtimestamp(int(t), tz=timezone.utc).astimezone(
         TZ).replace(tzinfo=None)
+    vit_brute = max(0.0, float(pos.get("s") or 0.0))
+    roule = (vit_brute > 3.0)
     return {"gps_associe": plaque, "horodatage": ts,
             "lat": float(y), "lng": float(x), "adresse": None,
-            "vitesse": max(0.0, float(pos.get("s") or 0.0)),
-            "moteur": "ON", "type_evenement": None}
+            "vitesse": vit_brute if roule else 0.0,
+            "moteur": "ON" if roule else "OFF",
+            "type_evenement": "POSITION" if roule else "ARRET"}
 
 
 def _texte(cellule) -> str:
@@ -525,19 +528,20 @@ class ApiWialon:
                     ts = datetime.fromtimestamp(t_epoch, tz=timezone.utc).astimezone(TZ).replace(tzinfo=None)
                     lat = float(pos["y"])
                     lng = float(pos["x"])
-                    vitesse = max(0.0, float(pos.get("s") or 0.0))
+                    vit_brute = max(0.0, float(pos.get("s") or 0.0))
                     p_params = m.get("p") if isinstance(m.get("p"), dict) else {}
-                    acc = p_params.get("acc", 1 if vitesse > 0 else 0)
-                    etat_moteur = "ON" if (vitesse > 0 or acc == 1) else "OFF"
+                    acc = p_params.get("acc", 1 if vit_brute > 0 else 0)
+                    roule = (vit_brute > 3.0)
+                    etat_moteur = "ON" if (vit_brute > 0 or acc == 1) else "OFF"
 
                     points_unite.append({
                         "plaque": plaque,
                         "horodatage": ts,
                         "lat": lat,
                         "lng": lng,
-                        "vitesse": vitesse,
+                        "vitesse": vit_brute if roule else 0.0,
                         "etat_moteur": etat_moteur,
-                        "type_evenement": "POSITION" if vitesse > 0 else "ARRET"
+                        "type_evenement": "POSITION" if roule else "ARRET"
                     })
 
                 if points_unite:

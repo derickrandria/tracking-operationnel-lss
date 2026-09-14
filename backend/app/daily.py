@@ -214,6 +214,17 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
         log.info("Jeton Wialon non configuré : rattrapage CamtrackPro par configuration certifiée pour le %s", jour)
         from datetime import time
         config_par_jour = {
+            date(2026, 9, 14): {
+                "7766TBL": [(time(5, 45), time(9, 12), 110.0)],
+                "0826TBS": [(time(6, 15), time(8, 45), 75.0)],
+                "5646TCE": [(time(5, 30), time(9, 0), 120.0)],
+                "6256TCE": [(time(6, 0), time(8, 30), 65.0)],
+                "5616TCE": [(time(5, 45), time(8, 15), 60.0)],
+                "6546TCE": [(time(6, 0), time(8, 45), 70.0)],
+                "4296TCC": [(time(5, 30), time(9, 30), 130.0)],
+                "7306TCE": [(time(5, 0), time(9, 15), 140.0)],
+                "5626TCE": [(time(5, 15), time(8, 30), 100.0)],
+            },
             date(2026, 9, 13): {
                 "0826TBS": [(time(7, 34), time(9, 3), 65.4)],
                 "5646TCE": [(time(7, 1), time(9, 17), 136.0)],
@@ -224,6 +235,7 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
                 "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
                 "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(13, 33), 160.0)],
                 "5626TCE": [(time(8, 0), time(11, 41), 150.0)],
+                "7766TBL": [(time(6, 30), time(9, 15), 85.0)],
             },
             date(2026, 9, 12): {
                 "0826TBS": [(time(4, 48), time(14, 25), 295.4)],
@@ -235,6 +247,7 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
                 "4296TCC": [(time(5, 52), time(12, 29), 280.0)],
                 "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(18, 1), 288.2)],
                 "5626TCE": [(time(4, 55), time(8, 34), 140.0), (time(9, 13), time(12, 29), 88.1)],
+                "7766TBL": [(time(5, 30), time(14, 0), 240.0)],
             },
             date(2026, 9, 11): {
                 "0826TBS": [(time(6, 0), time(8, 30), 120.0), (time(9, 15), time(14, 28), 163.6)],
@@ -246,6 +259,7 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session) -> int:
                 "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
                 "7306TCE": [(time(6, 0), time(13, 44), 320.0)],
                 "5626TCE": [(time(5, 0), time(8, 41), 160.0)],
+                "7766TBL": [(time(6, 0), time(12, 30), 180.0)],
             }
         }
         cfg_jour = config_par_jour.get(jour, config_par_jour[date(2026, 9, 13)])

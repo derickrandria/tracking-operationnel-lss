@@ -38,8 +38,9 @@ VEHICULES = [
     ("5446TBS", "5446TBS/4047TBH"), ("5506TBS", "5506TBS/0267TBG"),
     ("5616TCE", "5616TCE/5617TCE"), ("5626TCE", "5626TCE/0537TAV"),
     ("5646TCE", "5646TCE/5617TCE"), ("5706TBS", "5706TBS/4657TBH"),
-    ("5716TBS", "5716TBS/3407TBB"), ("6546TCE", "6546TCE/9747TBD"),
-    ("7306TCE", "7306TCE/9737TBD"), ("7936TCB", "7936TCB/5127TCB"),
+    ("5716TBS", "5716TBS/3407TBB"), ("6256TCE", "6256TCE/6257TCE"),
+    ("6546TCE", "6546TCE/9747TBD"), ("7306TCE", "7306TCE/9737TBD"),
+    ("7766TBL", "7766TBL/7767TBL"), ("7936TCB", "7936TCB/5127TCB"),
     ("7946TCB", "7946TCB/5057TCB"), ("8076TCB", "8076TCB/0527TBP"),
     ("8086TCB", "8086TCB/0557TBP"), ("8116TCB", "8116TCB/1247TCC"),
     ("8806TCB", "8806TCB/1287TCC"), ("9176TCC", "9176TCC/6107TCC"),
@@ -148,8 +149,8 @@ CAPACITES = [30000, 33000, 36000, 40000]
 # remontent via MZoneX (« Lss Tracking », groupe LSS (LPSA)).
 VEHICULES_CAMTRACKPRO = {
     "0826TBS", "0906TBV", "3076TBS", "4296TCC", "5346TBU", "5506TBS",
-    "5616TCE", "5626TCE", "5646TCE", "5716TBS", "6546TCE", "7306TCE",
-    "9176TCC",
+    "5616TCE", "5626TCE", "5646TCE", "5716TBS", "6256TCE", "6546TCE",
+    "7306TCE", "7766TBL", "9176TCC",
 }
 
 
@@ -227,8 +228,23 @@ def seed_si_vide():
                     gps_associe=f"OBC-{plaque}",
                     plateforme_gps=plateforme_gps,
                     conducteur_actuel_id=conducteur.id if conducteur else None))
-            log.info("Référentiels seedés : %d véhicules, %d chauffeurs, %d situations",
-                     len(VEHICULES), len(CHAUFFEURS), len(SITUATIONS))
+            db.flush()
+        else:
+            # Complétion des véhicules manquants sur une base existante
+            plaques_existantes = {v.plaque for v in db.scalars(select(Vehicule))}
+            for i, (plaque, desc) in enumerate(VEHICULES):
+                if plaque not in plaques_existantes:
+                    est_camtrack = plaque in VEHICULES_CAMTRACKPRO
+                    plateforme_gps = "CAMTRACKPRO" if est_camtrack else "MZONEX"
+                    v_new = Vehicule(
+                        plaque=plaque, description=desc,
+                        marque="MERCEDES ATEGO",
+                        capacite=36000, statut="ACTIF",
+                        gps_associe=f"OBC-{plaque}",
+                        plateforme_gps=plateforme_gps
+                    )
+                    db.add(v_new)
+            db.flush()
 
         # Historique de démonstration : quelques jours archivés réalistes afin
         # que le module Historique et les courbes 30 jours soient exploitables

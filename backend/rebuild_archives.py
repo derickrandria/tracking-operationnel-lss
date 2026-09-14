@@ -39,7 +39,7 @@ def main():
                 print(f"Format de date invalide : {arg} (attendu: YYYY-MM-DD)")
                 sys.exit(1)
     else:
-        dates_cibles = [date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)]
+        dates_cibles = [date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13), date(2026, 9, 14)]
 
     print("=" * 70)
     print("  LSS TRACKING — RECONSTRUCTION ET CONSOLIDATION DES ARCHIVES")
