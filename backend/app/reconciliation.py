@@ -1094,14 +1094,14 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
             # Ne jamais transformer en trajet ouvert (fin None) pour éviter d'étendre
             # artificiellement le trajet jusqu'à 23:59:59.
             if fin is not None and fin <= debut:
-                from datetime import timedelta
-                if (fin + timedelta(hours=3)) > debut and (fin + timedelta(hours=3) - debut).total_seconds() <= 43200:
-                    fin = fin + timedelta(hours=3)
-                else:
-                    log.warning("Trajet validé rejeté car fin (%s) <= début (%s) pour %s",
-                                iso(fin), iso(debut), it.get("plaque"))
-                    stats["ignores"] += 1
-                    continue
+                # `_parse_instant` convertit déjà UTC→local : une fin <= début
+                # est une donnée corrompue du portail — on rejette la ligne
+                # (PAS de correction +3h en dur : durées gonflées / trajets
+                # longs jetés silencieusement).
+                log.warning("Trajet validé rejeté car fin (%s) <= début (%s) pour %s",
+                            iso(fin), iso(debut), it.get("plaque"))
+                stats["ignores"] += 1
+                continue
             # Référence v2 §8.2/§8.3 — jour d'ATTRIBUTION du trajet (début
             # < 01h00 → veille ; la journée logistique court de 01h00 à 01h00)
             jour = jour_attribution(debut)

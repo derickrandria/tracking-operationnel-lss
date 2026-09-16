@@ -54,6 +54,11 @@ _TIMEOUT = float(os.getenv("CAMTRACKPRO_API_TIMEOUT_S", "30.0"))
 # 04/09/2026 : 2-15 pts/h au lieu de 150-220). Le portail web reste utilisable.
 SESSION_PARTAGEE = os.getenv("WIALON_SESSION_PARTAGEE", "1") == "1"
 _sid_partage: dict = {"sid": None}
+_SID_VERROU = threading.Lock()
+"""Verrou GLOBAL protégeant `_sid_partage` : l'ancien verrou par instance ne
+couvrait pas l'état partagé — deux threads pouvaient lire le même sid périmé,
+se re-logger chacun et s'invalider mutuellement (la « dégradation CamtrackPro »
+que SESSION_PARTAGEE était censée supprimer)."""
 NOM_RAPPORT = os.getenv("CAMTRACKPRO_API_RAPPORT_NOM", "Detail Trajet Vehicule")
 RESSOURCE_ID = os.getenv("CAMTRACKPRO_API_RESSOURCE_ID", "").strip()
 GABARIT_ID = os.getenv("CAMTRACKPRO_API_GABARIT_ID", "").strip()
@@ -234,11 +239,13 @@ def item_depuis_ligne_rapport(nom_unite: str, cellules: list, col_map: dict[str,
 
     fin = _parse_instant(cellules[idx_fin]) if idx_fin < len(cellules) else None
     if fin is not None and fin <= debut:
-        if (fin + timedelta(hours=3)) > debut and (fin + timedelta(hours=3) - debut).total_seconds() <= 43200:
-            fin = fin + timedelta(hours=3)
-        else:
-            log.warning("Wialon API : trajet ignoré pour %s car fin (%s) <= début (%s)", plaque, fin, debut)
-            return None
+        # `_parse_instant` convertit déjà UTC→local (§0octies C1) : une fin
+        # antérieure ou égale au début est une donnée corrompue du portail —
+        # on ignore la ligne (PAS de correction +3h en dur qui gonflait
+        # artificiellement des durées ou jetait des trajets légitimes).
+        log.warning("Wialon API : trajet ignoré pour %s car fin (%s) <= début (%s)",
+                    plaque, fin, debut)
+        return None
 
     dist_txt = _texte(cellules[idx_dist]) if idx_dist < len(cellules) else ""
     distance_km = _parse_distance(dist_txt)
@@ -273,9 +280,18 @@ class ApiWialon:
             raise ErreurApiWialon("CAMTRACKPRO_TOKEN absent de backend/.env")
         self._sid: str | None = None
         if SESSION_PARTAGEE:
-            self._sid = _sid_partage.get("sid")
+            with _SID_VERROU:
+                self._sid = _sid_partage.get("sid")
         self._ids_rapport: tuple[int, int] | None = None
         self._verrou = threading.Lock()
+
+    def _invalider_sid(self) -> None:
+        """Invalide la session COURANTE, sans écraser une session plus récente
+        qu'un autre thread viendrait d'ouvrir (lecture/écriture atomiques)."""
+        with _SID_VERROU:
+            if SESSION_PARTAGEE and _sid_partage.get("sid") == self._sid:
+                _sid_partage["sid"] = None
+            self._sid = None
 
     # ---------------------------------------------------------------- bas
     def _appel(self, svc: str, params: dict, reessai: bool = True) -> dict | list:
@@ -295,41 +311,36 @@ class ApiWialon:
         if isinstance(data, dict) and data.get("error"):
             code_err = int(data["error"])
             if code_err == 1 and reessai:      # session expirée
-                self._sid = None
-                if SESSION_PARTAGEE:
-                    _sid_partage["sid"] = None
+                self._invalider_sid()
                 self.connecter()
                 return self._appel(svc, params, reessai=False)
             if code_err in (1, 4, 7, 8):
-                self._sid = None
-                if SESSION_PARTAGEE:
-                    _sid_partage["sid"] = None
+                self._invalider_sid()
             raise ErreurApiWialon(f"svc={svc} → erreur Wialon "
                                   f"{data.get('error')} : "
                                   f"{str(data.get('reason'))[:120]}")
         return data
 
     def connecter(self) -> str:
-        with self._verrou:
-            try:
-                r = self._appel("token/login", {"token": self._jeton},
-                                reessai=False)
-                if not isinstance(r, dict) or "eid" not in r:
-                    self._sid = None
+        # Verrou GLOBAL : le check-then-login atomique empêche deux threads de
+        # s'authentifier simultanément et de s'invalider mutuellement.
+        with _SID_VERROU:
+            with self._verrou:
+                try:
+                    r = self._appel("token/login", {"token": self._jeton},
+                                    reessai=False)
+                    if not isinstance(r, dict) or "eid" not in r:
+                        self._invalider_sid()
+                        raise ErreurApiWialon(f"jeton refusé : {r}")
+                    self._sid = r["eid"]
                     if SESSION_PARTAGEE:
-                        _sid_partage["sid"] = None
-                    raise ErreurApiWialon(f"jeton refusé : {r}")
-                self._sid = r["eid"]
-                if SESSION_PARTAGEE:
-                    _sid_partage["sid"] = self._sid
-                log.info("CamtrackPro API : session Wialon ouverte (%s)",
-                         r.get("user", {}).get("nm"))
-                return self._sid
-            except Exception:
-                self._sid = None
-                if SESSION_PARTAGEE:
-                    _sid_partage["sid"] = None
-                raise
+                        _sid_partage["sid"] = self._sid
+                    log.info("CamtrackPro API : session Wialon ouverte (%s)",
+                             r.get("user", {}).get("nm"))
+                    return self._sid
+                except Exception:
+                    self._invalider_sid()
+                    raise
 
     def _exiger_session(self) -> None:
         if not self._sid:
@@ -446,9 +457,21 @@ class ApiWialon:
                 log.info("CamtrackPro API : rapport « %s » -> %d ligne(s) détectée(s)", nom, n_lig)
                 if n_lig <= 0:
                     continue
-                lignes = self._appel("report/get_result_rows", {
-                    "tableIndex": 0, "indexFrom": 0, "indexTo": n_lig})
-                if not isinstance(lignes, list):
+                # Pagination OBLIGATOIRE : `report/get_result_rows` plafonne le
+                # nombre de lignes par réponse — un seul appel avec indexTo =
+                # n_lig tronquait silencieusement les journées denses.
+                lignes: list = []
+                pas = 1000
+                depuis = 0
+                while depuis < n_lig:
+                    lot = self._appel("report/get_result_rows", {
+                        "tableIndex": 0, "indexFrom": depuis,
+                        "indexTo": min(n_lig, depuis + pas)})
+                    if not isinstance(lot, list) or not lot:
+                        break
+                    lignes.extend(lot)
+                    depuis += len(lot)
+                if not lignes:
                     continue
                 bruts = [it for it in (
                     item_depuis_ligne_rapport(nom, lig.get("c") or [], col_map=col_map)
@@ -499,10 +522,13 @@ class ApiWialon:
                 log.info("CamtrackPro API: Réponse Wialon pour %s -> total=%d, messages_inline=%d",
                          plaque, total, len(msgs))
 
-                # Si messages non retournés directement en inline mais count > 0, on pagine avec messages/get_messages
-                if not msgs and total > 0:
-                    saute = 0
-                    page_size = 2000
+                # Pagination dès que `count` dépasse les messages reçus
+                # INLINE (l'ancien test `if not msgs and total > 0` laissait
+                # tomber la FIN de journée quand Wialon renvoyait un lot
+                # partiel en ligne). Idempotent : on ne lit que le manquant.
+                if total > len(msgs):
+                    saute = len(msgs)
+                    page_size = 1000
                     while saute < total:
                         lot = self._appel("messages/get_messages", {
                             "indexFrom": saute,
@@ -512,7 +538,7 @@ class ApiWialon:
                         if not page_msgs:
                             break
                         msgs.extend(page_msgs)
-                        saute += page_size
+                        saute += len(page_msgs)
                         time.sleep(0.05)
 
                 points_unite: list[dict] = []

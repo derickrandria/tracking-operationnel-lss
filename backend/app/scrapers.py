@@ -1709,12 +1709,12 @@ class CamtrackProTrajetsCollector:
             if debut is None or fin is None:      # trajet non clôturé → ignoré
                 continue
             if fin <= debut:
-                from datetime import timedelta
-                if (fin + timedelta(hours=3)) > debut and (fin + timedelta(hours=3) - debut).total_seconds() <= 43200:
-                    fin = fin + timedelta(hours=3)
-                else:
-                    log.warning("CamtrackPro screen : trajet ignoré car fin (%s) <= début (%s) pour %s", fin, debut, cellules[ci["veh"]])
-                    continue
+                # `parse_dt` convertit déjà UTC→local : une fin <= début est
+                # une donnée corrompue du portail — on ignore la ligne (PAS
+                # de correction +3h en dur : durées gonflées / trajets longs
+                # jetés silencieusement).
+                log.warning("CamtrackPro screen : trajet ignoré car fin (%s) <= début (%s) pour %s", fin, debut, cellules[ci["veh"]])
+                continue
             plaque = ident_vehicule(cellules[ci["veh"]]) or plaque_attendue
             # Addendum v1.5 §4.2 : validité = distance ≥ 0,3 km ET
             # en_mouvement ≥ 20 min (le rejet est tranché côté réconciliation,

@@ -1362,7 +1362,10 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
             "lat": lat, "lng": lon, "vitesse": vitesse, "adresse": adresse,
             "maj": iso(ts),
         })
-    return {"suivi_id": suivi.id, "type": type_ev.value}
+    # `type_evenement` peut arriver en enum (flux internes) OU en chaîne brute
+    # (collecteurs portails — v1.46) : ne JAMAIS planter sur `.value`.
+    type_val = type_ev.value if hasattr(type_ev, "value") else str(type_ev)
+    return {"suivi_id": suivi.id, "type": type_val}
 
 
 # ------------------------------------------------------------------ missions (§6.3)
