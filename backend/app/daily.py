@@ -202,13 +202,12 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session,
     des positions (messages/load_interval) du jour [00:00:00 -> 23:59:59], insère ces
     événements réels dans `evenements_gps` avec absorption des doublons `begin_nested()`,
     et réconcilie les trajets officiels dans `SuiviJournalier`.
-    `reseau=False` : JAMAIS d'appel réseau — uniquement la configuration
-    certifiée locale du jour (utilisé au démarrage et par les tests ; s'il
-    n'existe pas de configuration certifiée pour ce jour, il n'y a RIEN à
-    injecter — jamais de repli sur une autre date)."""
+    `reseau=False` : JAMAIS d'appel réseau — RIEN n'est injecté (v149 :
+    utilisé au démarrage et par les tests ; §10/R2 : jamais de données
+    inventées)."""
     from .api_wialon import ApiWialon, jeton_configure
-    from .engine import cle_idempotence_evenement, recalculer_temps, ensure_suivi
-    from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule, Trajet, SuiviJournalier
+    from .engine import cle_idempotence_evenement
+    from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule
     from .reconciliation import reconcilier_trajets_valides, normaliser_valides
     from sqlalchemy.exc import IntegrityError
 
@@ -216,110 +215,14 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session,
     inseres = 0
 
     if not (reseau and jeton_configure()):
-        log.info("Jeton Wialon non configuré : rattrapage CamtrackPro par configuration certifiée pour le %s", jour)
-        from datetime import time
-        config_par_jour = {
-            date(2026, 9, 14): {
-                "2066TBP": [(time(12, 6), time(15, 35), 85.0)],
-                "7766TBL": [(time(5, 45), time(9, 12), 110.0)],
-                "0826TBS": [(time(6, 15), time(8, 45), 75.0)],
-                "5646TCE": [(time(5, 30), time(9, 0), 120.0)],
-                "6256TCE": [(time(6, 0), time(8, 30), 65.0)],
-                "5616TCE": [(time(5, 45), time(8, 15), 60.0)],
-                "6546TCE": [(time(6, 0), time(8, 45), 70.0)],
-                "4296TCC": [(time(5, 30), time(9, 30), 130.0)],
-                "7306TCE": [(time(5, 0), time(9, 15), 140.0)],
-                "5626TCE": [(time(5, 15), time(8, 30), 100.0)],
-            },
-            date(2026, 9, 13): {
-                "0826TBS": [(time(7, 34), time(9, 3), 65.4)],
-                "5646TCE": [(time(7, 1), time(9, 17), 136.0)],
-                "6256TCE": [(time(8, 26), time(9, 24), 48.2)],
-                "5616TCE": [(time(8, 59), time(9, 55), 42.0)],
-                "6546TCE": [(time(9, 22), time(10, 14), 38.5)],
-                "2066TBP": [(time(11, 36), time(12, 25), 36.0)],
-                "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
-                "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(13, 33), 160.0)],
-                "5626TCE": [(time(8, 0), time(11, 41), 150.0)],
-                "7766TBL": [(time(6, 30), time(9, 15), 85.0)],
-            },
-            date(2026, 9, 12): {
-                "0826TBS": [(time(4, 48), time(14, 25), 295.4)],
-                "5646TCE": [(time(5, 6), time(8, 46), 112.5)],
-                "6256TCE": [(time(5, 19), time(9, 41), 180.0), (time(10, 13), time(18, 0), 228.0)],
-                "5616TCE": [(time(6, 51), time(10, 38), 110.0), (time(11, 15), time(12, 29), 85.0)],
-                "6546TCE": [(time(5, 6), time(18, 53), 320.0)],
-                "2066TBP": [(time(5, 3), time(18, 0), 340.0)],
-                "4296TCC": [(time(5, 52), time(12, 29), 280.0)],
-                "7306TCE": [(time(4, 49), time(8, 47), 160.0), (time(9, 46), time(18, 1), 288.2)],
-                "5626TCE": [(time(4, 55), time(8, 34), 140.0), (time(9, 13), time(12, 29), 88.1)],
-                "7766TBL": [(time(5, 30), time(14, 0), 240.0)],
-            },
-            date(2026, 9, 11): {
-                "0826TBS": [(time(6, 0), time(8, 30), 120.0), (time(9, 15), time(14, 28), 163.6)],
-                "5646TCE": [(time(5, 0), time(7, 30), 75.0), (time(8, 15), time(10, 1), 61.0)],
-                "6256TCE": [(time(5, 0), time(8, 41), 160.0)],
-                "5616TCE": [(time(5, 0), time(11, 29), 144.2)],
-                "6546TCE": [(time(5, 0), time(11, 22), 160.0)],
-                "2066TBP": [(time(5, 0), time(10, 49), 150.0)],
-                "4296TCC": [(time(6, 0), time(10, 26), 180.0)],
-                "7306TCE": [(time(6, 0), time(13, 44), 320.0)],
-                "5626TCE": [(time(5, 0), time(8, 41), 160.0)],
-                "7766TBL": [(time(6, 0), time(12, 30), 180.0)],
-            }
-        }
-        if jour not in config_par_jour:
-            log.info("Aucune configuration certifiée pour le %s — rien à "
-                     "injecter (jamais de repli sur une autre date)", jour)
-            return 0
-        cfg_jour = config_par_jour[jour]
-        vehs_ctp = db.scalars(select(Vehicule).where(Vehicule.plateforme_gps == "CAMTRACKPRO")).all()
-        for v in vehs_ctp:
-            s = ensure_suivi(db, v, jour)
-            trajets_cfg = cfg_jour.get(v.plaque)
-            db.execute(delete(Trajet).where(Trajet.suivi_id == s.id))
-            if trajets_cfg:
-                km_tot = 0.0
-                tcj_tot = 0
-                for idx, (t_deb, t_fin, dist_km) in enumerate(trajets_cfg, start=1):
-                    dt_deb = datetime.combine(jour, t_deb)
-                    dt_fin = datetime.combine(jour, t_fin)
-                    duree = int((dt_fin - dt_deb).total_seconds())
-                    tcj_tot += duree
-                    km_tot += dist_km
-                    pause_suiv = 0
-                    if idx < len(trajets_cfg):
-                        dt_suiv = datetime.combine(jour, trajets_cfg[idx][0])
-                        pause_suiv = max(0, int((dt_suiv - dt_fin).total_seconds()))
-                    tr = Trajet(
-                        id=uid(),
-                        suivi_id=s.id,
-                        numero=idx,
-                        heure_debut=dt_deb,
-                        heure_fin=dt_fin,
-                        pause_apres_s=pause_suiv,
-                        distance_km=dist_km,
-                        statut_source=StatutSourceTrajet.VALIDE,
-                        statut_validation=StatutValidationTrajet.VALIDE,
-                        source_plateforme="CAMTRACKPRO",
-                        conducteur_badge_id=s.conducteur_id or v.conducteur_actuel_id
-                    )
-                    db.add(tr)
-                    inseres += 1
-
-                recalculer_temps(db, s, cloture)
-                s.km_parcourus = round(km_tot, 1)
-            else:
-                s.heure_depart = None
-                s.arret_final = "Base LSS — Antananarivo"
-                s.km_parcourus = 0.0
-                s.tcj_s = 0
-                s.ttj_s = 0
-                s.total_pause_s = 0
-                s.tcc_s = 0
-        db.commit()
-        log.info("rattraper_evenements_gps_camtrackpro(%s) : %d trajet(s) de référence insérés", jour, inseres)
-        return inseres
+        # v149 (16/09/2026) — FINI les trajets codés en dur : sans jeton,
+        # RIEN à injecter, jamais de données inventées (§10/R2). Les tables
+        # ci-dessous écrasaient les trajets RÉELS relus au portail CamtrackPro
+        # (constats : 7766TBL 12/09 → 5:30/14:00/240 km ; 6256TCE 13/09 →
+        # 8:26/9:24/48,2 km au lieu de 5:10→22:12 ; TCJ 18:29 vs 9:32…).
+        log.info("Jeton Wialon absent : aucun rattrapage CamtrackPro pour le "
+                 "%s (aucune donnée codée en dur)", jour)
+        return 0
 
     api = ApiWialon()
     try:

@@ -107,6 +107,13 @@ def test_recalcul_et_coherence_bdd():
 
 def test_valeurs_specifiques_13_09_2026():
     print("\n[T2] Test des valeurs réelles 13/09/2026 (0826TBS à ~01:29 et 5646TCE à ~02:16)...")
+    print("  (v149 — exécuté uniquement si un jeton CamtrackPro/Wialon est")
+    print("   configuré ; sans portail, le rattrapage n'injecte RIEN et le test")
+    print("   ne vérifie que la cohérence — jamais des valeurs codées en dur.)")
+    from app.api_wialon import jeton_configure
+    if not jeton_configure():
+        print("  ⏭️  Jeton Wialon absent : contrôle des valeurs sauté (base locale conservée).")
+        return
     db = SessionLocal()
     try:
         h_0826 = db.scalar(select(HistoriqueJournalier).join(Vehicule).where(

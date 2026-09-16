@@ -70,9 +70,44 @@ COL_DEBUT, COL_FIN, COL_DISTANCE, COL_CONDUCTEUR = 0, 2, 7, 11
 COL_RALENTI, COL_VMAX = 5, 9
 
 
+# v148 — un en-tête d'EMPLACEMENT porte une ADRESSE, jamais un instant : « Emplacement
+# final » contient « fin » et écrasait la vraie colonne « Date et heure fin » dans la
+# détection par simple sous-chaîne (cause racine mesurée le 16/09/2026 : `fin = None`
+# sur TOUTES les lignes CamtrackPro → plus aucune fin officielle, trajets jamais
+# refermés, TCJ/TTJ/TCH faux et repli sur des tables codées en dur).
+_EN_TETES_SANS_INSTANT = ("emplacement", "lieu", "adresse", "position",
+                          "location", "address")
+
+
+def _en_tete_normalise(libelle) -> str:
+    """Libellé d'en-tête Wialon normalisé (minuscules, sans accents, espaces simples)."""
+    import unicodedata
+    txt = unicodedata.normalize(
+        "NFKD", str(libelle or "").strip().lower())
+    txt = "".join(c for c in txt if not unicodedata.combining(c))
+    return " ".join(txt.split())
+
+
 def detecter_colonnes_wialon(headers: list[str] | None = None) -> dict[str, int]:
     """Détecte les index des colonnes à partir des libellés du gabarit Wialon.
-    Supporte les gabarits 9 colonnes (standard), 10, 11 ou 12 colonnes avec repli robuste."""
+    Supporte les gabarits 9 colonnes (standard), 10, 11 ou 12 colonnes avec repli robuste.
+
+    Gabarit réel du compte LSS (« Detail Trajet Vehicule », 12 colonnes — relevé
+    API du 16/09/2026 sur 6256TCE) :
+      0 « Date et heure debut » · 1 « Emplacement initial » · 2 « Date et heure
+      fin » · 3 « Emplacement final » · 4 « Durée de trajet » · 5 « Ralenti
+      moteur » · 6 « En mouvement » · 7 « Distance parcourue » · 8 « Vitesse
+      moyenne » · 9 « Vitesse maximal » · 10 « Durée (Depuis Precedent
+      Trajet)) » · 11 « Conducteur ».
+
+    v148 (constat métier du 16/09/2026) — l'ancienne détection laissait le
+    DERNIER libellé gagner : « Emplacement finAL » (index 3, cellule d'adresse
+    sans epoch) écrasait « Date et heure fin » (index 2, instant) → la lecture
+    rendait `fin = None` pour chaque ligne et **toutes les fins de trajets
+    CamtrackPro étaient perdues**. La détection retient désormais le libellé le
+    plus SPÉCIFIQUE (intitulé exact > préfixe daté > préfixe) et ignore tout
+    en-tête d'emplacement.
+    """
     mapping = {
         "debut": COL_DEBUT,
         "fin": COL_FIN,
@@ -84,20 +119,45 @@ def detecter_colonnes_wialon(headers: list[str] | None = None) -> dict[str, int]
     if not headers:
         return mapping
 
+    meilleurs: dict[str, tuple[int, int]] = {}   # clé → (score, index)
+
+    def _retenir(cle: str, score: int, index: int) -> None:
+        if cle not in meilleurs or score > meilleurs[cle][0]:
+            meilleurs[cle] = (score, index)
+
     for i, h in enumerate(headers):
-        hl = (str(h) or "").strip().lower()
-        if "debut" in hl or "début" in hl or "start" in hl:
-            mapping["debut"] = i
-        elif "fin" in hl or "end" in hl:
-            mapping["fin"] = i
-        elif "distance" in hl or "km" in hl or "parcour" in hl:
-            mapping["distance"] = i
-        elif "ralenti" in hl or "idle" in hl:
-            mapping["ralenti"] = i
-        elif "max" in hl and ("vitesse" in hl or "speed" in hl or "v_max" in hl):
-            mapping["v_max"] = i
-        elif "conducteur" in hl or "driver" in hl or "chauffeur" in hl:
-            mapping["conducteur"] = i
+        hl = _en_tete_normalise(h)
+        if not hl:
+            continue
+        if not any(m in hl for m in _EN_TETES_SANS_INSTANT):
+            if hl in ("debut", "start", "date debut", "heure debut",
+                      "date et heure debut"):
+                _retenir("debut", 3, i)
+            elif hl in ("fin", "end", "date fin", "heure fin",
+                        "date et heure fin"):
+                _retenir("fin", 3, i)
+            elif hl.startswith(("date et heure debut", "date debut",
+                                "heure debut", "debut du", "debut de")):
+                _retenir("debut", 2, i)
+            elif hl.startswith(("date et heure fin", "date fin", "heure fin",
+                                "fin du", "fin de")):
+                _retenir("fin", 2, i)
+            elif hl.startswith("debut") or hl.startswith("start"):
+                _retenir("debut", 1, i)
+            elif hl.startswith("fin") or hl.startswith("end"):
+                _retenir("fin", 1, i)
+        if "distance" in hl or "parcour" in hl or "km" in hl:
+            _retenir("distance", 2 if ("distance" in hl or "parcour" in hl)
+                     else 1, i)
+        if "ralenti" in hl or "idle" in hl:
+            _retenir("ralenti", 2, i)
+        if "max" in hl and ("vitesse" in hl or "speed" in hl):
+            _retenir("v_max", 2, i)
+        if "conducteur" in hl or "driver" in hl or "chauffeur" in hl:
+            _retenir("conducteur", 2, i)
+
+    for cle, (_score, index) in meilleurs.items():
+        mapping[cle] = index
     return mapping
 
 
@@ -237,7 +297,16 @@ def item_depuis_ligne_rapport(nom_unite: str, cellules: list, col_map: dict[str,
     if debut is None:
         return None
 
-    fin = _parse_instant(cellules[idx_fin]) if idx_fin < len(cellules) else None
+    cellule_fin = cellules[idx_fin] if idx_fin < len(cellules) else None
+    fin = _parse_instant(cellule_fin)
+    if fin is None and _texte(cellule_fin).strip():
+        # v148 — la cellule « Fin » porte un texte mais AUCUN instant exploitable :
+        # signal d'une détection de colonnes décalée (constat 16/09/2026 :
+        # « Emplacement final » — une adresse — pris pour « Date et heure fin »).
+        # Le trajet serait alors laissé « en cours » à tort : on trace.
+        log.warning("Wialon API : heure de fin ILLISIBLE pour %s — cellule %r "
+                    "(colonnes détectées %s) : trajet laissé « en cours »",
+                    plaque, cellule_fin, col)
     if fin is not None and fin <= debut:
         # `_parse_instant` convertit déjà UTC→local (§0octies C1) : une fin
         # antérieure ou égale au début est une donnée corrompue du portail —
