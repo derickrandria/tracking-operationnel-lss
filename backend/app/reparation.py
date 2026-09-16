@@ -1158,6 +1158,123 @@ def reparer_fins_incoherentes(db=None) -> dict:
     return stats
 
 
+def reparer_trajets_sans_fin(db=None) -> dict:
+    """GARDE D'INTÉGRITÉ idempotente (exécutée à chaque démarrage, APRÈS
+    `reparer_fins_incoherentes`) — un trajet NON rejeté resté SANS
+    `heure_fin` sur une JOURNÉE PASSÉE est une ligne « en cours » jamais
+    jugée (fin absente du portail au moment de la collecte, panne au
+    bouclage, session interrompue) : elle fausse TCJ/TTJ/TCH et l'onglet
+    Historique (« trajets continus sans fin »). Surface constatée les
+    12-16/09/2026 (fins jamais reçues pour 26-31 trajets VALIDE/jour).
+
+    RÈGLE de clôture NON destructive (AM-2 / R2 — jamais de suppression,
+    aucune heure inventée hors sources existantes) :
+      1. début du trajet SUIVANT du même suivi (chaîne — la pause entre les
+         deux lignes reste calculée par `_recalculer_pauses`) ;
+      2. sinon le DERNIER événement GPS du véhicule ce jour-là postérieur
+         au début (dernière position connue du portail) ;
+      3. sinon 23:59:59 du jour (clôture réglementaire AM-3).
+    Jamais de fin <= début (repli 23:59:59). Les compteurs réglementaires
+    (TCC/TCJ/TTJ) et l'archive sont recalculés. Retourne un dict de stats."""
+    propre = db is None
+    db = db or SessionLocal()
+    from .models import EvenementGPS
+    stats = {"fermes": 0, "suivis": 0}
+    try:
+        aujour = now_local().date()
+        ouverts = db.scalars(select(Trajet).join(SuiviJournalier).where(
+            Trajet.heure_fin.is_(None),
+            Trajet.heure_debut.isnot(None),
+            SuiviJournalier.date_jour < aujour)).all()
+        if not ouverts:
+            db.commit()
+            return stats
+
+        def _plaque(sid):
+            sv = db.get(SuiviJournalier, sid)
+            return sv.vehicule.plaque if sv and sv.vehicule else None
+
+        touches: set[str] = set()
+        # regroupement par suivi pour la chaîne (numero ordonné)
+        par_suivi: dict[str, list] = {}
+        for t in ouverts:
+            par_suivi.setdefault(t.suivi_id, []).append(t)
+        for sid, trajets in par_suivi.items():
+            sv = db.get(SuiviJournalier, sid)
+            if sv is None:
+                continue
+            chaines = sorted(
+                db.scalars(select(Trajet).where(
+                    Trajet.suivi_id == sid).order_by(Trajet.numero)).all(),
+                key=lambda t: (t.heure_debut or datetime.min,
+                               t.numero or 0))
+            fin_jour = (datetime.combine(sv.date_jour, datetime.min.time())
+                        + timedelta(seconds=86399))
+            for t in trajets:
+                if t.heure_fin is not None or t.heure_debut is None:
+                    continue
+                fin = None
+                suiv = next((x for x in chaines
+                             if x.id != t.id and x.heure_debut
+                             and x.heure_debut > t.heure_debut), None)
+                if suiv is not None:
+                    fin = suiv.heure_debut
+                else:
+                    ev = db.scalar(select(EvenementGPS).where(
+                        EvenementGPS.vehicule_id == sv.vehicule_id,
+                        EvenementGPS.horodatage > t.heure_debut,
+                        EvenementGPS.horodatage <= fin_jour
+                    ).order_by(EvenementGPS.horodatage.desc()))
+                    if ev is not None:
+                        fin = ev.horodatage
+                if fin is None or fin > fin_jour:
+                    fin = fin_jour
+                if fin <= t.heure_debut:
+                    fin = fin_jour if fin_jour > t.heure_debut else t.heure_debut
+                t.heure_fin = fin
+                stats["fermes"] += 1
+                _audit(db, "trajet.sans_fin_jour_passe", t.id, {
+                    "plaque": _plaque(sid),
+                    "debut": iso(t.heure_debut),
+                    "fin_posee": iso(fin),
+                    "regle": "v147 : trajet « en cours » resté sans fin sur "
+                             "une journée passée → clôturé par la chaîne / "
+                             "la dernière position connue / 23:59:59 "
+                             "(aucune donnée supprimée)"})
+            touches.add(sid)
+
+        from .engine import recalculer_temps
+        for sid in touches:
+            suivi = db.get(SuiviJournalier, sid)
+            if suivi is None:
+                continue
+            trajets = list(db.scalars(select(Trajet).where(
+                Trajet.suivi_id == sid).order_by(Trajet.numero)).all())
+            _renumeroter(sorted(trajets, key=lambda t: t.heure_debut))
+            _recalculer_pauses(trajets)
+            db.flush()
+            try:
+                recalculer_temps(db, suivi, now_local())
+            except Exception:
+                log.exception("reparer_trajets_sans_fin : recalcul échoué %s",
+                              sid)
+            _synchroniser_archive(db, suivi)
+            stats["suivis"] += 1
+        db.commit()
+        if stats["fermes"]:
+            log.warning("Réparation v147 (trajets sans fin sur jours passés) :"
+                        " %s", stats)
+    except Exception:
+        db.rollback()
+        log.exception("Réparation v147 (trajets sans fin) en échec — reprise "
+                      "au prochain démarrage")
+        stats["erreur"] = True
+    finally:
+        if propre:
+            db.close()
+    return stats
+
+
 def nettoyer_alertes_missions_invalides(db=None) -> dict:
     """Purge / clôture toutes les fausses alertes de déchargement/chargement ou alertes sur lieux non officiels."""
     propre = False

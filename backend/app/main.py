@@ -564,6 +564,16 @@ async def _am4_puis_reparation_v130():
     except Exception:
         log.exception("v146 : réparation fins incohérentes en échec — reprise "
                       "au prochain démarrage")
+    try:
+        # v147 — garde d'intégrité des trajets « en cours » restés SANS fin
+        # sur des journées PASSÉES (falsifiait TCJ/TTJ/TCH et l'onglet
+        # Historique : trajets continus sans fin 12-16/09). Clôture par la
+        # chaîne / dernière position connue / 23:59:59, recalcul + archives.
+        # Idempotente, exécutée à CHAQUE démarrage, APRÈS v146.
+        await asyncio.to_thread(reparation.reparer_trajets_sans_fin)
+    except Exception:
+        log.exception("v147 : réparation trajets sans fin en échec — reprise "
+                      "au prochain démarrage")
 
 
 def rattraper_7_derniers_jours():
