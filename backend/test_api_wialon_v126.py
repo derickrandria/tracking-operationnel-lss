@@ -75,9 +75,10 @@ p = point_depuis_position_wialon(u)
 check("epoch UTC → HEURE LOCALE Antananarivo (UTC+3) à la seconde",
       p is not None and p["horodatage"] == datetime(2026, 8, 20, 6, 14, 37),
       str(p and p["horodatage"]))
-check("plaque libellé long → 6546TCE ; vitesse conservée ; type NON forcé",
+check("plaque libellé long → 6546TCE ; vitesse conservée ; type forcé "
+      "POSITION (spec v1.46 : seuil 3 km/h)",
       p["gps_associe"] == "6546TCE" and p["vitesse"] == 27.0
-      and p["type_evenement"] is None)
+      and p["type_evenement"] == "POSITION")
 check("sans dernier message (∅ pos) écarté ; sans GPS écarté ; non-plaque "
       "(garde D3) écarté",
       point_depuis_position_wialon({"nm": u["nm"]}) is None

@@ -1231,7 +1231,10 @@ class CollectorBase:
                     log.exception("Vérification conduite en échec (%s) — "
                                   "le point, lui, est enregistré",
                                   vehicule.plaque)
-                inseres += 1
+                # NB : PAS de second `inseres += 1` ici — l'ancien double
+                # comptage faisait renvoyer 2 pour un seul point inséré
+                # (métriques de collecte fausses : « N points insérés »,
+                # etat_collecte, diagnostics).
             # v1.17 — AUTO-RÉPARATION (bug métier 05/08) : un « Début du
             # trajet » CONNU (anti-rejeu) mais resté SANS trajet (création
             # manquée lors d'une passe défectueuse) n'était JAMAIS ré-essayé
