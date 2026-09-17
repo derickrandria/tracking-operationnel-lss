@@ -381,7 +381,11 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
         date_jour=suivi.date_jour,
         pause_min=pause_min, seuil_km=seuil_km,
         roule=roule, fin_substitution=fin_sub,
-        pause_affichee_min=pause_tcc)
+        pause_affichee_min=pause_tcc,
+        # v1.48 — écran = export = archive = MESURE : une ligne ouverte ne
+        # compte que jusqu'à sa dernière preuve (boîtier muet).
+        derniere_trace=fin_sub,
+        seuil_silence_s=float(seuils.get("SEUIL_GPS_HORS_LIGNE", 1800)))
 
     if not journee.lignes:
         suivi.heure_depart = None

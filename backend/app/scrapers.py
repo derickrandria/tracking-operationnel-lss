@@ -282,6 +282,20 @@ def etat_collecte_memoire() -> dict:
         }
 
 
+def sources_en_echec() -> list[str]:
+    """v1.48 — noms des sources dont la DERNIÈRE tentative a échoué.
+
+    `_etat_collecte_fin` remet `derniere_erreur` à None à chaque succès : la
+    présence d'une erreur signifie donc « la dernière tentative a échoué ».
+    Base commune de `/api/sante` (statut honnête) et de l'écran Suivi
+    Journalier (badge « source en panne » au lieu de « données en transit »).
+    """
+    with _ETAT_COLLECTE_LOCK:
+        sources = dict(_ETAT_COLLECTE.get("sources") or {})
+    return sorted(nom for nom, etat in sources.items()
+                  if isinstance(etat, dict) and etat.get("derniere_erreur"))
+
+
 def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
     """Exécute une passe de source N1 sans chevauchement avec timeout dur de 30s."""
     if not _acquerir_verrou_n1(source):

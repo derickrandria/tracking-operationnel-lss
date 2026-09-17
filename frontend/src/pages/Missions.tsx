@@ -1362,7 +1362,10 @@ function ModalNouvelleMission({
           >
             {vehicules.map((v) => (
               <option key={v.id} value={v.id}>
-                {v.plaque} {v.modele ? `(${v.modele})` : ""}
+                {/* v1.48 — `modele` n'existe ni dans le type Vehicule ni dans
+                    la réponse /api/vehicules (clés réelles : marque,
+                    description) : le libellé restait vide en silence. */}
+                {v.plaque} {v.marque ? `(${v.marque})` : ""}
               </option>
             ))}
           </select>

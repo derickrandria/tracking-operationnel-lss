@@ -110,3 +110,71 @@ curl -X POST -H "Authorization: Bearer <jeton>" ^
 **30/43 → 32/43** avec le commit `52dc843`, aucune régression.
 Rouges restants = chantiers distincts (v113, v125, v130 D4-2, v138, v14, v143,
 v121, v145 B9, v122, reglement_metier_missions, runner).
+
+
+---
+
+## 7. v1.48-bis — les deux corrections demandées (poussées le 17/09)
+
+### a) Compteurs bornés à la dernière preuve (`chaines.py`, `serializers.py`, `engine.py`)
+
+Constat de vos captures : 17 camions affichaient « TCC 0:02 · TCJ 3:58 ·
+TTJ 3:58 » à 12:42 pour un dernier mouvement à **08:43** — 3:58 était le temps
+écoulé depuis le dernier signal, pas une durée de conduite.
+
+Règle appliquée (`fin_bornee_ouverte`) : la ligne ouverte **reste « en cours »**
+à l'écran (arbitrage v1.16 préservé : un vrai long trajet ne disparaît pas),
+mais ses **compteurs se figent à `min(maintenant, dernière trace + 30 min)`**.
+Monotone (la trace ne recule jamais), aligné sur la frontière du badge
+« boîtier muet », et appliqué **partout** : écran, export, archive **et**
+`engine.recalculer_temps` (donc les valeurs stockées).
+
+Mesuré sur une instance réelle, scénario exact de vos captures :
+
+| | Avant | Après |
+|---|---|---|
+| TCJ / TTJ de `0576TCD` (dernier signal 08:43) | ≈ 166 min (et jusqu'à minuit) | **30 min**, figés |
+| État de la ligne | EN_COURS | EN_COURS (inchangé) |
+
+**Bonus mesuré** : `test_chaines_v113` passait 31 OK / **10 KO** — il est
+désormais **41 OK / 0 KO**. Ces 10 KO portaient précisément sur les compteurs
+des lignes ouvertes.
+
+### b) Badge honnête (`scrapers.py`, `main.py`, `operations.py`, frontend)
+
+`scrapers.sources_en_echec()` expose les portails dont la **dernière tentative a
+échoué** (une réussite remet `derniere_erreur` à `None`). `/api/suivi` transporte
+la liste, `s_suivi` porte `plateforme_gps`, et la grille affiche :
+
+- **rouge** « source MZONEX en panne — collecte interrompue » quand la panne est
+  **globale au portail** (il n'y a rien à attendre) ;
+- **orange** « boîtier muet — données en transit » sinon (zone sans réseau,
+  remontée automatique attendue) — message d'origine conservé.
+
+Le bundle `frontend/dist` a été **reconstruit et committé** (c'est lui qui est
+servi : `app.mount("/", SPAStaticFiles(directory=FRONTEND_DIST))`).
+
+### c) Trois erreurs de type corrigées (le build était aveugle)
+
+`npx tsc --noEmit` renvoie désormais **0 erreur** (il en renvoyait 3) :
+`Missions.tsx` lisait `v.modele` (champ inexistant → libellé vide en silence),
+`TempsConduite.tsx` utilisait un repli aux clés périmées (`nb_chauffeurs_actifs`
+au lieu de `total_chauffeurs`…) et incomplet (`du`/`au`/`seuils` manquants).
+
+### d) Suites de tests
+
+**34 / 44** (contre 30/43 avant le premier commit) — dont la nouvelle suite
+`test_compteurs_muets_v148.py` **14 OK / 0 KO**. Rouges restants (10, chantiers
+distincts) : v125, v143, v138, v145 (47/1), v122 (25/1), v14, v121,
+reglement_metier_missions, v130 (25/1), runner.
+
+### À faire de votre côté
+
+```powershell
+git pull origin arena/01a0aa2b-tracking-operationnel-lss
+# redémarrer le service (le bundle front est déjà committé : rien à builder)
+```
+
+Attendu à l'écran (une fois la source MZONEX rétablie ou non) : les lignes de
+camions MZoneX affichent **« source MZONEX en panne — collecte interrompue »** au
+lieu de « données en transit », et leurs compteurs ne gonflent plus.

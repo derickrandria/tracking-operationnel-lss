@@ -127,6 +127,9 @@ export interface GrilleSuiviProps {
   /** §0vicies decies N1 : journée terminée → colonne TCC affichée « 0:00 ». */
   masquerTCC?: boolean;
   onRefresh?: () => void;
+  /** v1.48 — portails dont la collecte est EN PANNE (cf. /api/sante) :
+      le badge « en transit » y devient trompeur, on le dit franchement. */
+  sourcesEnPanne?: string[];
 }
 
 function extraireConducteursRelais(l: SuiviLigne): Array<{ nom: string; duree_s: number }> {
@@ -165,7 +168,12 @@ function fmtDureeRelais(sec: number): string {
 
 export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                                       lectureSeule, onEdit, pendingUI,
-                                      masquerTCC, onRefresh }: GrilleSuiviProps) {
+                                      masquerTCC, onRefresh,
+                                      sourcesEnPanne = [] }: GrilleSuiviProps) {
+  const portailsEnPanne = new Set(
+    (sourcesEnPanne || []).map((x) => (x || "").toUpperCase()));
+  const pannePortail = (portail?: string | null) =>
+    !!portail && portailsEnPanne.has(portail.toUpperCase());
   const [extra, setExtra] = useState<SuiviLigne | null>(null);
   const [arbitrageLigne, setArbitrageLigne] = useState<SuiviLigne | null>(null);
   const [choixArbitrage, setChoixArbitrage] = useState<"PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE">("PASSAGE_TEMPORAIRE");
@@ -261,13 +269,23 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
               <td className={cls("whitespace-nowrap text-slate-400 text-[12px]",
                 modeDetail && "sticky left-[104px] z-10 bg-white dark:bg-nuit-900")}>
                 {l.description}
-                {/* §0nonies decies M4 (29/08/2026) — boîtier muet : zone sans
-                    réseau probable ; la relecture officielle complètera seule */}
+                {/* v1.48 — deux silences, deux messages :
+                    · SOURCE en panne (portail entier HS, cf. /api/sante) :
+                      rouge, aucune donnée n'arrive, il n'y a rien à attendre ;
+                    · boîtier muet (§0nonies decies M4) : orange, zone sans
+                      réseau probable, la relecture officielle complètera. */}
                 {!fige && l.gps_age_s != null && l.gps_age_s > 1800 && (
-                  <div className="mt-0.5 text-[10px] font-semibold text-amber-500"
-                    title="Aucun signal du boîtier depuis plus de 30 min — zone sans réseau probable : les trajets seront complétés automatiquement à la remontée des données (relecture officielle, §0nonies decies M1).">
-                    boîtier muet — données en transit
-                  </div>
+                  pannePortail(l.plateforme_gps) ? (
+                    <div className="mt-0.5 text-[10px] font-semibold text-red-500"
+                      title={`La collecte ${l.plateforme_gps} est en panne (voir /api/sante) : la plateforme ne reçoit plus AUCUNE donnée de ce portail. Les trajets manquants ne pourront être complétés qu'après rétablissement de la source.`}>
+                      source {l.plateforme_gps} en panne — collecte interrompue
+                    </div>
+                  ) : (
+                    <div className="mt-0.5 text-[10px] font-semibold text-amber-500"
+                      title="Aucun signal du boîtier depuis plus de 30 min — zone sans réseau probable : les trajets seront complétés automatiquement à la remontée des données (relecture officielle, §0nonies decies M1).">
+                      boîtier muet — données en transit
+                    </div>
+                  )
                 )}
               </td>
               <td className={cls("whitespace-nowrap",

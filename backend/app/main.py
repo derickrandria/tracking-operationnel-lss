@@ -761,9 +761,8 @@ def sante(db: Session = Depends(get_db)):
         # source totalement morte (MZoneX, SSO refusé — constat du 17/09/2026)
         # restait annoncée « COLLECTE_OK » tant que l'autre source fournissait
         # des points. Un état de santé qui ne voit pas la panne ne sert à rien.
-        sources_en_echec = sorted(
-            nom for nom, etat in sources.items()
-            if isinstance(etat, dict) and etat.get("derniere_erreur"))
+        from .scrapers import sources_en_echec as _sources_en_echec
+        sources_en_echec = _sources_en_echec()
         if dernier_ev is None or retard_s is None:
             statut_str = "AUCUNE_COLLECTE"        # aucun point GPS en 24 h
         elif retard_s > 900:

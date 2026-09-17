@@ -84,6 +84,9 @@ export interface SuiviLigne {
   date_jour: string;
   vehicule_id: string;
   plaque: string;
+  /** v1.48 — portail d'appartenance (MZONEX / CAMTRACKPRO) : permet à la
+      grille de distinguer « boîtier muet » d'une panne de SOURCE. */
+  plateforme_gps?: string | null;
   description: string | null;
   conducteur_id: string | null;
   conducteur: Conducteur | null;

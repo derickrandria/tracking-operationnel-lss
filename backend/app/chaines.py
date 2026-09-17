@@ -58,7 +58,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 log = logging.getLogger("tracking.chaines")
 
@@ -164,12 +164,50 @@ def _fin_effective(seg: Segment, vivant_possible: bool, roule: bool,
     return max(sub, seg.debut)
 
 
+#: v1.48 — silence au-delà duquel les COMPTEURS d'une ligne ouverte se figent
+#: à la dernière preuve (défaut aligné sur SEUIL_GPS_HORS_LIGNE = 30 min).
+SEUIL_SILENCE_MUET_S = 1800.0
+
+
+def fin_bornee_ouverte(debut: datetime, maintenant: datetime,
+                       derniere_trace: datetime | None = None,
+                       seuil_silence_s: float = SEUIL_SILENCE_MUET_S) -> datetime:
+    """v1.48 — fin retenue pour les COMPTEURS d'une ligne OUVERTE :
+    ``max(debut, min(maintenant, derniere_trace + seuil_silence_s))``.
+
+    Deux règles du corpus se conciliaient mal :
+      · v1.16 — un trajet en cours reste « en cours » SANS condition de
+        fraîcheur : sinon un trajet commencé à 11:37 disparaissait après
+        15 min sans nouvel événement (« TCC cassé »). L'AFFICHAGE de la ligne
+        reste donc EN_COURS (aucun changement) ;
+      · §10 / consolidation — on ne ferme jamais à l'aveugle : la fin d'un
+        ouvert est ``min(clôture, dernier signal)``.
+
+    Constat exploitant du 17/09/2026 (panne MZoneX depuis 08:43) : sans borne,
+    chaque ligne ouverte comptait jusqu'à l'heure de consultation — 17 camions
+    affichaient « TCC 0:02 · TCJ 3:58 · TTJ 3:58 » à 12:42 pour un dernier
+    mouvement à 08:43, et ces valeurs auraient couru jusqu'à minuit.
+
+    Règle : la présomption de conduite est BORNÉE à la dernière preuve +
+    ``seuil_silence_s`` (la frontière même du badge « boîtier muet »). La
+    valeur est MONOTONE (la trace ne recule jamais) : au pire 30 min de
+    présomption, jamais un compteur fantôme. L'écran, l'export, la mesure et
+    l'archive donnent le même résultat. Fonction PURE.
+    """
+    if derniere_trace is None:
+        return max(maintenant, debut)
+    plafond = derniere_trace + timedelta(seconds=float(seuil_silence_s))
+    return max(debut, min(maintenant, plafond))
+
+
 def construire_journee(segments: list[Segment], *, maintenant: datetime,
                        date_jour: date | None = None,
                        pause_min: float = 1200, seuil_km: float = 0.3,
                        roule: bool = False,
                        fin_substitution: datetime | None = None,
-                       pause_affichee_min: float = 1800) -> JourneeChainee:
+                       pause_affichee_min: float = 1800,
+                       derniere_trace: datetime | None = None,
+                       seuil_silence_s: float = SEUIL_SILENCE_MUET_S) -> JourneeChainee:
     """Assemble la journée v3 (AMÉLIORATIONS, arbitrages C1→C4 du 22/08/2026).
 
     AM-2 : UN TRAJET VALIDE = UNE LIGNE (plus de fusion d'affichage) ; les
@@ -253,7 +291,12 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
                 and s.distance_km < seuil_km):
             continue                      # manœuvre clôturée : cachée (R2)
         ouverte = s.fin is None and fin_s is None
-        fin_travail = fin_s if not ouverte else maintenant
+        # v1.48 — la ligne reste « en cours » à l'écran (v1.16), mais sa durée
+        # de travail est bornée à la dernière PREUVE connue : un boîtier muet
+        # n'alimente plus un compteur fantôme.
+        fin_travail = (fin_bornee_ouverte(s.debut, maintenant, derniere_trace,
+                                          seuil_silence_s)
+                       if ouverte else fin_s)
         dist = None if s.distance_km is None else round(s.distance_km, 3)
         res.lignes.append(LigneJournee(
             debut=s.debut, fin=None if ouverte else fin_s,
@@ -285,9 +328,16 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     # ouverte) : l'amplitude englobe toujours toutes les lignes.
     if res.lignes:
         depart = res.lignes[0].debut
-        fin_ref = max(lg.fin or maintenant for lg in res.lignes)
-        raw_tcj = union_duree_s((lg.debut, lg.fin or maintenant)
-                                for lg in res.lignes)
+        # v1.48 — bornes EFFECTIVES : une ligne ouverte s'arrête à sa dernière
+        # preuve (+ présomption bornée), jamais à l'heure de consultation.
+        bornes_eff = [
+            (lg.debut,
+             lg.fin if lg.fin is not None
+             else fin_bornee_ouverte(lg.debut, maintenant, derniere_trace,
+                                     seuil_silence_s))
+            for lg in res.lignes]
+        fin_ref = max(f for _, f in bornes_eff)
+        raw_tcj = union_duree_s(bornes_eff)
         raw_ttj = max(0, int((fin_ref - depart).total_seconds()))
 
         if raw_tcj > 86400 or raw_ttj > 86400:

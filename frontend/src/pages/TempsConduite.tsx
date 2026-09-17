@@ -61,6 +61,17 @@ const COULEURS_STATUT: Record<string, string> = {
   INACTIF: "bg-slate-500/15 text-slate-500 border-slate-500/40",
 };
 
+/** v1.48 — repli neutre COMPLET (l'ancien objet n'avait ni `du`/`au`/`seuils`
+    ni les clés réelles de `stats` : en cas d'échec, l'écran affichait des
+    valeurs vides sans que le type s'en aperçoive). */
+const SYNTHESE_VIDE: SyntheseTCH = {
+  du: "", au: "", dates: [],
+  seuils: { seuil_alerte_s: 0, seuil_max_s: 0, seuil_reset_repos_s: 0 },
+  stats: { total_chauffeurs: 0, en_conduite_aujourdhui: 0, proche_limite: 0,
+           limite_atteinte: 0, tch_moyen_s: 0 },
+  lignes: [],
+};
+
 export default function TempsConduite() {
   const [params, setParams] = useSearchParams();
   const P = useMemo(presets, []);
@@ -102,10 +113,10 @@ export default function TempsConduite() {
       if (filtreAlerte) p.set("alerte", filtreAlerte);
 
       const d = await api(`/api/temps-conduite?${p}`);
-      setData(d || { dates: [], lignes: [], stats: { nb_chauffeurs_actifs: 0, nb_proche_limite: 0, nb_limite_atteinte: 0, tch_moyen_s: 0 } });
+      setData(d || SYNTHESE_VIDE);
     } catch (e: any) {
       addToast({ type: "erreur", titre: "Erreur de chargement", message: e.message });
-      setData({ dates: [], lignes: [], stats: { nb_chauffeurs_actifs: 0, nb_proche_limite: 0, nb_limite_atteinte: 0, tch_moyen_s: 0 } });
+      setData(SYNTHESE_VIDE);
     } finally {
       setChargement(false);
     }

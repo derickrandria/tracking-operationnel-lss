@@ -30,7 +30,11 @@ type EtatSave = { etat: "neutre" | "attente" | "en_cours" | "ok" | "erreur"; heu
 export default function Suivi() {
   const [params, setParams] = useSearchParams();
   const [date, setDate] = useState(params.get("date") || todayISO());
-  const [data, setData] = useState<{ lignes: SuiviLigne[]; seuils: Record<string, number> } | null>(null);
+  const [data, setData] = useState<{
+    lignes: SuiviLigne[]; seuils: Record<string, number>;
+    /** v1.48 — sources portails dont la dernière collecte a échoué. */
+    sources_en_echec?: string[];
+  } | null>(null);
   const [refs, setRefs] = useState<Referentiels | null>(null);
   const [recherche, setRecherche] = useState(params.get("q") || "");
   const [filtreStatut, setFiltreStatut] = useState("");
@@ -346,6 +350,7 @@ export default function Suivi() {
           <div className="flex h-40 items-center justify-center gap-2 text-slate-400"><Spinner /> Chargement…</div>
         ) : (
           <GrilleSuivi lignes={lignes} seuils={data?.seuils} modeDetail={modeDetail}
+            sourcesEnPanne={data?.sources_en_echec ?? []}
             refs={refs} lectureSeule={lectureSeule}
             onEdit={lectureSeule ? undefined : programmer} pendingUI={pendingUI}
             /* §0vicies decies N1 — TCC « 0:00 » dès que le jour n'est plus le jour en cours */

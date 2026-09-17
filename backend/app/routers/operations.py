@@ -59,7 +59,13 @@ def liste_suivi(date: str | None = None, db: Session = Depends(get_db),
     seuils = get_seuils(db)
     lignes = _masquer_tcc_si_jour_passe(
         [s_suivi(s, seuils) for s in suivis], jour)
-    return {"date": jour.isoformat(), "seuils": seuils, "lignes": lignes}
+    # v1.48 — état des sources joint à la grille : l'écran peut alors dire
+    # « source X en panne — collecte interrompue » (badge rouge) au lieu de
+    # « boîtier muet — données en transit » (orange) quand la panne est
+    # GLOBALE à un portail, et non propre à un boîtier.
+    from ..scrapers import sources_en_echec
+    return {"date": jour.isoformat(), "seuils": seuils, "lignes": lignes,
+            "sources_en_echec": sources_en_echec()}
 
 
 class SuiviPatch(BaseModel):

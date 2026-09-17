@@ -1,8 +1,8 @@
 """Sérialisation des entités vers les réponses JSON de l'API."""
 from datetime import datetime
 
-from .chaines import (ETAT_OFFICIEL, LigneJournee, Segment,
-                      construire_journee)
+from .chaines import (ETAT_OFFICIEL, SEUIL_SILENCE_MUET_S, LigneJournee,
+                      Segment, construire_journee)
 from .config import jour_attribution, now_local
 from .models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
                      Mission, StatutMission, StatutValidationTrajet, SuiviJournalier, Trajet,
@@ -169,7 +169,12 @@ def journee_suivi(s: SuiviJournalier, seuils: dict | None = None,
         pause_min=float(seuils.get("DUREE_MIN_PAUSE_VALIDE", 1200)),
         seuil_km=float(seuils.get("SEUIL_DISTANCE_MIN_TRAJET_KM", 0.3)),
         roule=roule, fin_substitution=fin_sub,
-        pause_affichee_min=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC", 1800)))
+        pause_affichee_min=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC", 1800)),
+        # v1.48 — compteurs bornés à la dernière preuve : `fin_sub` est le
+        # dernier événement GPS connu du véhicule (None si jamais vu).
+        derniere_trace=fin_sub,
+        seuil_silence_s=float(seuils.get("SEUIL_GPS_HORS_LIGNE",
+                                         SEUIL_SILENCE_MUET_S)))
     if est_jour_passe:
         for lg in journee.lignes:
             lg.etat = ETAT_OFFICIEL
@@ -361,6 +366,9 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         # Partie A
         "vehicule_id": s.vehicule_id,
         "plaque": s.vehicule.plaque if s.vehicule else None,
+        # v1.48 — portail d'appartenance : l'écran distingue ainsi « boîtier
+        # muet » (données en transit) d'une SOURCE EN PANNE (cf. /api/sante).
+        "plateforme_gps": (s.vehicule.plateforme_gps if s.vehicule else None),
         "description": s.vehicule.description if s.vehicule else None,
         "conducteur_id": s.conducteur_id,
         "conducteur": s_conducteur(s.conducteur, court=True),
