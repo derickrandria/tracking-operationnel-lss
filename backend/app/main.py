@@ -593,6 +593,20 @@ def rattraper_7_derniers_jours():
         nb_vehs = db.scalar(select(func.count(Vehicule.id))) or 0
         seuil_archive_complete = max(1, nb_vehs - 5) if nb_vehs > 0 else 1
 
+        # v148 — l'import Ym@ne n'est PAS journalier : la fenêtre A-I5 couvre
+        # J-8→J et l'upsert est idempotent par `exceptionid`. L'ancien appel
+        # « pour ce jour » passait `debut=`/`fin=`, absents de la signature
+        # `(db, items, maintenant)` : TypeError avalé par le `except`, donc
+        # AUCUNE infraction Ym@ne importée depuis le 14/09/2026. Une seule
+        # passe, observable (§0septies decies K1 : alerte si échec, fermeture
+        # automatique à la guérison), couvre les 7 jours rattrapés.
+        try:
+            from .ymane_import import cycle_ymane_avec_alerte
+            stats_ym = cycle_ymane_avec_alerte(db)
+            log.info("Boot Catch-up Ym@ne : %s", stats_ym)
+        except Exception as e:
+            log.warning("Boot Catch-up Ym@ne : %s", e)
+
         for offset in range(7, 0, -1):
             jour_cible = aujour - timedelta(days=offset)
             nb_arch = db.scalar(select(func.count(HistoriqueJournalier.id)).where(
@@ -604,14 +618,8 @@ def rattraper_7_derniers_jours():
                 log.info("Boot Catch-up: Journée du %s incomplète (%d/%d archives) — lancement de la récupération...",
                          jour_cible.isoformat(), nb_arch, nb_vehs)
 
-                # 1. Collecte Ym@ne pour ce jour
-                try:
-                    from .ymane_import import importer_infractions_ymane
-                    importer_infractions_ymane(db, debut=jour_cible, fin=jour_cible)
-                except Exception as e:
-                    log.warning("Boot Catch-up Ym@ne pour %s : %s", jour_cible, e)
-
-                # 2. Collecte et recalcul de l'archive (CamTrackPro / MZoneX)
+                # 1. Collecte et recalcul de l'archive (CamTrackPro / MZoneX)
+                #    (Ym@ne a été importé en une passe avant la boucle — v148)
                 try:
                     res_recalc = recalculer_archives_journee(jour_cible, db=db)
                     log.info("Boot Catch-up: Journée du %s rattrapée avec succès (%s)",
@@ -744,12 +752,32 @@ def sante(db: Session = Depends(get_db)):
             select(func.count(Vehicule.id)).where(Vehicule.statut == StatutVehicule.ACTIF)
         ) or 0
 
-        statut_str = "COLLECTE_OK" if (retard_s is None or retard_s <= 900) else "RETARD_COLLECTE"
         etat_coll = etat_collecte_memoire()
+        sources = etat_coll.get("sources") or {}
+        # v148-bis — l'état de santé reflète la source la PLUS FAIBLE :
+        # `derniere_erreur` est remise à None à chaque succès réussi
+        # (scrapers._etat_collecte_fin), donc sa présence = dernière tentative
+        # en échec. Avant, seul l'âge du dernier point GPS comptait : une
+        # source totalement morte (MZoneX, SSO refusé — constat du 17/09/2026)
+        # restait annoncée « COLLECTE_OK » tant que l'autre source fournissait
+        # des points. Un état de santé qui ne voit pas la panne ne sert à rien.
+        sources_en_echec = sorted(
+            nom for nom, etat in sources.items()
+            if isinstance(etat, dict) and etat.get("derniere_erreur"))
+        if dernier_ev is None or retard_s is None:
+            statut_str = "AUCUNE_COLLECTE"        # aucun point GPS en 24 h
+        elif retard_s > 900:
+            statut_str = "RETARD_COLLECTE"
+        elif sources_en_echec:
+            statut_str = "COLLECTE_DEGRADEE"
+        else:
+            statut_str = "COLLECTE_OK"
 
         return {
             "statut": statut_str,
             "statut_collecte": statut_str,
+            "sources_en_echec": sources_en_echec,
+            "collecte_par_source": sources,
             "pid": os.getpid(),
             "version": APP_VERSION,
             "heure_serveur": now.isoformat(),
@@ -771,7 +799,9 @@ def sante(db: Session = Depends(get_db)):
     except Exception as e:
         log.exception("Erreur dans /api/sante")
         return {
-            "statut": "COLLECTE_OK",
+            # v148-bis — un diagnostic qui échoue ne peut PAS se déclarer sain
+            # (avant : « COLLECTE_OK » en repli — faux vert garanti).
+            "statut": "DIAGNOSTIC_INDISPONIBLE",
             "pid": os.getpid(),
             "version": APP_VERSION,
             "heure_serveur": now_local().isoformat(),

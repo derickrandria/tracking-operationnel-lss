@@ -153,6 +153,13 @@ def journee_suivi(s: SuiviJournalier, seuils: dict | None = None,
     OFFICIELLE — jamais de PROVISOIRE dans l'historique."""
     seuils = seuils or {}
     maintenant = maintenant or now_local()
+    # v148 — le test « journée passée » DOIT être évalué AVANT de ramener
+    # `maintenant` à la clôture du jour : sinon `jour_attribution(maintenant)`
+    # == s.date_jour, la condition `s.date_jour < ...` devient fausse, et la
+    # journée passée n'était JAMAIS officialisée (dernière ligne de chaque
+    # journée rendue PROVISOIRE à l'écran, à l'export et dans l'archive,
+    # contre l'Addendum v1.8 §4 / CA-4 et [R-11]).
+    est_jour_passe = bool(s.date_jour and s.date_jour < maintenant.date())
     if s.date_jour and maintenant.date() > s.date_jour:
         maintenant = datetime.combine(s.date_jour, datetime.max.time().replace(microsecond=0))
     roule, fin_sub = etat_roulage(s.vehicule, maintenant, seuils)
@@ -163,7 +170,7 @@ def journee_suivi(s: SuiviJournalier, seuils: dict | None = None,
         seuil_km=float(seuils.get("SEUIL_DISTANCE_MIN_TRAJET_KM", 0.3)),
         roule=roule, fin_substitution=fin_sub,
         pause_affichee_min=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC", 1800)))
-    if s.date_jour and s.date_jour < jour_attribution(maintenant):
+    if est_jour_passe:
         for lg in journee.lignes:
             lg.etat = ETAT_OFFICIEL
     return journee

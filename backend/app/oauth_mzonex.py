@@ -88,8 +88,14 @@ def flux_code_pkce(username: str, password: str,
 
     timeout_cfg = httpx.Timeout(_TIMEOUT, connect=5.0)
     try:
+        # v148-bis — UN SEUL client httpx pour TOUT le flux SSO : le cookie
+        # posé par la page de connexion doit accompagner le POST (session +
+        # anti-CSRF ASP.NET/IS4). Avec deux clients séparés (deux pots à
+        # cookies), le POST part sans cookie → l'IdP répond HTTP 400 SANS
+        # « Location », ce que le message traduisait à tort par « identifiants
+        # portail à vérifier » (panne MZoneX constatée le 17/09/2026).
         with httpx.Client(timeout=timeout_cfg, follow_redirects=True) as client:
-            # 1) page de connexion
+            # 1) page de connexion (cookies conservés dans CE client)
             r = client.get(url_auth, headers={"User-Agent": _UA})
             page = r.text
             url_login = str(r.url)
@@ -99,23 +105,38 @@ def flux_code_pkce(username: str, password: str,
                       re.findall(r'name="([^"]+)"[^>]*value="([^"]*)"', page)}
             for k in ("Username", "Password"):
                 caches.pop(k, None)
-            post = {"Username": username, "Password": password, "button": "login", **caches}
+            post = {"Username": username, "Password": password,
+                    "button": "login", **caches}
 
-        with httpx.Client(timeout=timeout_cfg, follow_redirects=False) as client_stop:
-            # 2) POST identifiants (sans suivre) puis chaîne de redirections
-            r2 = client_stop.post(
+            # 2) POST identifiants — MÊME client, donc MÊMES cookies que la
+            #    page de connexion ; redirections suivies À LA MAIN pour capter
+            #    le « Location ».
+            r2 = client.post(
                 url_login, data=post,
-                headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": _UA}
+                headers={"Content-Type": "application/x-www-form-urlencoded",
+                         "User-Agent": _UA, "Referer": url_login},
+                follow_redirects=False
             )
             loc = r2.headers.get("Location")
             if not loc:
-                raise ErreurAuthMZoneX(f"connexion SSO refusée (HTTP {r2.status_code}) — identifiants portail à vérifier")
+                # PREUVE conservée (statut + URL + début de la réponse du
+                # portail, identifiants masqués) : sans elle, impossible de
+                # distinguer « mauvais identifiants » de « requête refusée par
+                # l'IdP » — c'est ce qui a induit l'exploitant en erreur.
+                corps = r2.text[:300]
+                for secret in (username, password):
+                    if secret:
+                        corps = corps.replace(secret, "***")
+                raise ErreurAuthMZoneX(
+                    f"connexion SSO refusée (HTTP {r2.status_code}) sur {r2.url} "
+                    f"cookies={sorted(client.cookies.keys())} — réponse portail : {corps!r}")
             for _ in range(8):
                 if loc.startswith(URI_REDIRECTION):
                     break
                 if loc.startswith("/"):
                     loc = urllib.parse.urljoin(SSO_URL, loc)
-                r3 = client_stop.get(loc, headers={"User-Agent": _UA})
+                r3 = client.get(loc, headers={"User-Agent": _UA},
+                                follow_redirects=False)
                 loc2 = r3.headers.get("Location")
                 if not loc2:
                     break
