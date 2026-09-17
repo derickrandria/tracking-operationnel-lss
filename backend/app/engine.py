@@ -794,7 +794,8 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
                  adresse: str | None, vitesse: float, moteur: str,
                  type_force: TypeEvenement | None = None,
                  source: SourceEvenement = SourceEvenement.SIMULATEUR,
-                 publier: bool = True, historique: bool = False) -> dict | None:
+                 publier: bool = True, historique: bool = False,
+                 observation: bool = False) -> dict | None:
     """Point d'entrée unique d'un événement GPS (scraper ou simulateur).
 
     §7.1 : début de mouvement (vitesse > 0 après arrêt), arrêt (vitesse nulle
@@ -830,6 +831,38 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
     if not adresse and lat is not None and lon is not None:
         from .geozones import libelle_position
         adresse = libelle_position(lat, lon) or f"{lat:.4f}, {lon:.4f}"
+
+    # v1.49 — UNE PHOTO N'EST PAS UN ÉVÉNEMENT (défaut du 17/09, prouvé sur
+    # les captures : « départ 15:32 » pour le trajet MZoneX 2746TCC commencé
+    # 14:08:56 ; « départ 08:43 » sur 0916TBV, resté à l'arrêt — 0 km/h et
+    # odomètre figé côté portail). `observation=True` marque les instantanés du
+    # portail (« dernière position connue », endpoint Vehicles) : ils prouvent
+    # OÙ est le camion et QUAND le portail en a parlé — jamais QUAND il est
+    # parti. Les laisser entrer dans la machine à états (vitesse > 3 km/h ⇒
+    # ouverture de ligne ; vitesse nulle ⇒ clôture) fabriquait des départs à
+    # l'heure de la photo. Une photo met donc à jour la trace et l'état observé
+    # (§0quater, gps_age_s, badges, carte) et s'arrête là : seuls un ÉVÉNEMENT
+    # (N1) ou un TRAJET OFFICIEL (N2) ouvrent, ferment ou soudent une ligne.
+    if observation:
+        try:
+            with db.begin_nested():
+                db.add(EvenementGPS(
+                    vehicule_id=vehicule.id, horodatage=ts, latitude=lat,
+                    longitude=lon, adresse=adresse,
+                    vitesse=round(float(vitesse or 0), 1), etat_moteur=moteur,
+                    type_evenement=type_force or TypeEvenement.POSITION,
+                    source=source, idempotence_key=idempotence_key,
+                    received_at=now_local()))
+                db.flush()
+        except IntegrityError:
+            pass
+        if vehicule.last_event_at is None or ts >= vehicule.last_event_at:
+            vehicule.last_lat, vehicule.last_lng = lat, lon
+            vehicule.last_vitesse = vitesse
+            vehicule.last_adresse = adresse
+            vehicule.last_event_at = ts
+            vehicule.moteur_on = (moteur == "ON")
+        return {"observation": True, "idempotence_key": idempotence_key}
 
     prev_lat, prev_lng, prev_ts = vehicule.last_lat, vehicule.last_lng, vehicule.last_event_at
 

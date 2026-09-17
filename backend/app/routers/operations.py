@@ -354,7 +354,9 @@ def sync_gps_immediat(db: Session = Depends(get_db),
     # 4. Rattrapages
     try:
         from ..scrapers import _synchroniser_dernier_point_mzonex
-        _synchroniser_dernier_point_mzonex(db)
+        # v1.49 — le résultat est REMONTÉ (avant, il était jeté) : un portail
+        # muet n'est pas un succès, l'écran et l'audit doivent pouvoir le dire.
+        resultat["dernier_point_mzonex"] = _synchroniser_dernier_point_mzonex(db)
         rattraper_ouvertures()
         auto_positions_horaires(db)
     except Exception:

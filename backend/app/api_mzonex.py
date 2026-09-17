@@ -199,7 +199,16 @@ class ApiMZoneX:
                     "vitesse": max(0.0, float(v.get("speed") or 0.0)),
                     "moteur": "ON",
                     "type_evenement": None,
-                    "badge_code": _entier(v, "driverKeyCode")
+                    "badge_code": _entier(v, "driverKeyCode"),
+                    # v1.49 — INSTANTANÉ ≠ ÉVÉNEMENT : la ligne « Vehicles »
+                    # décrit l'état CONNU du camion (dernière position, dernière
+                    # vitesse publiée), pas un fait horodaté. Le marquer
+                    # `observation` interdit à la machine à états d'en ouvrir ou
+                    # d'en fermer une ligne (engine.ingest_event) : sans cela,
+                    # une photo prise pendant un trajet créait un DÉPART à
+                    # l'heure de la photo (constat 17/09 : 15:32 affiché pour un
+                    # trajet MZoneX commencé 14:08:56).
+                    "observation": True
                 })
         return points
 

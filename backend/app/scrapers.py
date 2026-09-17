@@ -1227,7 +1227,8 @@ class CollectorBase:
                 try:
                     ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
                                  p.get("adresse"), p["vitesse"], p["moteur"],
-                                 p.get("type_evenement"), self.source)
+                                 p.get("type_evenement"), self.source,
+                                 observation=bool(p.get("observation")))
                     inseres += 1
                 except IntegrityError:
                     pass
@@ -1937,6 +1938,7 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
         fermer_db = True
         
     actualises = 0
+    muets: list = []       # v1.49 — véhicules muets côté portail (jamais inventés)
     now = now_local()
     
     try:
@@ -1966,6 +1968,10 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                 v.last_event_at = p["horodatage"]
                 v.moteur_on = (p.get("moteur") == "ON")
                 actualises += 1
+                # v1.49 — clé d'idempotence : la MÊME photo ne doit pas
+                # s'empiler dans la trace à chaque appel de « Sync GPS »
+                # (l'ancien code écrivait sans clé — doublons garantis).
+                from .engine import cle_idempotence_evenement
                 ev = EvenementGPS(
                     source=SourceEvenement.MZONEX,
                     vehicule_id=v.id,
@@ -1974,7 +1980,10 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                     longitude=p["lng"],
                     vitesse=p.get("vitesse", 0.0),
                     etat_moteur=p.get("moteur", "ON"),
-                    type_evenement=TypeEvenement.POSITION
+                    type_evenement=TypeEvenement.POSITION,
+                    idempotence_key=cle_idempotence_evenement(
+                        v.id, p["horodatage"], p["lat"], p["lng"],
+                        SourceEvenement.MZONEX)
                 )
                 try:
                     with db.begin_nested():
@@ -1983,57 +1992,38 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
                 except IntegrityError:
                     pass
             else:
-                dernier_ev = db.scalar(select(EvenementGPS).where(
-                    EvenementGPS.vehicule_id == v.id
-                ).order_by(EvenementGPS.horodatage.desc()).limit(1))
-                
-                v.last_event_at = now - timedelta(minutes=2)
-                if dernier_ev:
-                    v.last_lat = dernier_ev.latitude
-                    v.last_lng = dernier_ev.longitude
-                    v.last_vitesse = dernier_ev.vitesse or 0.0
-                    v.moteur_on = (dernier_ev.etat_moteur == "ON")
-                    if (now - dernier_ev.horodatage).total_seconds() > 300:
-                        ev_refresh = EvenementGPS(
-                            source=dernier_ev.source or SourceEvenement.MZONEX,
-                            vehicule_id=v.id,
-                            horodatage=now - timedelta(minutes=2),
-                            latitude=dernier_ev.latitude,
-                            longitude=dernier_ev.longitude,
-                            vitesse=dernier_ev.vitesse or 0.0,
-                            etat_moteur=dernier_ev.etat_moteur or "OFF",
-                            type_evenement=TypeEvenement.POSITION
-                        )
-                        try:
-                            with db.begin_nested():
-                                db.add(ev_refresh)
-                                db.flush()
-                        except IntegrityError:
-                            pass
-                else:
-                    ev_init = EvenementGPS(
-                        source=SourceEvenement.MZONEX,
-                        vehicule_id=v.id,
-                        horodatage=now - timedelta(minutes=2),
-                        latitude=v.last_lat or -18.8792,
-                        longitude=v.last_lng or 47.5079,
-                        vitesse=v.last_vitesse or 0.0,
-                        etat_moteur="ON" if v.moteur_on else "OFF",
-                        type_evenement=TypeEvenement.POSITION
-                    )
-                    try:
-                        with db.begin_nested():
-                            db.add(ev_init)
-                            db.flush()
-                    except IntegrityError:
-                        pass
-                actualises += 1
+                # v1.49 — PLUS AUCUNE TRACE FABRIQUÉE (défaut majeur du 17/09).
+                # Cette branche forçait `v.last_event_at = now - 2 min` et
+                # écrivait un événement inventé (« il y a 2 minutes », position
+                # et vitesse recopiées du dernier signal) « afin d'actualiser le
+                # timestamp de communication et lever le repère boîtier muet ».
+                # Conséquences mesurées :
+                #   (a) le repère « boîtier muet » ne pouvait JAMAIS s'afficher
+                #       pour un camion MZoneX muet — le mensonge contredisait
+                #       /api/sante (v1.48) ;
+                #   (b) le bornage v1.48 des compteurs (« dernière trace +
+                #       30 min ») était neutralisé : la fausse trace étant
+                #       toujours « fraîche », les compteurs couraient encore
+                #       jusqu'à minuit ;
+                #   (c) l'arbitrage R2 (engine.rattraper_ouvertures : signal
+                #       ≤ 15 min ET vitesse > 3 km/h) croyait à un roulage en
+                #       cours et ROUVRAIT une ligne datée du dernier événement
+                #       connu → « mauvaises heures de départ » (08:43, 15:32) ;
+                #   (d) ces événements, écrits SANS clé d'idempotence,
+                #       s'empilaient à chaque cycle dans la trace.
+                # Le portail ne publie rien pour ce véhicule : on le DIT
+                # (compteur `portail_muet`), on n'invente rien.
+                muets.append(v.plaque)
                     
         db.commit()
         log.info("_synchroniser_dernier_point_mzonex : %d véhicule(s) actualisé(s)", actualises)
         return {
             "vehicules_actualises": actualises,
-            "statut": "OK"
+            # v1.49 — ce que le portail N'A PAS publié : la mesure honnête du
+            # silence (avant, il était masqué par une trace fabriquée).
+            "portail_muet": len(muets),
+            "portail_muet_plaques": muets[:20],
+            "statut": "OK" if not muets else "PARTIEL"
         }
     except Exception:
         db.rollback()

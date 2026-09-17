@@ -178,3 +178,59 @@ git pull origin arena/01a0aa2b-tracking-operationnel-lss
 Attendu à l'écran (une fois la source MZONEX rétablie ou non) : les lignes de
 camions MZoneX affichent **« source MZONEX en panne — collecte interrompue »** au
 lieu de « données en transit », et leurs compteurs ne gonflent plus.
+
+
+---
+
+## 8. v1.49 — les heures de départ venaient de nos propres photos
+
+Vos captures du 17/09 (Suivi + portail MZoneX côte à côte) ont mis au jour deux
+défauts de fond, **corrigés et vérifiés** (`DIAGNOSTIC_HEURES_DEPART_v149.md`
+pour le détail, `backend/test_heure_depart_v149.py` pour la preuve) :
+
+| Constat | Cause | Correctif |
+|---|---|---|
+| `2746TCC` : départ affiché **15:32** alors que MZoneX publie **14:08:56 → 15:47:18** | `dernieres_positions()` (endpoint `Vehicles` = « dernière position connue ») était ingéré comme un **événement** ; `ingest_event` ouvrait la ligne à l'heure de la photo | marqueur `observation: True` → une photo met à jour la trace et l'état observé, mais **n'ouvre, ne ferme ni ne soude jamais une ligne** |
+| `4006TBS` : départ **08:43** · `0916TBV` : départ **08:43**, TCC 0:02 / TCJ 7:46 pour un camion resté à l'arrêt (0 km/h, odomètre figé) | `_synchroniser_dernier_point_mzonex()` (appelé à chaque **timeout N1** et par « Sync GPS ») **fabriquait** un événement « il y a 2 minutes » et forçait `last_event_at = maintenant − 2 min` | plus aucune trace fabriquée : le silence est **compté** (`portail_muet`, `statut: PARTIEL`) et remonté dans la réponse de `sync-gps` |
+
+Le second défaut expliquait aussi trois choses que vous nous aviez signalées :
+
+1. le repère **« boîtier muet » ne pouvait jamais s'afficher** (la fausse trace
+   disait toujours « il y a 2 min ») — le faux vert contredisait `/api/sante` ;
+2. le **bornage v1.48 des compteurs** (« dernière trace + 30 min ») était
+   neutralisé, la fausse trace étant toujours fraîche → les compteurs couraient
+   encore jusqu'à minuit ;
+3. l'arbitrage R2 (`rattraper_ouvertures` : signal ≤ 15 min **et** vitesse
+   > 3 km/h) croyait à un roulage en cours et **rouvrait une ligne datée du
+   dernier événement connu** → les heures de départ fantômes (08:43, 15:32).
+
+Bonus du même passage : ces événements s'écrivaient **sans clé
+d'idempotence** (empilement à chaque clic sur « Sync GPS ») — corrigé.
+
+### Vérification
+
+- `backend/test_heure_depart_v149.py` — **13 OK / 0 KO** (photo ≠ événement,
+  photo après un vrai départ, portail muet jamais inventé, signal périmé → R2
+  n'ouvre rien, roulage réel et frais → R2 ouvre toujours) ;
+- `backend/test_compteurs_muets_v148.py` — **14 OK / 0 KO** (non-régression) ;
+- campagne complète : **37 verts / 45** (les 8 rouges restants sont des
+  chantiers déjà connus et inchangés : v125, v143, v138, v14, v121,
+  reglement_metier_missions, v145, v122, v130 ; `runner_complet` repasse au
+  vert). `test_mzonex_ping` et `test_e2e_reel_v113` sont **environnementaux**
+  (TLS MZoneX injoignable depuis la machine de contrôle, base bac à sable
+  absente) — pas des régressions.
+
+### Nouveau vérificateur à votre disposition
+
+```powershell
+python verifier_heures_depart.py                     # journée en cours
+python verifier_heures_depart.py --date 2026-09-17 --suspects
+python verifier_heures_depart.py --plaque 2746TCC
+```
+
+Lecture seule, aucun accès réseau : pour chaque camion il affiche l'heure de
+départ **affichée**, la provenance de chaque ligne (portail, statut, distance),
+les audits de la journée (`trajet.ouverture_rattrapage` = ligne ouverte par R2,
+`trajet.rejet_distance`, `trajet.reactivation`) et le dernier signal réel — puis
+signale les lignes douteuses (« départ sans événement à ±15 min », « ligne en
+cours alors que le boîtier est muet depuis X min »).
