@@ -1,39 +1,56 @@
 # -*- coding: utf-8 -*-
-"""v1.48 — BILAN DE COLLECTE ET DE FLOTTE (une commande, exécutable sur le serveur).
+"""v1.48 — BILAN DE COLLECTE ET DE FLOTTE (v2, lecture seule).
 
-Exécute pour vous la séquence de contrôle après déploiement du patch v148 :
+Étape de contrôle sur le serveur, après déploiement du patch v148.
 
-  1. lit `/api/sante`            → statut honnête + sources en échec ;
-  2. POST `/api/sante/sync`      → force un cycle réel et récupère la RÉPONSE
-     du portail (c'est elle qui dit si MZoneX est cassé par les identifiants,
-     par le flux SSO ou par le réseau) ;
-  3. relit `/api/sante`          → état après cycle ;
-  4. interroge la BASE           → répartition de la flotte par portail,
-     camions muets (aucun point GPS récent), et journées archivées SANS
-     données MZoneX (celles qu'il faudra reprendre).
+  1. lit `/api/sante`          → statut honnête, sources en échec, et DÉTECTION
+     du cas « service non redémarré » (les champs v148 sont absents) ;
+  2. (option `--sync`) force un cycle de collecte réel et affiche la réponse
+     des portails — l'endpoint est SYNCHRONE et peut durer plusieurs minutes :
+     il n'est donc plus exécuté par défaut ;
+  3. relit `/api/sante`        → état après cycle ;
+  4. interroge la BASE         → flotte par portail, véhicules jamais vus,
+     camions muets, et pour chaque journée : trajets en archive, mouvements
+     GPS réellement présents, journées signalées par l'audit (portails
+     absents / archivage sur la base locale / archivage réécrit).
 
-Lecture seule : aucun point, aucun trajet, aucune archive n'est modifié.
+La section 4 ne se contente plus de « archive sans trajet » (trop grossier :
+un camion peut légitimement n'avoir pas roulé) : elle croise les MOUVEMENTS
+GPS de la journée avec le contenu de l'archive. Un camion qui a bougé ce
+jour-là et dont l'archive ne contient aucun trajet = trou réel.
+
+Lecture seule : rien n'est modifié.
 
 Usage (sur le serveur, dans `backend/`) :
-    python3 verifier_collecte.py                       # + cycle forcé
-    python3 verifier_collecte.py --sans-sync           # observation seule
-    python3 verifier_collecte.py --jours 10 --url http://127.0.0.1:8000
+    python3 verifier_collecte.py                 # observation (rapide)
+    python3 verifier_collecte.py --sync          # force un cycle (patience)
+    python3 verifier_collecte.py --rapide        # saute l'analyse GPS par jour
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
+
+ACTIONS_REPRISE = (
+    "cycle_minuit.relecture_partielle",   # minuit : portails injoignables
+    "jour.catchup_consolide_local",       # catch-up : archivé sur la base seule
+    "jour.catchup_sans_source",           # catch-up : jour laissé de côté
+    "jour.archive_reecrite_v130",         # archive réécrite par la réparation
+    "historique.recalculer_archive",      # reprise manuelle déjà faite
+    "trajet.sans_fin_jour_passe",         # v147 : fins manquantes réparées
+)
 
 
-def appel(url: str, chemin: str, methode: str = "GET"):
+def appel(url: str, chemin: str, methode: str = "GET", timeout: float = 30.0):
     req = urllib.request.Request(url.rstrip("/") + chemin, method=methode)
     req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read().decode() or "{}")
     except urllib.error.HTTPError as e:
         return e.code, {"erreur_http": e.read().decode()[:200]}
@@ -41,30 +58,168 @@ def appel(url: str, chemin: str, methode: str = "GET"):
         return None, {"erreur": f"{type(e).__name__}: {e}"}
 
 
-def afficher_sante(d: dict, titre: str) -> None:
-    print(f"\n{titre}")
-    for cle in ("statut", "statut_collecte", "sources_en_echec",
-                "retard_collecte_min", "dernier_evenement_gps",
-                "vehicules_actifs", "mode_collecte", "erreur_diagnostic"):
+def afficher_sante(d: dict, titre: str) -> bool:
+    """Affiche l'état de santé. Renvoie True si le serveur est bien à jour (v148)."""
+    print(titre)
+    a_jour = "sources_en_echec" in d and "collecte_par_source" in d
+    for cle in ("statut", "statut_collecte", "retard_collecte_min",
+                "dernier_evenement_gps", "vehicules_actifs", "mode_collecte",
+                "erreur_diagnostic"):
         if cle in d:
             print(f"    {cle:22s} {d.get(cle)!r}")
-    for nom, s in (d.get("collecte_par_source") or {}).items():
-        erreur = (s or {}).get("derniere_erreur")
-        reussite = (s or {}).get("derniere_reussite")
-        marque = "❌" if erreur else "✅"
-        print(f"      {marque} {nom:20s} dernière réussite={reussite} "
-              f"erreur={str(erreur)[:80] if erreur else 'aucune'}")
+    if a_jour:
+        print(f"    {'sources_en_echec':22s} {d.get('sources_en_echec')!r}")
+        for nom, s in (d.get("collecte_par_source") or {}).items():
+            erreur = (s or {}).get("derniere_erreur")
+            marque = "❌" if erreur else "✅"
+            print(f"      {marque} {nom:20s} dernière réussite="
+                  f"{(s or {}).get('derniere_reussite')} "
+                  f"erreur={str(erreur)[:150] if erreur else 'aucune'}")
+        if d.get("statut") == "COLLECTE_OK" and d.get("sources_en_echec"):
+            print("      ⚠️  incohérence : statut OK avec des sources en échec")
+    else:
+        print("    ⚠️  CHAMPS v148 ABSENTS (`sources_en_echec`, "
+              "`collecte_par_source`)")
+        print("        → le processus en cours n'exécute PAS le code mis à jour :")
+        print("          redémarrer le service, puis relancer ce bilan.")
+        print("        → en attendant, le statut affiché reste AVEUGLE aux "
+              "sources mortes.")
+    return a_jour
+
+
+def section_base(args) -> None:
+    print("\n[4] FLOTTE, MOUVEMENTS ET ARCHIVES (lecture directe de la base)")
+    try:
+        from app.database import SessionLocal
+        from app.models import (AuditLog, EvenementGPS, HistoriqueJournalier,
+                                Vehicule)
+        from app.config import now_local
+        from sqlalchemy import func
+    except Exception as e:
+        print(f"    ⚠️  base non interrogée ({type(e).__name__}: {e}) — lancez "
+              f"ce script depuis le dossier `backend/`")
+        return
+    db = SessionLocal()
+    try:
+        vehs = db.query(Vehicule).all()
+        par_portail: dict[str, int] = {}
+        for v in vehs:
+            par_portail[v.plateforme_gps or "?"] = \
+                par_portail.get(v.plateforme_gps or "?", 0) + 1
+        print("    Répartition de la flotte : " + " · ".join(
+            f"{p} {n}" for p, n in sorted(par_portail.items())))
+
+        jamais = [v for v in vehs if v.last_event_at is None]
+        if jamais:
+            print(f"\n    ⚠️  VÉHICULES JAMAIS VUS ({len(jamais)}) — aucun point "
+                  f"GPS depuis le début : rattachement portail à vérifier")
+            for v in jamais[:12]:
+                print(f"      · {v.plaque:12s} portail={v.plateforme_gps or '?':12s} "
+                      f"gps={v.gps_associe or '—':16s} statut={v.statut.value}")
+            if len(jamais) > 12:
+                print(f"      … et {len(jamais) - 12} autre(s)")
+
+        maintenant = now_local()
+        seuil = timedelta(minutes=args.muet_min)
+        muets = [v for v in vehs if v.last_event_at is not None
+                 and (maintenant - v.last_event_at) > seuil]
+        muets.sort(key=lambda v: v.last_event_at)
+        print(f"\n    Camions sans point GPS depuis > {args.muet_min:.0f} min : "
+              f"{len(muets)} / {len(vehs)}")
+        if muets:
+            plus_recent = muets[-1].last_event_at
+            plus_ancien = muets[0].last_event_at
+            print(f"      fenêtre des derniers points : "
+                  f"{plus_ancien:%d/%m %H:%M} → {plus_recent:%d/%m %H:%M}")
+            par_p: dict[str, int] = {}
+            for v in muets:
+                par_p[v.plateforme_gps or "?"] = par_p.get(v.plateforme_gps or "?", 0) + 1
+            print("      muets par portail : " + " · ".join(
+                f"{p} {n}" for p, n in sorted(par_p.items())))
+
+        print(f"\n    Journées ({args.jours} derniers jours) — croisement "
+              f"mouvements GPS / contenu d'archive :")
+        aujour = maintenant.date()
+        for offset in range(args.jours, 0, -1):
+            jour = aujour - timedelta(days=offset)
+            archives = db.query(HistoriqueJournalier).filter(
+                HistoriqueJournalier.date_jour == jour).all()
+            trajs: dict[str, int] = {}
+            for h in archives:
+                trajs[h.vehicule_id] = len((h.donnees or {}).get("trajets") or [])
+
+            mouvements: dict[str, int] = {}
+            if not args.rapide:
+                debut = datetime.combine(jour, dtime.min)
+                fin = debut + timedelta(days=1)
+                try:
+                    lignes = db.query(EvenementGPS.vehicule_id,
+                                      func.count(EvenementGPS.id)).filter(
+                        EvenementGPS.horodatage >= debut,
+                        EvenementGPS.horodatage < fin,
+                        EvenementGPS.vitesse > 3.0).group_by(
+                        EvenementGPS.vehicule_id).all()
+                    mouvements = {vid: n for vid, n in lignes}
+                except Exception as e:
+                    print(f"      ⚠️  mouvements non mesurés pour {jour:%d/%m} "
+                          f"({type(e).__name__})")
+
+            trous = sorted(v for v, n in mouvements.items()
+                           if n >= 5 and trajs.get(v, 0) == 0)
+            plaques = {}
+            if trous:
+                plaques = {v.id: v.plaque for v in db.query(Vehicule).filter(
+                    Vehicule.id.in_(trous[:40])).all()}
+
+            audits: list[str] = []
+            try:
+                debut_audit = datetime.combine(jour, dtime.min)
+                fin_audit = debut_audit + timedelta(days=2)
+                for a in db.query(AuditLog).filter(
+                        AuditLog.action.in_(ACTIONS_REPRISE),
+                        AuditLog.date_heure >= debut_audit,
+                        AuditLog.date_heure < fin_audit).all():
+                    # un audit de minuit est horodaté le LENDEMAIN du jour qu'il
+                    # clôture : on le rattache par son champ `jour`, sinon par
+                    # sa nature (cycle de minuit) et sa date.
+                    texte = json.dumps(a.details or {}, ensure_ascii=False)
+                    if jour.isoformat() in texte or (
+                            a.action.startswith("cycle_minuit")
+                            and a.date_heure.date() == jour + timedelta(days=1)):
+                        audits.append(a.action)
+            except Exception:
+                pass
+            compte: dict[str, int] = {}
+            for a in audits:
+                compte[a] = compte.get(a, 0) + 1
+
+            etat = "⚠️ À REPRENDRE" if (trous or compte) else "✅"
+            print(f"      {etat}  {jour:%d/%m}  archives={len(archives)} · "
+                  f"sans trajet={sum(1 for n in trajs.values() if n == 0)}"
+                  + (f" · a bougé sans trajet={len(trous)}" if mouvements else ""))
+            if compte:
+                print("              audits : " + " · ".join(
+                    f"{a}×{n}" for a, n in sorted(compte.items())))
+            for vid in trous[:6]:
+                print(f"              └ {plaques.get(vid, vid)[:12]:12s} a roulé "
+                      f"ce jour-là, archive sans trajet "
+                      f"({mouvements[vid]} points en mouvement)")
+    finally:
+        db.close()
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Bilan de collecte et de flotte (v148)")
+    ap = argparse.ArgumentParser(description="Bilan de collecte et de flotte (v148 v2)")
     ap.add_argument("--url", default="http://127.0.0.1:8000")
-    ap.add_argument("--jours", type=int, default=7,
-                    help="jours d'archives à contrôler (défaut 7)")
-    ap.add_argument("--sans-sync", action="store_true",
-                    help="ne pas forcer de cycle de collecte (observation seule)")
-    ap.add_argument("--muet-min", type=float, default=60.0,
-                    help="seuil de silence d'un camion, en minutes (défaut 60)")
+    ap.add_argument("--jours", type=int, default=7)
+    ap.add_argument("--sync", action="store_true",
+                    help="force un cycle de collecte (l'endpoint est synchrone : "
+                         "peut durer plusieurs minutes)")
+    ap.add_argument("--timeout", type=float, default=900.0,
+                    help="délai maximal du cycle forcé, en secondes (défaut 900)")
+    ap.add_argument("--rapide", action="store_true",
+                    help="saute l'analyse des mouvements GPS par journée")
+    ap.add_argument("--muet-min", type=float, default=60.0)
     args = ap.parse_args()
 
     print("=" * 78)
@@ -72,21 +227,28 @@ def main() -> int:
     print(f"date : {datetime.now():%d/%m/%Y %H:%M} · API : {args.url}")
     print("=" * 78)
 
-    print("\n[1] ÉTAT DE SANTÉ (après patch v148)")
+    print("\n[1] ÉTAT DE SANTÉ")
     statut, d1 = appel(args.url, "/api/sante")
+    a_jour = False
     if statut is None:
         print(f"    ⚠️  API injoignable ({d1.get('erreur')}) — lancez la "
               f"plateforme ou corrigez --url")
     else:
-        afficher_sante(d1, "    /api/sante :")
+        a_jour = afficher_sante(d1, "    /api/sante :")
 
-    if not args.sans_sync and statut:
+    if args.sync and statut:
         print("\n[2] CYCLE DE COLLECTE FORCÉ (réponse réelle des portails)")
-        st2, d2 = appel(args.url, "/api/sante/sync", "POST")
+        debut = time.monotonic()
+        st2, d2 = appel(args.url, "/api/sante/sync", "POST", timeout=args.timeout)
+        ecoule = time.monotonic() - debut
         if st2 is None:
-            print(f"    ⚠️  cycle non déclenché ({d2.get('erreur')})")
+            print(f"    ⚠️  pas de réponse après {ecoule:.0f}s "
+                  f"({d2.get('erreur')})")
+            print("        Le cycle tourne probablement ENCORE côté serveur "
+                  "(l'endpoint est synchrone) : relancez ce bilan SANS --sync "
+                  "dans quelques minutes pour lire son résultat dans [1].")
         else:
-            print(f"    HTTP {st2}")
+            print(f"    HTTP {st2} en {ecoule:.0f}s")
             for cle in ("mzonex_n1_points", "camtrackpro_n1_points", "duree_s"):
                 if cle in d2:
                     print(f"      {cle:22s} {d2.get(cle)!r}")
@@ -101,74 +263,21 @@ def main() -> int:
         print("\n[3] ÉTAT DE SANTÉ APRÈS CYCLE")
         _, d3 = appel(args.url, "/api/sante")
         afficher_sante(d3, "    /api/sante :")
+    elif statut:
+        print("\n[2] CYCLE FORCÉ : non demandé (option `--sync`) — l'état [1] "
+              "reflète déjà la dernière tentative réelle.")
 
-    print("\n[4] FLOTTE ET ARCHIVES (lecture directe de la base)")
-    try:
-        from app.database import SessionLocal
-        from app.models import HistoriqueJournalier, Vehicule
-        from app.config import now_local
-    except Exception as e:
-        print(f"    ⚠️  base non interrogée ({type(e).__name__}: {e}) — lancez "
-              f"ce script depuis le dossier `backend/`")
-        return 0
-    db = SessionLocal()
-    try:
-        vehs = db.query(Vehicule).all()
-        par_portail: dict[str, int] = {}
-        for v in vehs:
-            par_portail[v.plateforme_gps or "?"] = par_portail.get(v.plateforme_gps or "?", 0) + 1
-        print("    Répartition de la flotte par portail :")
-        for portail, n in sorted(par_portail.items()):
-            print(f"      {portail:14s} {n} véhicule(s)")
-
-        maintenant = now_local()
-        seuil = timedelta(minutes=args.muet_min)
-        muets = [v for v in vehs if v.last_event_at is None
-                 or (maintenant - v.last_event_at) > seuil]
-        muets.sort(key=lambda v: v.last_event_at or datetime.min)
-        print(f"\n    Camions SANS point GPS depuis > {args.muet_min:.0f} min : "
-              f"{len(muets)} / {len(vehs)}")
-        for v in muets[:12]:
-            age = ("jamais" if v.last_event_at is None
-                   else f"{(maintenant - v.last_event_at).total_seconds() / 3600:.1f} h")
-            print(f"      · {v.plaque:12s} portail={v.plateforme_gps or '?':12s} "
-                  f"dernier point={age}")
-        if len(muets) > 12:
-            print(f"      … et {len(muets) - 12} autre(s)")
-
-        print(f"\n    Journées archivées sans données, par portail "
-              f"({args.jours} derniers jours) :")
-        aujour = maintenant.date()
-        for offset in range(args.jours, 0, -1):
-            jour = aujour - timedelta(days=offset)
-            archives = db.query(HistoriqueJournalier).filter(
-                HistoriqueJournalier.date_jour == jour).all()
-            if not archives:
-                print(f"      ·  {jour:%d/%m}  aucune archive")
-                continue
-            stats: dict[str, list[int]] = {}
-            for h in archives:
-                v = db.get(Vehicule, h.vehicule_id)
-                portail = (v.plateforme_gps if v else None) or "?"
-                nb_traj = len((h.donnees or {}).get("trajets") or [])
-                stats.setdefault(portail, [0, 0])
-                stats[portail][1] += 1
-                if nb_traj == 0:
-                    stats[portail][0] += 1
-            detail = " · ".join(
-                f"{p} {vides}/{tot} sans trajet"
-                for p, (vides, tot) in sorted(stats.items()))
-            alerte = "  ⚠️ À REPRENDRE" if any(v > 0 for v, _ in stats.values()) else ""
-            print(f"      ·  {jour:%d/%m}  {detail}{alerte}")
-    finally:
-        db.close()
+    section_base(args)
 
     print("\n" + "=" * 78)
-    print("LECTURE : une source ❌ en [1] ou une erreur en [2] = collecte à "
-          "réparer AVANT de trancher les archives.")
-    print("Si MZoneX échoue encore après ce patch, l'erreur de [2] contient "
-          "désormais la réponse du portail (code, cookies, corps) : elle dit "
-          "la cause exacte — identifiants, flux SSO ou réseau.")
+    if a_jour:
+        print("LECTURE : `sources_en_echec` vide + statut COLLECTE_OK = toutes "
+              "les sources collectent.")
+    else:
+        print("ACTION IMMÉDIATE : le service n'exécute pas le code v148 — le "
+              "redémarrer, puis relancer ce bilan.")
+    print("Une journée marquée ⚠️ À REPRENDRE peut être recalculée (écriture) :")
+    print("  POST /api/suivi/recalculer-archive?date_jour=AAAA-MM-JJ   (admin)")
     print("=" * 78)
     return 0
 
