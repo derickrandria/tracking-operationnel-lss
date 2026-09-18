@@ -1,0 +1,53 @@
+# Instructions obligatoires pour les agents IA
+
+## Source de vérité métier
+
+La seule source normative actuelle est :
+
+SPEC_RULES_v3.md
+
+Le README et les documents historiques ne doivent jamais être utilisés comme source de décision lorsqu'ils contredisent SPEC_RULES_v3.md.
+
+## Sécurité des données
+
+Ne jamais :
+- afficher les valeurs des fichiers .env ;
+- demander à l'utilisateur de coller des mots de passe ;
+- écrire des secrets dans les logs ;
+- inclure un vrai .env dans Git, un ZIP ou un commit ;
+- lancer une collecte réelle sans autorisation explicite ;
+- modifier une base de production ;
+- supprimer ou réécrire des archives sans procédure approuvée.
+
+## Processus de développement
+
+Avant toute modification :
+1. identifier la branche et le commit ;
+2. vérifier l'état Git ;
+3. produire un plan ;
+4. rechercher les tests existants ;
+5. expliquer les impacts sur les données ;
+6. attendre l'autorisation si une migration ou une écriture de données est nécessaire.
+
+## Règles de modification
+
+Chaque correction doit :
+- être limitée à un problème précis ;
+- avoir des tests de régression ;
+- être idempotente ;
+- conserver les données brutes ;
+- produire un audit avant/après ;
+- fournir une procédure de rollback ;
+- éviter les modifications directes de main.
+
+## Règles de production
+
+En production :
+- APP_ENV=production ;
+- SIM_ENABLE=0 obligatoire ;
+- SEED_DEMO=0 obligatoire ;
+- aucune bascule silencieuse vers le simulateur ;
+- PostgreSQL obligatoire ;
+- les sources externes sont séparées ;
+- les erreurs de collecte doivent être visibles ;
+- une archive partielle est interdite.
