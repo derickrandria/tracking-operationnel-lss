@@ -4,7 +4,7 @@ FastAPI : API REST (/api), WebSocket (/ws) pour le temps réel (§9),
 documentation OpenAPI/Swagger (/docs), service du frontend React (SPA).
 """
 
-APP_VERSION = "1.50"   # visible au démarrage (fenêtre noire) et dans le bandeau latéral
+APP_VERSION = "1.51"   # visible au démarrage (fenêtre noire) et dans le bandeau latéral
 import asyncio
 import logging
 import os
@@ -21,7 +21,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from .config import CORS_ORIGINS, FRONTEND_DIST, SIM_ENABLE, SIM_TICK_S, now_local
 from .database import SessionLocal, get_db
 from .models import StatutVehicule, Vehicule
-from . import daily, engine, event_bus, seed
+from . import daily, engine, event_bus, rattrapage, seed
 from .security import decode_token
 
 logging.basicConfig(level=logging.INFO,
@@ -183,6 +183,25 @@ def migrer_schema():
         if "position_22h" not in cols_s:
             cx.execute(text("ALTER TABLE suivi_journalier ADD COLUMN position_22h VARCHAR(200)"))
             log.info("Migration v1.44 : suivi_journalier.position_22h ajouté (§0vicies decies N2)")
+
+        # v1.51 (18/09/2026) — table de VERROU/ÉTAT du rattrapage (exigence 9) :
+        # `create_all` (seed) la crée sur une base neuve ; ici on complète les
+        # bases DÉJÀ livrées, sinon le rattrapage ne pourrait pas poser son verrou.
+        if "traitement_journees" not in tables:
+            cx.execute(text(
+                "CREATE TABLE IF NOT EXISTS traitement_journees ("
+                "jour DATE PRIMARY KEY, "
+                "statut VARCHAR(30) DEFAULT 'EN_COURS', "
+                "proprietaire VARCHAR(120), "
+                "debut DATETIME, maj DATETIME, "
+                "tentatives INTEGER DEFAULT 0, "
+                "derniere_erreur TEXT, "
+                "sources_etat JSON, "
+                "archive BOOLEAN DEFAULT 0)"))
+            cx.execute(text("CREATE INDEX IF NOT EXISTS ix_traitement_journees_statut "
+                            "ON traitement_journees (statut)"))
+            log.info("Migration v1.51 : table traitement_journees créée "
+                     "(verrou de journée du rattrapage)")
 
         # Migration automatique et exhaustive de la table missions
         if "missions" in tables:
@@ -621,7 +640,9 @@ def rattraper_7_derniers_jours():
                 # 1. Collecte et recalcul de l'archive (CamTrackPro / MZoneX)
                 #    (Ym@ne a été importé en une passe avant la boucle — v148)
                 try:
-                    res_recalc = recalculer_archives_journee(jour_cible, db=db)
+                    res_recalc = recalculer_archives_journee(
+                        jour_cible, db=db, autoriser_reecriture=True,
+                        motif="boot_catchup_7j")  # v1.51 exigence 6
                     log.info("Boot Catch-up: Journée du %s rattrapée avec succès (%s)",
                              jour_cible.isoformat(), res_recalc)
                 except Exception as e:
@@ -700,6 +721,10 @@ async def lifespan(app: FastAPI):
         # §0decies D1/D3 (24/08/2026) — réparation embarquée des journées
         # abîmées par l'ancienne bascule 01h00 (v1.30, une seule fois)
         asyncio.create_task(_am4_puis_reparation_v130()),
+        # v1.51 (exigence 7) — le rattrapage ne dépend plus du seul
+        # démarrage : une journée non archivée (source en panne le soir)
+        # est reprise périodiquement tant qu'elle n'est pas figée.
+        asyncio.create_task(rattrapage.boucle_rattrapage_periodique()),
     ]
     if SIM_ENABLE:
         # Addendum v1.4 (démo) : la « validation retardée » du simulateur imite

@@ -264,11 +264,18 @@ J_VI = date(2026, 6, 11)      # jour vide partout
 J_SA = date(2026, 6, 12)      # jour sans source accessible
 V2 = db.scalar(select(Vehicule).where(Vehicule.plaque == "0826TBS"))
 
-sauve_f = daily._trajets_reels_du_jour
+# v1.51 — la couture d'injection a changé : le moteur de rattrapage lit les
+# sources lui-même (`rattrapage.lecture_reelle`) pour distinguer « source vide
+# confirmée » de « source indisponible » (exigence 11). On injecte donc un
+# relevé PAR SOURCE ; les assertions de G9 sont inchangées.
+import app.rattrapage as rat
+sauve_f = rat.lecture_reelle
 try:
-    def faux_items(jour):
+    def faux_lecture(jour):
+        vide = lambda nom: rat.LectureSource(nom, rat.VIDE_CONFIRMEE)
+        ym = lambda: rat.LectureSource("YMANE", rat.DISPONIBLE)
         if jour == J_MQ:
-            return ([{"plaque": "0826TBS",
+            items = [{"plaque": "0826TBS",
                       "debut": datetime(2026, 6, 10, 6, 0),
                       "fin": datetime(2026, 6, 10, 9, 0),
                       "distance_km": 120.0,
@@ -279,12 +286,23 @@ try:
                       "fin": datetime(2026, 6, 10, 12, 30),
                       "distance_km": 80.0,
                       "conducteur": "ANDRIAMAMPIANINA Lahatra Faneva Omega",
-                      "source": "CAMTRACKPRO"}], [])
+                      "source": "CAMTRACKPRO"}]
+            return rat.LectureJour(jour, {
+                "MZONEX": rat.LectureSource("MZONEX", rat.DISPONIBLE, items=items),
+                "CAMTRACKPRO": rat.LectureSource("CAMTRACKPRO", rat.DISPONIBLE, items=[]),
+                "YMANE": ym()})
         if jour == J_SA:
-            return ([], ["MZONEX (TimeoutError)"])
-        return ([], [])
+            return rat.LectureJour(jour, {
+                "MZONEX": rat.LectureSource("MZONEX", rat.INDISPONIBLE,
+                                            erreur="TimeoutError"),
+                "CAMTRACKPRO": rat.LectureSource("CAMTRACKPRO", rat.INDISPONIBLE,
+                                                 erreur="HTTP 503"),
+                "YMANE": ym()})
+        return rat.LectureJour(jour, {"MZONEX": vide("MZONEX"),
+                                      "CAMTRACKPRO": vide("CAMTRACKPRO"),
+                                      "YMANE": ym()})
 
-    daily._trajets_reels_du_jour = faux_items
+    rat.lecture_reelle = faux_lecture
     rep = daily.rattraper_consolidation(cible_hier=J_SA)
     db.expire_all()
     arch = db.scalar(select(HistoriqueJournalier).where(
@@ -302,17 +320,20 @@ try:
     arch_sa = db.scalar(select(func.count(HistoriqueJournalier.id)).where(
         HistoriqueJournalier.date_jour == J_SA))
     audit_sa = db.scalar(select(func.count(AuditLog.id)).where(
-        AuditLog.action == "jour.catchup_sans_source"))
-    check("AM-4 garde-fou R5 : source absente → AUCUNE archive, jour sauté "
-          "et journalisé + alerte", (arch_sa or 0) == 0 and audit_sa >= 1
-          and J_SA.isoformat() in rep["jours_sautés"],
-      f"arch={arch_sa} audit={audit_sa} sautes={rep['jours_sautés']}")
+        AuditLog.action == "jour.archive_refusee"))
+    check("AM-4 garde-fou R5 (v1.51) : source INDISPONIBLE → AUCUNE archive, "
+          "jour journalisé + alerte et en attente de reprise",
+          (arch_sa or 0) == 0 and audit_sa >= 1
+          and J_SA.isoformat() in rep["jours_sautés"]
+          and J_SA.isoformat() in rep["en_attente_source"],
+      f"arch={arch_sa} audit={audit_sa} sautes={rep['jours_sautés']} "
+      f"attente={rep['en_attente_source']}")
     arch_vi = db.scalar(select(func.count(HistoriqueJournalier.id)).where(
         HistoriqueJournalier.date_jour == J_VI))
     check("AM-4 : jour vide des deux côtés (plateforme éteinte, portails "
           "muets) → RIEN n'est inventé", (arch_vi or 0) == 0)
 finally:
-    daily._trajets_reels_du_jour = sauve_f
+    rat.lecture_reelle = sauve_f
 
 # ------------------------------------------------------------------ G10
 print("\n[G10] AM-5/C3 : zéro écriture locale dans Infraction")

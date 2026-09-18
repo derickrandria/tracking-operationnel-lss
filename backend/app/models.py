@@ -568,6 +568,33 @@ class CollecteCheckpoint(Base):
                                                   onupdate=now_local)
 
 
+# ------------------------------------- rattrapage / archivage (v1.51, §9)
+class TraitementJournee(Base):
+    """v1.51 — état ET verrou du traitement d'une journée (catch-up/archivage).
+
+    La clé primaire `jour` est le VERROU (exigence 9) : deux workers — deux
+    processus, deux threads, deux machines sur PostgreSQL — ne peuvent pas
+    traiter la même journée, car la base refuse la seconde insertion. Un verrou
+    laissé par un worker mort est repris après `RATTRAPAGE_VERROU_TTL_S`
+    (`rattrapage.acquerir_verrou_jour`), ce qui rend un redémarrage pendant une
+    consolidation inoffensif (exigence 6).
+
+    `statut` ∈ EN_COURS | TERMINE | ECHEC | EN_ATTENTE_SOURCE.
+    Aucune donnée métier ici : uniquement l'état du pipeline.
+    """
+    __tablename__ = "traitement_journees"
+
+    jour: Mapped[date] = mapped_column(Date, primary_key=True)
+    statut: Mapped[str] = mapped_column(String(30), default="EN_COURS", index=True)
+    proprietaire: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    debut: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    maj: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    tentatives: Mapped[int] = mapped_column(Integer, default=0)
+    derniere_erreur: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sources_etat: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    archive: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 # ------------------------------------------------------------- audit (§11)
 class AuditLog(Base):
     __tablename__ = "audit_log"

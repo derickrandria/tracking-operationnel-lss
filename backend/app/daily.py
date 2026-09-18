@@ -24,6 +24,8 @@ Exécution : tâche de fond asyncio (remplaçant direct de Celery Beat en mode
 autonome ; voir README pour la version Celery en production).
 """
 import asyncio
+import hashlib
+import json
 import logging
 from datetime import date, datetime, timedelta
 
@@ -56,9 +58,78 @@ def _cloture_du(jour: date, seuils: dict | None = None) -> datetime:
     return datetime.combine(jour, datetime.min.time()) + timedelta(seconds=secondes)
 
 
+def _trajets_provisoires(db, jour: date) -> int:
+    """Trajets encore PROVISOIRE sur la journée (exigence 10)."""
+    return db.scalar(select(func.count(Trajet.id)).join(
+        SuiviJournalier, Trajet.suivi_id == SuiviJournalier.id).where(
+            SuiviJournalier.date_jour == jour,
+            Trajet.statut_source == StatutSourceTrajet.PROVISOIRE)) or 0
+
+
+def _trajets_simules(db, jour: date) -> int:
+    """Trajets issus du SIMULATEUR sur la journée (exigence 13)."""
+    return db.scalar(select(func.count(Trajet.id)).join(
+        SuiviJournalier, Trajet.suivi_id == SuiviJournalier.id).where(
+            SuiviJournalier.date_jour == jour,
+            Trajet.source_plateforme == "SIMULATEUR")) or 0
+
+
 def archiver_jour(db, jour: date) -> int:
     """Archive (une seule fois) tous les suivis du jour donné. Retourne le
-    nombre de lignes archivées. Idempotent (§A.2 : jamais de réécriture)."""
+    nombre de lignes NOUVELLEMENT archivées. Idempotent (§A.2).
+
+    v1.51 — trois garde-fous : une journée ne peut plus être figée à tort.
+
+      • exigence 5/10 : un trajet encore **PROVISOIRE** interdit d'écrire
+        l'historique du jour — une archive officielle ne contient JAMAIS de
+        donnée provisoire ; le jour repassera par `consolider_jour` ;
+      • exigence 13 : le mode simulateur ne fabrique pas d'archive officielle
+        sans accord EXPLICITE de l'exploitant (`LSS_SIMULATEUR_ARCHIVE=1`) —
+        une alerte visible est levée à chaque refus ;
+      • exigence 6 : la fonction ne SUPPRIME ni ne RÉÉCRIT rien — seules les
+        lignes manquantes sont créées (la seule réécriture du dépôt vit dans
+        `recalculer_archives_journee`, désormais autorisée explicitement et
+        tracée).
+    """
+    from .config import SIMULATEUR_ARCHIVE_AUTORISE, SIM_ENABLE
+
+    # --- garde-fou simulateur (exigence 13) --------------------------------
+    if not SIMULATEUR_ARCHIVE_AUTORISE:
+        n_sim = _trajets_simules(db, jour)
+        if SIM_ENABLE or n_sim:
+            db.add(AuditLog(username="systeme",
+                            action="archive.refusee_simulateur",
+                            entite="suivi", entite_id=None,
+                            details={"jour": jour.isoformat(),
+                                     "sim_enable": bool(SIM_ENABLE),
+                                     "trajets_simules": n_sim,
+                                     "regle": "v1.51 exigence 13 : le mode "
+                                              "simulateur ne fabrique jamais une "
+                                              "archive officielle en silence "
+                                              "(LSS_SIMULATEUR_ARCHIVE=1 pour "
+                                              "l'autoriser explicitement)"}))
+            db.commit()
+            log.warning("archiver_jour(%s) REFUSÉ : mode simulateur actif "
+                        "(SIM_ENABLE=%s, %d trajet(s) simulé(s)) — "
+                        "l'historique reste intact", jour, SIM_ENABLE, n_sim)
+            return 0
+
+    # --- garde-fou « aucune donnée provisoire dans une archive » -----------
+    n_prov = _trajets_provisoires(db, jour)
+    if n_prov:
+        db.add(AuditLog(username="systeme",
+                        action="archive.refusee_provisoire",
+                        entite="suivi", entite_id=None,
+                        details={"jour": jour.isoformat(),
+                                 "trajets_provisoires": n_prov,
+                                 "regle": "v1.51 exigence 10 : une archive "
+                                          "officielle ne contient aucune donnée "
+                                          "PROVISOIRE (consolider_jour d'abord)"}))
+        db.commit()
+        log.warning("archiver_jour(%s) REFUSÉ : %d trajet(s) encore "
+                    "PROVISOIRE(S) — consolidations requises", jour, n_prov)
+        return 0
+
     suivis = db.scalars(select(SuiviJournalier).where(SuiviJournalier.date_jour == jour)).all()
     archives = 0
     debut = datetime.combine(jour, datetime.min.time())
@@ -301,7 +372,9 @@ def rattraper_evenements_gps_camtrackpro(jour: date, db: Session,
 
 
 def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None,
-                                db=None, rattraper_portail: bool = True) -> dict:
+                                db=None, rattraper_portail: bool = True,
+                                autoriser_reecriture: bool = False,
+                                motif: str | None = None) -> dict:
     """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
     Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
     Assure que les clés tcj_str, ttj_str, tcj_secondes, ttj_secondes, pauses_secondes sont
@@ -353,8 +426,50 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
         )).all()
         map_anciens_hists = {h.vehicule_id: h for h in anciens_hists}
 
-        # Suppression préalable ciblée dans historique_journalier
+        # Suppression préalable ciblée dans historique_journalier — v1.51,
+        # exigence 6 : la réécriture d'archives est DÉSORMAIS EXPLICITE et
+        # TRACÉE. Sans autorisation, on refuse au lieu de détruire (avant, le
+        # delete/re-insert était silencieux : une panne au milieu du travail
+        # faisait disparaître la journée sans laisser la moindre trace).
         if target_veh_ids:
+            if map_anciens_hists and not autoriser_reecriture:
+                db.add(AuditLog(username="systeme",
+                                action="archive.reecriture_refusee",
+                                entite="suivi", entite_id=None,
+                                details={"jour": jour.isoformat(),
+                                         "motif": motif,
+                                         "archives_conservees": len(map_anciens_hists),
+                                         "regle": "v1.51 exigence 6 : un jour "
+                                                  "ARCHIVÉ n'est jamais réécrit "
+                                                  "silencieusement — passer "
+                                                  "autoriser_reecriture=True "
+                                                  "avec un motif"}))
+                db.commit()
+                log.warning("recalculer_archives_journee(%s) REFUSÉ : %d archive(s) "
+                            "existante(s), réécriture non autorisée (motif=%s)",
+                            jour, len(map_anciens_hists), motif)
+                return {"date_jour": jour.isoformat(), "source_filtre": source_filtre,
+                        "suivis_recalcules": 0, "archives_mises_a_jour": 0,
+                        "trajets_consolides": n_consolides, "statut": "REFUSEE",
+                        "raison": "archive existante — réécriture non autorisée "
+                                  "(v1.51 exigence 6 : aucune réécriture silencieuse)",
+                        "archives_conservees": len(map_anciens_hists)}
+            if map_anciens_hists:
+                empreintes = []
+                for h in anciens_hists[:200]:
+                    brut = json.dumps(h.donnees or {}, sort_keys=True, default=str)
+                    empreintes.append(hashlib.sha256(brut.encode("utf-8")).hexdigest()[:16])
+                db.add(AuditLog(username="systeme",
+                                action="archive.reecriture_autorisee",
+                                entite="suivi", entite_id=None,
+                                details={"jour": jour.isoformat(),
+                                         "motif": motif,
+                                         "archives_remplacees": len(map_anciens_hists),
+                                         "empreintes_avant": empreintes,
+                                         "regle": "v1.51 exigence 6 : réécriture "
+                                                  "d'archives explicitement "
+                                                  "autorisée et tracée"}))
+                db.commit()
             db.execute(delete(HistoriqueJournalier).where(
                 HistoriqueJournalier.date_jour == jour,
                 HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
@@ -464,17 +579,27 @@ def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
         except Exception:
             items, echecs = [], ["ERREUR_INTERNE"]
         if echecs:
+            # v1.51 — exigence 5 : une source indisponible interdit l'archive
+            # partielle. La journée SE FERME quand même (23:59:59 : le split de
+            # minuit est une opération d'intégrité) mais l'historique n'est PAS
+            # écrit ; `rattrapage` l'archivera dès que la source répondra.
+            # (Avant : D4 archivait une veille incomplète — « minuit n'attend
+            # pas » ; c'est cette dérogation que l'exigence 5 remplace.)
             db.add(AuditLog(username="systeme",
-                            action="cycle_minuit.relecture_partielle",
+                            action="cycle_minuit.archive_differee",
                             entite="suivi", entite_id=None, details={
                                 "jour": jour_precedent.isoformat(),
                                 "portails_absents": echecs,
-                                "regle": "§0decies D4 (24/08/2026) : portails "
-                                         "injoignables à minuit — consolidation "
-                                         "sur la base (minuit n'attend pas)"}))
+                                "regle": "v1.51 exigence 5 : source "
+                                         "indisponible ⇒ AUCUNE archive "
+                                         "partielle — archive différée et "
+                                         "reprise automatique"}))
             db.commit()
             n_pre = consolider_jour(db, jour_precedent)
-            nb_arch = archiver_jour(db, jour_precedent)
+            nb_arch = 0
+            log.warning("Cycle de minuit %s : portail(s) absent(s) (%s) — "
+                        "ARCHIVE DIFFÉRÉE (aucune archive partielle)",
+                        jour_precedent, ", ".join(echecs))
         else:
             stats = _consolider_et_archiver_jour(
                 db, jour_precedent, items, username="cycle_minuit_d4")
@@ -525,43 +650,16 @@ async def boucle_cycle_quotidien():
 
 # ---------------------------------------------------------------- AM-4
 def _trajets_reels_du_jour(jour: date) -> tuple[list[dict], list[str]]:
-    """Relecture des historiques RÉELS des deux portails pour `jour` (AM-4/R5:
-    MZoneX Trips + rapport CamtrackPro — jamais effacés côté portails).
+    """Relecture des historiques RÉELS des portails pour `jour` (AM-4/R5).
 
-    Retourne (items, portails_en_echec). Un portail qui répond « 0 trajet »
-    est une réponse RÉELLE (jour calme) ; un portail en ERREUR est absent →
-    son nom est listé et le jour ne sera pas écrit en partiel (garde-fou)."""
-    items: list[dict] = []
-    echecs: list[str] = []
-    # MZoneX (API OData — fenêtre locale du jour complet)
-    try:
-        from .api_mzonex import ApiMZoneX, trajet_depuis_api
-        mz = ApiMZoneX()
-        bruts = mz.trajets_jour_local(jour)
-        items.extend(it for it in (trajet_depuis_api(t) for t in bruts) if it)
-    except Exception as e:
-        echecs.append(f"MZONEX ({type(e).__name__})")
-        log.warning("AM-4 catch-up %s : historique MZoneX indisponible (%s)",
-                    jour, type(e).__name__)
-    # CamtrackPro (API Wialon — rapport « Detail Trajet Vehicule » borné au jour)
-    try:
-        from .api_wialon import ApiWialon, jeton_configure
-        if jeton_configure():
-            api = ApiWialon()
-            try:
-                items.extend(api.trajets_du_jour(
-                    jour, fin_locale=_cloture_du(jour)))
-            finally:
-                api.fermer()
-        else:
-            echecs.append("CAMTRACKPRO (jeton absent)")
-    except Exception as e:
-        echecs.append(f"CAMTRACKPRO ({type(e).__name__})")
-        log.warning("AM-4 catch-up %s : historique CamtrackPro indisponible (%s)",
-                    jour, type(e).__name__)
-    return items, echecs
-
-
+    v1.51 — délègue à `rattrapage.lecture_reelle` : UNE seule lecture des
+    portails pour tout le moteur, et une distinction explicite entre « source
+    vide confirmée » (le portail a répondu « 0 trajet ») et « source
+    indisponible » (le portail n'a pas répondu) — exigence 11. Retourne
+    (items, sources_non_confirmées)."""
+    from .rattrapage import lecture_reelle
+    lecture = lecture_reelle(jour)
+    return lecture.items, lecture.echecs()
 def _consolider_et_archiver_jour(db, jour: date, items: list[dict],
                                  username: str = "rattrapage_am4") -> dict:
     """Écrit les trajets réels du jour (réconciliation bornée à ce jour),
@@ -580,124 +678,19 @@ def _consolider_et_archiver_jour(db, jour: date, items: list[dict],
 
 
 def rattraper_consolidation(cible_hier: date | None = None) -> dict:
-    """v3 AM-4/C4 — CATCH-UP au démarrage : consolide TOUS les jours manqués,
-    du plus ancien au plus récent, avec les données RÉELLES des portails.
+    """v3 AM-4/C4 — CATCH-UP des journées manquées (données RÉELLES portails).
 
-    Un jour est « manqué » s'il n'a AUCUNE archive (les archives partielles
-    d'un jour déjà entamé ne sont JAMAIS réécrites — §A.2). Un jour sans
-    relique portail disponible est LAISSÉ de côté (journal + alerte), jamais
-    écrit en partiel (garde-fou R5). S'arrête tout seul quand tout est à jour.
+    v1.51 — le moteur vit dans `rattrapage.rattraper_journees` (exigences du
+    18/09/2026) : UNE journée = UNE transaction isolée, verrou inter-processus
+    (deux workers ne traitent jamais la même journée), échec consigné dans une
+    transaction séparée SANS bloquer les journées suivantes, alerte visible
+    créée ou mise à jour, et **aucune archive partielle** : une source
+    indisponible fait reporter l'archivage au lieu de figer un historique
+    incomplet. Le rapport conserve les clés historiques (jours_traités,
+    jours_archivés, jours_sautés, détails).
     """
-    from .engine import get_seuils  # seuils à jour après seed/migrations
-    db = SessionLocal()
-    rapport = {"jours_traités": 0, "jours_archivés": 0, "jours_sautés": [],
-               "détails": {}}
-    try:
-        aujour = jour_attribution(now_local())
-        hier = (cible_hier or (aujour - timedelta(days=1)))
-        if hier >= aujour:
-            return rapport
-        jours_avec_archive = set(db.scalars(
-            select(HistoriqueJournalier.date_jour).distinct()).all())
-        premier = db.scalar(select(func.min(SuiviJournalier.date_jour)))
-        if premier is None:
-            ensure_suivis_du_jour(db, aujour)
-            return rapport
-        jour = premier
-        while jour <= hier:
-            if jour in jours_avec_archive:
-                jour += timedelta(days=1)
-                continue                      # déjà figé §A.2 — idempotent
-            nb_suivis = db.scalar(select(func.count(SuiviJournalier.id)).where(
-                SuiviJournalier.date_jour == jour)) or 0
-            items, echecs = _trajets_reels_du_jour(jour)
-            if echecs:
-                if nb_suivis > 0:
-                    # En production comme en démo : si la veille/journée possède déjà des suivis enregistrés (55 camions),
-                    # on consolide à 23:59:59 et archive les données locales existantes (minuit n'attend pas — règle §0decies D4).
-                    if items:
-                        stats = _consolider_et_archiver_jour(db, jour, items, username="catchup_partiel")
-                        n_pre = stats.get("consolides", 0)
-                        nb_arch = stats.get("archives", 0)
-                    else:
-                        n_pre = consolider_jour(db, jour)
-                        nb_arch = archiver_jour(db, jour)
-
-                    db.add(AuditLog(username="systeme",
-                                    action="jour.catchup_consolide_local",
-                                    entite="suivi", entite_id=None,
-                                    details={"jour": jour.isoformat(),
-                                             "portails_absents": echecs,
-                                             "suivis_archives": nb_arch,
-                                             "regle": "§0decies D4 : consolidation sur la base (minuit n'attend pas)"}))
-                    db.commit()
-                    rapport["jours_traités"] += 1
-                    rapport["jours_archivés"] += nb_arch
-                    rapport["détails"][jour.isoformat()] = {"consolides": n_pre, "archives": nb_arch, "portails_absents": echecs}
-                    log.info("AM-4 : journée du %s consolidée (%d) et archivée (%d) sur la base (portails absents : %s)",
-                             jour, n_pre, nb_arch, ", ".join(echecs))
-                    jour += timedelta(days=1)
-                    continue
-
-                # Si aucun suivi local et portail en échec :
-                deja = db.scalar(select(func.count(AuditLog.id)).where(
-                    AuditLog.action == "jour.catchup_sans_source",
-                    AuditLog.details.like(f'%"{jour.isoformat()}"%'))) or 0
-                if not deja:
-                    db.add(AuditLog(username="systeme",
-                                    action="jour.catchup_sans_source",
-                                    entite="suivi", entite_id=None,
-                                    details={"jour": jour.isoformat(),
-                                             "portails_absents": echecs,
-                                             "regle": "v3 AM-4/R5 : jour absent "
-                                                      "des sources — aucune donnée "
-                                                      "partielle écrite"}))
-                    a = Alerte(date_heure=now_local(),
-                               type=TypeAlerte.GPS_HORS_LIGNE,
-                               gravite=GraviteAlerte.MOYENNE,
-                               message=(f"Rattrapage : journée du {jour:%d/%m/%Y} "
-                                        f"sans source ({', '.join(echecs)}) — "
-                                        "reprise au prochain démarrage."),
-                               statut=StatutAlerte.NOUVELLE,
-                               lien_module="/historique")
-                    db.add(a)
-                    db.commit()
-                log.warning("AM-4 : %s laissé de côté (portails absents : %s)",
-                            jour, ", ".join(echecs))
-                rapport["jours_sautés"].append(jour.isoformat())
-                jour += timedelta(days=1)
-                continue
-            if not items and nb_suivis == 0:
-                # jour réellement vide des deux côtés : RIEN à écrire (le jour
-                # n'est pas marqué : on ne peut distinguer « personne n'a
-                # roulé » de « plateforme éteinte » — honnêteté §10)
-                jour += timedelta(days=1)
-                continue
-            stats = _consolider_et_archiver_jour(db, jour, items)
-            db.add(AuditLog(username="systeme", action="jour.catchup_consolide",
-                            entite="suivi", entite_id=None,
-                            details={"jour": jour.isoformat(),
-                                     "regle": "v3 AM-4 : catch-up au démarrage "
-                                              "avec données réelles portails",
-                                     "trajets_portails": len(items)}))
-            db.commit()
-            rapport["jours_traités"] += 1
-            if stats.get("archives"):
-                rapport["jours_archivés"] += stats["archives"]
-            rapport["détails"][jour.isoformat()] = stats
-            log.info("AM-4 : journée du %s rattrapée — %s", jour, stats)
-            jour += timedelta(days=1)
-        ensure_suivis_du_jour(db, aujour)
-        if rapport["jours_traités"] or rapport["jours_sautés"]:
-            log.warning("AM-4 catch-up terminé : %s", rapport)
-    except Exception:
-        db.rollback()
-        log.exception("AM-4 : échec du rattrapage de consolidation")
-    finally:
-        db.close()
-    return rapport
-
-
+    from .rattrapage import rattraper_journees
+    return rattraper_journees(cible_hier)
 def rattraper_au_demarrage():
     """Démarrage : journée courante créée (rapide), puis le CATCH-UP AM-4
     complet tourne — il consolide au titre 23:59:59 (v3 AM-3/C1) tous les

@@ -391,7 +391,11 @@ def recalculer_archive_api(date_jour: str = Query(default="2026-09-11"),
                            user=Depends(require_roles(*ECRITURE))):
     """Re-consolide et re-calcule intégralement les archives d'une journée."""
     from ..daily import recalculer_archives_journee
-    res = recalculer_archives_journee(date_jour, db=db)
+    # v1.51 exigence 6 : la réécriture d'archives demandée par un
+    # opérateur est EXPLICITE et tracée (jamais silencieuse).
+    res = recalculer_archives_journee(date_jour, db=db,
+                                      autoriser_reecriture=True,
+                                      motif="api_recalcul_manuel")
     audit(db, user, "historique.recalculer_archive", "historique", date_jour, res)
     db.commit()
     return res

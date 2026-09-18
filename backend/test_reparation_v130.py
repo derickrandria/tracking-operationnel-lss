@@ -208,10 +208,16 @@ def _pannes(jour):
 
 daily._trajets_reels_du_jour = _pannes
 daily.executer_cycle_quotidien(J3, J3 + timedelta(days=1))
+# v1.51 (exigence 5) — la dérogation D4 « minuit n'attend pas » est REMPLACÉE :
+# la journée se ferme (23:59:59) mais l'archive est DIFFÉRÉE tant qu'une source
+# bloquante n'a pas répondu. L'audit porte le nouveau nom.
 note = db.scalar(select(func.count(AuditLog.id)).where(
+    AuditLog.action == "cycle_minuit.archive_differee")) or 0
+ancien = db.scalar(select(func.count(AuditLog.id)).where(
     AuditLog.action == "cycle_minuit.relecture_partielle")) or 0
-check("D4-3 : portails en panne → consolidation sur la base + audit explicite",
-      note >= 1, f"audits={note}")
+check("D4-3 : portails en panne → consolidation sur la base, archive DIFFÉRÉE "
+      "+ audit explicite (v1.51 exigence 5)",
+      note >= 1 and ancien == 0, f"audits={note} anciens={ancien}")
 
 # fermeture propre du 23/08 → 24/08 (miroir de la production : suivis du 23
 # créés par le cycle précédent ; ici journée vide des deux côtés)

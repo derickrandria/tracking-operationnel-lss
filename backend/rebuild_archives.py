@@ -54,7 +54,12 @@ def main():
     try:
         for d in dates_cibles:
             print(f"\n[+] Re-moulinage et consolidation pour le {d.isoformat()}...")
-            res = recalculer_archives_journee(d, db=db)
+            # v1.51 (exigence 6) : la réécriture d'une archive n'est JAMAIS
+            # implicite. Cet outil CLI a justement pour métier de reconstruire :
+            # il déclare donc explicitement son accord et son motif, tracés en base.
+            res = recalculer_archives_journee(
+                d, db=db, autoriser_reecriture=True,
+                motif="outil_rebuild_archives")
             print(f"    -> Statut: {res.get('statut')} | Archives réinsérées: {res.get('archives_mises_a_jour')} | Trajets consolidés: {res.get('trajets_consolides')}")
         db.commit()
         print("\n✅ Reconstruction des archives terminée avec succès !")

@@ -209,6 +209,20 @@ TOKEN_TTL_MIN = int(os.getenv("TOKEN_TTL_MIN", "10080"))  # 7 jours (choix méti
 SIM_ENABLE = os.getenv("SIM_ENABLE", "0") == "1"
 SIM_TICK_S = int(os.getenv("SIM_TICK_S", "20"))       # cadence de remontée live (s)
 COLLECTOR_SOURCE = os.getenv("COLLECTOR_SOURCE", "MIXTE").upper()
+# v1.51 (exigence 13) — le mode simulateur ne peut JAMAIS fabriquer une archive
+# officielle en silence : `archiver_jour` refuse d'écrire l'historique d'une
+# journée simulée tant que l'exploitant n'a pas donné son accord EXPLICITE par
+# cette variable. Une alerte visible est levée à chaque refus.
+SIMULATEUR_ARCHIVE_AUTORISE = os.getenv("LSS_SIMULATEUR_ARCHIVE", "0") == "1"
+
+# ------------------------------------------------- rattrapage / archivage (v1.51)
+# Période de la relance automatique du rattrapage (exigence 7) : 15 min.
+RATTRAPAGE_PERIODE_S = int(os.getenv("RATTRAPAGE_PERIODE_S", "900"))
+# Durée de vie d'un verrou de journée avant reprise par un autre worker
+# (exigence 9) : 30 min — très au-delà d'une consolidation normale.
+RATTRAPAGE_VERROU_TTL_S = int(os.getenv("RATTRAPAGE_VERROU_TTL_S", "1800"))
+# Garde-fou de volume : nombre maximum de journées examinées par passage.
+RATTRAPAGE_LIMITE_JOURS = int(os.getenv("RATTRAPAGE_LIMITE_JOURS", "400"))
 
 # ---------------------------------------------------------------- frontend
 FRONTEND_DIST = os.getenv("FRONTEND_DIST", str(ROOT_DIR.parent / "frontend" / "dist"))

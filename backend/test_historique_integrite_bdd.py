@@ -54,7 +54,9 @@ def setup():
             db.add(User(username="admin_test", password_hash=hash_password("Pass@123"),
                         nom_complet="Admin Test", role=Role.ADMIN))
         for d in [date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)]:
-            recalculer_archives_journee(d, db=db, rattraper_portail=False)
+            recalculer_archives_journee(d, db=db, rattraper_portail=False,
+                                                   autoriser_reecriture=True,
+                                                   motif="test_integrite")
         db.commit()
     finally:
         db.close()
@@ -66,7 +68,9 @@ def test_recalcul_et_coherence_bdd():
     try:
         for d_str in ["2026-09-11", "2026-09-12", "2026-09-13"]:
             d = date.fromisoformat(d_str)
-            res = recalculer_archives_journee(d, db=db, rattraper_portail=False)
+            res = recalculer_archives_journee(d, db=db, rattraper_portail=False,
+                                                   autoriser_reecriture=True,
+                                                   motif="test_integrite")
             assert res["statut"] == "OK", f"Échec recalcul pour {d_str}: {res}"
 
         # Contrôle exhaustif de TOUTES les archives en base
