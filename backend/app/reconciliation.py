@@ -64,8 +64,8 @@ from .engine import (PUBLISH_ENABLED, _verifier_temps, appliquer_badge_et_eco,
 from .event_bus import publish
 from .models import (AuditLog, HistoriqueJournalier, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet, Vehicule)
-from .serializers import (compter_trajets_reels, fusionner_trajets_affichage,
-                       iso, journee_suivi, s_ligne, s_suivi, s_trajet)
+from .serializers import (iso, journee_suivi, s_ligne, snapshot_canonique,
+                       s_suivi, s_trajet)
 
 log = logging.getLogger("lss.reconciliation")
 
@@ -234,18 +234,16 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
                  suivi.vehicule.plaque if suivi.vehicule else "?",
                  len(avant_lignes), len(donnees["trajets"]),
                  " (+ positions N3)" if change_pos else "")
-    # v1.53 (18/09/2026) — le snapshot conserve les trajets BRUTS (aucun trajet
-    # valide n'est perdu en base) et déclare les SÉQUENCES affichées à côté :
-    # `nb_trajets` ne porte plus qu'un seul sens, partout = nombre de séquences.
-    _seqs = fusionner_trajets_affichage(
-        donnees["trajets"],
-        seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S", 1800)),
-        seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN", 1800)))
-    _reels = len(journee.lignes)
-    donnees["nb_trajets_valides_reels"] = _reels
-    donnees["nb_sequences_affichees"] = len(_seqs)
-    donnees["nb_trajets_fusionnes"] = max(0, _reels - len(_seqs))
-    donnees["nb_trajets"] = len(_seqs)
+    # v1.53 (18/09/2026) — SNAPSHOT CANONIQUE : trajets BRUTS + compteurs
+    # distincts, produits par LA fabrique unique partagée avec `archiver_jour`
+    # et `recalculer_archives_journee` (vérifié par
+    # test_coherence_archives_v153.py). `nb_trajets` n'a qu'un seul sens :
+    # le nombre de SÉQUENCES affichées.
+    _canon = snapshot_canonique(suivi, seuils)
+    donnees["nb_trajets_valides_reels"] = _canon["nb_trajets_valides_reels"]
+    donnees["nb_sequences_affichees"] = _canon["nb_sequences_affichees"]
+    donnees["nb_trajets_fusionnes"] = _canon["nb_trajets_fusionnes"]
+    donnees["nb_trajets"] = _canon["nb_trajets"]
     donnees["heure_depart"] = iso(suivi.heure_depart)
     donnees["tcc_s"], donnees["tcj_s"] = suivi.tcc_s, suivi.tcj_s
     donnees["ttj_s"], donnees["total_pause_s"] = suivi.ttj_s, suivi.total_pause_s

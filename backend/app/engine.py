@@ -408,8 +408,22 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
         return
 
     suivi.heure_depart = journee.lignes[0].debut      # AM-6 : 1er mouvement valide
-    suivi.tcj_s = min(86400, max(0, journee.tcj_s))   # AM-1/§0duodecies F1 : UNION (plafond 24h)
-    suivi.ttj_s = min(86400, max(0, journee.ttj_s))   # T1 : amplitude brute (plafond 24h)
+    # v1.53 (18/09/2026) — PLAFOND TECHNIQUE 24 h, désormais TRACÉ. Pour une
+    # journée civile la borne physique est 86 400 s : le bornage au jour
+    # (construire_journee) clippe AVANT, donc cet écrêtage ne peut se
+    # déclencher que sur une donnée ANORMALE (trajet non découpé à minuit,
+    # valeur importée, correction manuelle). Il reste une sécurité — mais une
+    # sécurité SILENCIEUSE était un risque d'audit : toute troncature réelle
+    # est désormais journalisée (durée brute conservée dans le message).
+    _tcj_brut, _ttj_brut = journee.tcj_s, journee.ttj_s
+    suivi.tcj_s = min(86400, max(0, _tcj_brut))       # AM-1/§0duodecies F1 : UNION (plafond 24h)
+    suivi.ttj_s = min(86400, max(0, _ttj_brut))       # T1 : amplitude brute (plafond 24h)
+    if _ttj_brut > 86400 or _tcj_brut > 86400:
+        log.warning(
+            "Plafond technique 24 h APPLIQUÉ — suivi %s / %s : TCJ brut=%.0f s → %d s, "
+            "TTJ brut=%.0f s → %d s (donnée anormale : vérifier le découpage à minuit)",
+            suivi.date_jour, suivi.vehicule_id, _tcj_brut, suivi.tcj_s,
+            _ttj_brut, suivi.ttj_s)
     suivi.total_pause_s = max(0, suivi.ttj_s - suivi.tcj_s) # Σ de TOUS les arrêts
 
     # §0duodecies F1 (arbitrage LSS 25/08/2026) — journal de transparence :

@@ -295,7 +295,7 @@ def seed_si_vide():
                             "km_parcourus": round(rng.uniform(120, 480), 1),
                             "nb_trajets": rng.randint(3, 7), "trajets": [],
                             "flag_tcj": bool(tcj > 36000),
-                            "flag_ttj": bool(ttj > 43200),
+                            "flag_ttj": bool(ttj >= 43200),   # v1.53 : inclusif
                             "flag_tcc": False,
                         },
                         nb_infractions=nb_inf, nb_alertes=rng.randint(0, 3)))

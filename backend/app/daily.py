@@ -42,7 +42,8 @@ from .models import (Alerte, AuditLog, GraviteAlerte, HistoriqueJournalier,
                      StatutValidationTrajet, SuiviJournalier, Trajet,
                      TypeAlerte, Vehicule, uid)
 from .serializers import (compter_trajets_reels, fusionner_trajets_affichage,
-                       iso, journee_suivi, s_ligne, s_suivi)
+                       iso, journee_suivi, s_ligne, s_suivi,
+                       snapshot_canonique)
 
 log = logging.getLogger("lss.daily")
 
@@ -153,7 +154,13 @@ def archiver_jour(db, jour: date) -> int:
         db.add(HistoriqueJournalier(
             date_jour=jour, annee=jour.year, mois=jour.month,
             vehicule_id=s.vehicule_id, conducteur_id=s.conducteur_id,
-            donnees=s_suivi(s), nb_infractions=nb_inf, nb_alertes=nb_alertes))
+            # v1.53 — FABRIQUE UNIQUE : trajets BRUTS + compteurs distincts
+            # (avant : `s_suivi(s)` stockait la vue déjà fusionnée, si bien que
+            # le chemin « rattrapage » et le chemin « recalcul » produisaient
+            # deux snapshots différents pour la même journée — écart détecté par
+            # test_coherence_archives_v153.py, corrigé ici).
+            donnees=snapshot_canonique(s), nb_infractions=nb_inf,
+            nb_alertes=nb_alertes))
         archives += 1
     db.commit()
     return archives
@@ -490,24 +497,10 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             # On force la relecture : « TCJ/TTJ/TCC calculés AVANT toute
             # sérialisation » n'a de sens que si elle lit l'état réel.
             db.expire(s, ["trajets"])
-            d = s_suivi(s, seuils)
+            d = snapshot_canonique(s, seuils)   # v1.53 — fabrique unique
 
-            # v1.53 (18/09/2026) — le snapshot d'archive conserve les trajets
-            # BRUTS (un trajet valide n'est JAMAIS perdu en base : ici on
-            # stockait la vue déjà fusionnée) et déclare les compteurs
-            # distincts — `nb_trajets` = SÉQUENCES affichées, un seul sens.
-            _journee_brute = journee_suivi(s, seuils)
-            d["trajets"] = [s_ligne(lg, i)
-                            for i, lg in enumerate(_journee_brute.lignes, start=1)]
-            _seqs = fusionner_trajets_affichage(
-                d["trajets"],
-                seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S", 1800)),
-                seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN", 1800)))
-            d["nb_trajets_valides_reels"] = compter_trajets_reels(d["trajets"])
-            d["nb_sequences_affichees"] = len(_seqs)
-            d["nb_trajets_fusionnes"] = max(
-                0, d["nb_trajets_valides_reels"] - len(_seqs))
-            d["nb_trajets"] = len(_seqs)
+            db.expire(s, ["trajets"])
+            d = snapshot_canonique(s, seuils)   # v1.53 — fabrique unique
 
             nb_inf = db.scalar(select(func.count(Infraction.id)).where(
                 Infraction.date_jour == jour, Infraction.vehicule_id == v.id,
@@ -518,7 +511,16 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
 
             cond_id = s.conducteur_id or v.conducteur_actuel_id
 
-            tcj_sec = max(0, min(86400, int(d.get("tcj_s") or d.get("tcj_secondes") or 0)))
+            _tcj_src = int(d.get("tcj_s") or d.get("tcj_secondes") or 0)
+            _ttj_src = int(d.get("ttj_s") or d.get("ttj_secondes") or _tcj_src)
+            if _tcj_src > 86400 or _ttj_src > 86400:
+                # v1.53 — une valeur d'archive > 24 h est anormale : on la ramène
+                # à la borne technique MAIS on le dit (jamais de correction muette).
+                log.warning(
+                    "Archive %s / véhicule %s : valeur > 24 h ramenée à la borne "
+                    "technique (TCJ %d → ≤86400, TTJ %d → ≤86400)",
+                    jour, v.id, _tcj_src, _ttj_src)
+            tcj_sec = max(0, min(86400, _tcj_src))
             ttj_sec = max(0, min(86400, int(d.get("ttj_s") or d.get("ttj_secondes") or (tcj_sec + int(d.get("total_pause_s") or d.get("pauses_secondes") or 0)))))
             if ttj_sec < tcj_sec:
                 ttj_sec = tcj_sec
@@ -557,7 +559,8 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
                 ttj_max *= 3600
 
             d["flag_tcj"] = bool(tcj_sec > tcj_max)
-            d["flag_ttj"] = bool(ttj_sec > ttj_max)
+            # v1.53 — seuil INCLUSIF (12:00:00 pile est signalé)
+            d["flag_ttj"] = bool(ttj_sec >= ttj_max)
             tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
             if tcc_max <= 24:
                 tcc_max *= 3600

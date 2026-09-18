@@ -23,8 +23,10 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 
+from app.serializers import s_historique
 from app.database import SessionLocal
 from app import daily, engine, reparation
+from app.engine import get_seuils
 from app.models import (Alerte, AuditLog, EvenementGPS, HistoriqueJournalier,
                         Infraction, Mission, StatutSourceTrajet,
                         StatutValidationTrajet, SuiviJournalier, Trajet,
@@ -313,17 +315,36 @@ check("R3g : audits de masquage ET de guérison présents",
 arch_j2 = {h.vehicule_id: dict(h.donnees or {}) for h in db.scalars(
     select(HistoriqueJournalier).where(HistoriqueJournalier.date_jour == J2))}
 a4876 = arch_j2.get(v4876.id, {})
-fins_archives = [t.get("heure_fin") for t in (a4876.get("trajets") or [])]
+# v1.53 (18/09/2026) — OÙ LIRE LES « 3 LIGNES FUSIONNÉES » : l'archive STOCKÉE
+# conserve désormais les trajets BRUTS (arbitrage LSS « tous les trajets valides
+# restent conservés individuellement en base ; les séquences d'affichage sont
+# calculées séparément ») et la projection d'affichage (3 lignes) est produite à
+# la LECTURE. L'intention de R3h est inchangée : plus aucune fin « 01:00 », les
+# fins réelles apparaissent sur la vue d'écran ; on lit donc la vue d'affichage
+# — et on vérifie EN PLUS que la base en garde bien 5 (aucun trajet perdu).
+_h4876 = db.scalar(select(HistoriqueJournalier).where(
+    HistoriqueJournalier.date_jour == J2,
+    HistoriqueJournalier.vehicule_id == v4876.id))
+fins_stockees = [t.get("heure_fin") for t in (a4876.get("trajets") or [])]
+fins_archives = [t.get("heure_fin")
+                 for t in (s_historique(_h4876, detail=True, seuils=get_seuils(db))
+                           ["donnees"]["trajets"] or [])]
 # Réalignement v1.31 (§0undecies E1, 24/08/2026 — prime sur AM-2 pour les
 # arrêts < 20 min) : les pauses 13:30:39→13:47:55 (17 min) et 16:41:20→
-# 16:57:11 (16 min) sont < 20 min → la grille/archive affichent 3 LIGNES
-# fusionnées ; la BASE garde les 5 trajets réels (vérifié par R3c/R3f).
+# 16:57:11 (16 min) sont < 20 min → l'écran affiche 3 LIGNES fusionnées ;
+# la BASE garde les 5 trajets réels (vérifié par R3c/R3f).
 check("R3h : archive du 21/08 régénérée — plus AUCUNE fin « 01:00 », fins "
       "réelles (E1 v1.31 : 3 lignes fusionnées, fins 14:00:01 / 18:58:06 / "
       "20:38:36)", len(fins_archives) == 3
       and fins_archives == ["2026-08-21T14:00:01", "2026-08-21T18:58:06",
                             "2026-08-21T20:38:36"],
-      f"{fins_archives}")
+      f"affichage={fins_archives}")
+check("R3h bis v1.53 — la BASE conserve bien les 5 trajets réels (aucune "
+      "fusion stockée) et aucune fin « 01:00 »",
+      len(fins_stockees) == 5
+      and not any((f or "").endswith("T01:00:00") or (f or "").endswith("T01:00")
+                  for f in fins_stockees),
+      f"bruts={fins_stockees}")
 reecr = db.scalar(select(func.count(AuditLog.id)).where(
     AuditLog.action == "jour.archive_reecrite_v130")) or 0
 check("R3i : journal AVANT/APRÈS de la réécriture d'archive présent", reecr >= 1)

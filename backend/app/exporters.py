@@ -546,6 +546,9 @@ def _note_provisoire_pdf():
 
 def export_suivi_pdf(jour_label: str, lignes: list[dict], detail: bool,
                      utilisateur: str = "") -> bytes:
+    # v1.53 — l'export porte « 0:00 » (convention) sur une journée close là où
+    # l'interface affiche « — » : la note de convention accompagne le fichier
+    # (cf. NOTE_TCC_CONVENTION) et la donnée réelle reste en base.
     """Addendum v1.1 §3.5 — Export PDF du Suivi Journalier : paysage, A3 en
     mode détaillé / A4 en compact, en-tête + pied de page numéroté."""
     from reportlab.lib.pagesizes import A3, A4, landscape
@@ -567,6 +570,10 @@ def export_suivi_pdf(jour_label: str, lignes: list[dict], detail: bool,
     ]
     if detail:
         story += _note_provisoire_pdf()
+    # v1.53 — note de convention TCC : l'export porte « 0:00 » là où l'écran
+    # affiche « — » ; la donnée réelle reste en base (jamais détruite).
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"<i>ⓘ  {NOTE_TCC_CONVENTION}</i>", petit))
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()
@@ -696,6 +703,10 @@ def export_historique_pdf(du, au, jours: list, synthese: list[dict],
                                f"{len(lignes)} camions", styles["Title"]))
         story.append(Spacer(1, 4))
         story.append(_table_suivi_pdf(lignes, detail))
+    # v1.53 — même note de convention que le Suivi : « 0:00 » est un rendu,
+    # la valeur TCC réelle reste en base et dans les archives.
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"<i>ⓘ  {NOTE_TCC_CONVENTION}</i>", petit))
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()
@@ -862,9 +873,6 @@ def export_missions_pdf(titre_periode: str, missions: list[dict],
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(t)
-    # v1.53 — note de convention TCC (« 0:00 » = affichage, donnée conservée)
-    story.append(Spacer(1, 8))
-    story.append(Paragraph(f"<i>ⓘ  {NOTE_TCC_CONVENTION}</i>", petit))
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()

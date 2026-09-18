@@ -315,6 +315,34 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     return res
 
 
+def snapshot_canonique(s: SuiviJournalier, seuils: dict | None = None) -> dict:
+    """Snapshot d'archive CANONIQUE (v1.53, 18/09/2026) — FABRIQUE UNIQUE des
+    trois chemins d'écriture (`daily.archiver_jour`,
+    `daily.recalculer_archives_journee`, `reconciliation._synchroniser_archive`).
+
+    Contrat unique, vérifié par `test_coherence_archives_v153.py` :
+      • `trajets` = trajets valides BRUTS, **individuellement** conservés
+        (le regroupement est une projection d'affichage, jamais une écriture) ;
+      • `nb_trajets_valides_reels` = nombre de trajets valides en base ;
+      • `nb_sequences_affichees` = `nb_trajets` = lignes réellement rendues ;
+      • `nb_trajets_fusionnes` = trajets absorbés par le regroupement.
+    Les compteurs viennent de la vue d'affichage (`s_suivi`) et les trajets de
+    la journée chaînée : une seule source, deux projections explicites.
+    """
+    seuils = seuils or {}
+    d = s_suivi(s, seuils)                       # vue d'affichage (fusionnée)
+    nb_sequences = int(d.get("nb_sequences_affichees")
+                       or len(d.get("trajets") or []))
+    journee = journee_suivi(s, seuils)
+    bruts = [s_ligne(lg, i) for i, lg in enumerate(journee.lignes, start=1)]
+    d["trajets"] = bruts                          # BRUTS, jamais fusionnés
+    d["nb_trajets_valides_reels"] = len(bruts)
+    d["nb_sequences_affichees"] = nb_sequences
+    d["nb_trajets"] = nb_sequences
+    d["nb_trajets_fusionnes"] = max(0, len(bruts) - nb_sequences)
+    return d
+
+
 def compter_trajets_reels(trajets: list[dict] | None) -> int:
     """Nombre de trajets valides RÉELS représentés par une liste de lignes —
     fusionnée ou non (v1.53, 18/09/2026).
@@ -466,7 +494,9 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         # drapeaux de dépassement (pour coloration frontend)
         "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
         "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
-        "flag_ttj": bool(ttj_val and ttj_val > ttj_max),
+        # v1.53 — seuil TTJ INCLUSIF (clarification 18/09 : « TTJ >= 12:00 ») :
+        # 12:00:00 PILE est signalé. TTJ_MAX reste un SEUIL, jamais un plafond.
+        "flag_ttj": bool(ttj_val is not None and ttj_val >= ttj_max),
         "updated_at": iso(s.updated_at),
     }
 
@@ -657,8 +687,15 @@ def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = No
     ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
     tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
     tcc_val = min(86400, max(0, int(d.get("tcc_s") or d.get("tcc_secondes") or 0)))
-    tcj_val = min(86400, max(0, int(d.get("tcj_s") or d.get("tcj_secondes") or 0)))
-    ttj_val = min(86400, max(0, int(d.get("ttj_s") or d.get("ttj_secondes") or 0)))
+    # v1.53 — PLAFOND TECHNIQUE 24 h, RENDU VISIBLE : une valeur d'archive
+    # supérieure à 86 400 s est anormale (aucune journée civile ne peut la
+    # produire). Elle est ramenée à la borne pour l'affichage — sans jamais
+    # réécrire l'archive — et le fait est DÉCLARÉ au client pour que
+    # l'anomalie ne disparaisse pas silencieusement d'un rapport.
+    _tcj_brut = int(d.get("tcj_s") or d.get("tcj_secondes") or 0)
+    _ttj_brut = int(d.get("ttj_s") or d.get("ttj_secondes") or _tcj_brut)
+    tcj_val = min(86400, max(0, _tcj_brut))
+    ttj_val = min(86400, max(0, _ttj_brut))
     if ttj_val < tcj_val:
         ttj_val = tcj_val
     pause_val = max(0, min(86400, int(d.get("total_pause_s") or d.get("pauses_secondes") or (ttj_val - tcj_val))))
@@ -709,8 +746,13 @@ def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = No
         "nb_alertes": h.nb_alertes,
         # drapeaux de dépassement (v1.52 : calculés sur la valeur RÉELLE,
         # comme s_suivi — un drapeau n'a de sens que si la valeur existe)
+        # v1.53 — signale qu'une valeur > 24 h a été ramenée à la borne
+        # technique (donnée anormale ; l'archive n'est PAS réécrite).
+        "plafond_24h_applique": bool(_tcj_brut > 86400 or _ttj_brut > 86400),
         "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
-        "flag_ttj": bool(ttj_val and ttj_val > ttj_max),
+        # v1.53 — seuil TTJ INCLUSIF (clarification 18/09 : « TTJ >= 12:00 ») :
+        # 12:00:00 PILE est signalé. TTJ_MAX reste un SEUIL, jamais un plafond.
+        "flag_ttj": bool(ttj_val is not None and ttj_val >= ttj_max),
         "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
         "archive_le": iso(h.archive_le),
     }

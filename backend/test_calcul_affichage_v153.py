@@ -402,9 +402,92 @@ try:
                         if isinstance(c.value, str))
     check("export Historique : note de convention également présente",
           "Convention d'affichage" in texteh)
+
+    # --- v1.53 : les PDF (Suivi ET Historique) portent la même note ---------
+    import pypdf
+    from app.exporters import export_pdf, export_suivi_pdf
+
+    pdf_suivi = export_suivi_pdf("14/09/2026", [ligne], detail=True, utilisateur="test")
+    texte_pdf_suivi = " ".join(
+        (pg.extract_text() or "") for pg in
+        pypdf.PdfReader(io.BytesIO(pdf_suivi)).pages)
+    check("export Suivi PDF : note de convention présente dans le texte du PDF",
+          "Convention d'affichage" in texte_pdf_suivi)
+    check("export Suivi PDF : TCC rendu « 0:00 » sur une journée close",
+          "0:00" in texte_pdf_suivi, texte_pdf_suivi[:80])
+
+    pdf_hist = export_pdf("Historique 09/2026", ["Date", "TCC"],
+                          [["14/09/2026", "0:00"]], note=NOTE_TCC_CONVENTION)
+    texte_pdf_hist = " ".join(
+        (pg.extract_text() or "") for pg in
+        pypdf.PdfReader(io.BytesIO(pdf_hist)).pages)
+    check("export Historique PDF : note de convention présente",
+          "Convention d'affichage" in texte_pdf_hist)
     check("la donnée TCC réelle reste disponible dans le snapshot exporté "
           "(l'export ne détruit rien)",
           int((h.donnees or {}).get("tcc_s") or 0) > 0)
+
+    # -------------------------------------------------------------------------
+    print("\n[12] §1 — BORNES TTJ : 12:00:00 INCLUSIF, plafond 24 h, valeur jamais écrasée")
+    seuils12 = get_seuils(db)
+    ttj_max12 = float(seuils12["SEUIL_TTJ_MAX"])
+    check("le seuil TTJ paramétré vaut bien 12 h (43 200 s)", ttj_max12 == 43200,
+          f"{ttj_max12}")
+
+    J12a = date(2026, 9, 15)
+    scenario(J12a, [(dt(J12a, 6, 0), dt(J12a, 18, 0), 100.0, False)], dt(J12a, 20, 0))
+    s12a = db.get(SuiviJournalier, ensure_suivi(db, v, J12a).id)
+    db.refresh(s12a)
+    d12a = s_suivi(s12a, seuils12)
+    check("TTJ = 12:00:00 PILE → SIGNALÉ (seuil INCLUSIF, clarification du 18/09)",
+          int(d12a["ttj_s"]) == 43200 and d12a["flag_ttj"] is True,
+          f"ttj={d12a['ttj_s']} flag={d12a['flag_ttj']}")
+
+    J12b = date(2026, 9, 16)
+    scenario(J12b, [(dt(J12b, 6, 0), dt(J12b, 17, 59, 59), 100.0, False)], dt(J12b, 20, 0))
+    s12b = db.get(SuiviJournalier, ensure_suivi(db, v, J12b).id)
+    db.refresh(s12b)
+    d12b = s_suivi(s12b, seuils12)
+    check("TTJ = 11:59:59 → NON signalé (juste sous le seuil)",
+          int(d12b["ttj_s"]) == 43199 and d12b["flag_ttj"] is False,
+          f"ttj={d12b['ttj_s']} flag={d12b['flag_ttj']}")
+
+    # --- au-delà de 24 h : le bornage au jour clippe AVANT tout plafond
+    _jr24 = construire_journee(
+        [Segment(debut=dt(J, 5, 0), fin=dt(J + timedelta(days=1), 8, 0),
+                 distance_km=900.0, rejete=False)],
+        maintenant=dt(J, 23, 59, 59), date_jour=J, pause_min=1200, seuil_km=0.3)
+    check("un trajet de 27 h est BORNÉ au jour J (05:00 → 23:59:59 = 68 399 s) "
+          "AVANT tout plafond : aucune valeur > 24 h n'est produite",
+          _jr24.ttj_s == 68399 and _jr24.ttj_s < 86400, f"ttj={_jr24.ttj_s}")
+    _jr24b = construire_journee(
+        [Segment(debut=dt(J, 0, 0), fin=dt(J, 23, 59, 59), distance_km=500.0,
+                 rejete=False)],
+        maintenant=dt(J, 23, 59, 59), date_jour=J, pause_min=1200, seuil_km=0.3)
+    check("journée pleine 00:00 → 23:59:59 = 86 399 s : le maximum physiologique "
+          "d'une journée civile reste sous la borne de 86 400 s",
+          _jr24b.ttj_s == 86399)
+
+    # --- le plafond technique ne peut donc écrêter qu'une donnée ANORMALE :
+    #     on le prouve sur une archive fautive, et l'anomalie est DÉCLARÉE.
+    h_faux = HistoriqueJournalier(
+        date_jour=date(2026, 9, 5), annee=2026, mois=9, vehicule_id=v.id,
+        donnees={"tcc_s": 5400, "tcj_s": 100000, "ttj_s": 120000,
+                 "trajets": [], "nb_trajets": 0, "plaque": "ANOMALIE"},
+        nb_infractions=0, nb_alertes=0)
+    db.add(h_faux)
+    db.commit()
+    lu_faux = s_historique(h_faux, seuils=seuils12)
+    check("valeur d'archive ANORMALE (TTJ 120 000 s = 33 h) : ramenée à la borne "
+          "technique 24 h à la lecture", int(lu_faux["ttj_s"]) == 86400,
+          f"ttj={lu_faux['ttj_s']}")
+    check("…et l'anomalie est DÉCLARÉE au client (plus de correction silencieuse)",
+          lu_faux.get("plafond_24h_applique") is True)
+    check("l'archive fautive n'est PAS réécrite en base (lecture seule)",
+          int((h_faux.donnees or {}).get("ttj_s") or 0) == 120000)
+    check("TTJ réel jamais écrasé en base pour une journée NORMALE : "
+          "la valeur stockée égale la valeur calculée",
+          int(s12a.ttj_s) == 43200, f"stocké={s12a.ttj_s}")
 
     print("\n" + "=" * 74)
     print(f"  RÉSULTAT : {OK} OK / {KO} KO")
