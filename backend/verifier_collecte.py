@@ -28,6 +28,12 @@ Usage (sur le serveur, dans `backend/`) :
 """
 from __future__ import annotations
 
+import os
+# v1.50 — outil de CONTRÔLE en lecture seule : on n'ouvre pas de transaction
+# d'écriture (sinon ses longues analyses prendraient le verrou de la base et
+# gêneraient la collecte du service en cours d'exécution).
+os.environ.setdefault("LSS_SQLITE_IMMEDIATE", "0")
+
 import argparse
 import json
 import sys
@@ -77,6 +83,25 @@ def afficher_sante(d: dict, titre: str) -> bool:
                   f"erreur={str(erreur)[:150] if erreur else 'aucune'}")
         if d.get("statut") == "COLLECTE_OK" and d.get("sources_en_echec"):
             print("      ⚠️  incohérence : statut OK avec des sources en échec")
+        # v1.50 — « qui est en panne : le portail ou nous ? ». Un verrou de base
+        # ne se répare pas en attendant le portail (constat du 18/09/2026 :
+        # MZONEX déclarée en panne alors que la seule erreur était un
+        # « database is locked » local).
+        if "sources_bloquees_localement" in d:
+            locales = d.get("sources_bloquees_localement") or []
+            portails = d.get("sources_portail_en_panne") or []
+            if locales:
+                print(f"      🔴 CAUSE LOCALE (base/disque) : {locales}")
+                print("         → ce n'est PAS une panne du portail. Regarder "
+                      "`sqlite` ci-dessous, la charge disque, et "
+                      "DIAGNOSTIC_VERROUS_SQLITE_v150.md")
+            if portails:
+                print(f"      🔴 PORTAIL EN PANNE : {portails}")
+            if not locales and not portails:
+                print("      ✅ aucune cause d'échec identifiée")
+        for cle in ("sqlite", "collecte_bloquee_localement"):
+            if cle in d:
+                print(f"    {cle:22s} {d.get(cle)!r}")
     else:
         print("    ⚠️  CHAMPS v148 ABSENTS (`sources_en_echec`, "
               "`collecte_par_source`)")

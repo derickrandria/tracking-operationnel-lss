@@ -234,3 +234,85 @@ les audits de la journée (`trajet.ouverture_rattrapage` = ligne ouverte par R2,
 `trajet.rejet_distance`, `trajet.reactivation`) et le dernier signal réel — puis
 signale les lignes douteuses (« départ sans événement à ±15 min », « ligne en
 cours alors que le boîtier est muet depuis X min »).
+
+
+---
+
+## 9. v1.50 — « database is locked » : ce n'était pas MZoneX, c'était nous
+
+Votre relevé `/api/sante` du 18/09 (10:08) contenait trois bonnes nouvelles : le
+jeton Wialon est présent, CamtrackPro collecte (`derniere_reussite 10:08:26`,
+5 points), et **la base se remplit en temps réel** (`dernier_evenement_gps
+10:08:03`, retard 0,6 min). Aucune erreur d'authentification, aucun HTTP 5xx,
+aucun timeout vers le portail.
+
+La seule erreur était la nôtre :
+
+```
+OperationalError: (sqlite3.OperationalError) database is locked
+[SQL: INSERT INTO collecte_checkpoints ...]
+```
+
+`collecte_checkpoints` est le **journal** des passes de collecte, écrit **avant**
+l'appel au portail. La plateforme déclarait donc « MZONEX en panne » sans même
+avoir interrogé MZoneX.
+
+### Les causes (mesurées, cf. `DIAGNOSTIC_VERROUS_SQLITE_v150.md`)
+
+| Cause | Mesure |
+|---|---|
+| Tout un lot dans **une seule transaction** | 10 000 points = **10,9 s** de verrou d'écriture ; une fenêtre d'arrêt de 25 h ≈ **44 s** — au-delà du `busy_timeout` de 30 s |
+| Le **journal** qui fait tomber la collecte | le checkpoint s'écrit avant l'appel : un verrou sur cet INSERT avortait toute la passe N1 |
+| Un **timeout sans effet** | le thread n'était pas tué : il continuait d'écrire (et de tenir le verrou) pendant que le cycle suivant démarrait |
+| **Relecture sans plafond** | elle repartait à chaque cycle sur la même fenêtre géante jamais terminée |
+| **Diagnostic trompeur** | un verrou de base s'affichait comme une panne de portail |
+
+### Les correctifs
+
+1. **commit par lots** (`COLLECTE_LOT_INSERTION=250`) + **rejeu idempotent** du
+   lot en cas de verrou résiduel ;
+2. **souffle inter-lots** (`COLLECTE_SOUFFLE_S=0,01`) → blocage continu du
+   verrou **3 810 ms → 270 ms** ;
+3. le **checkpoint ne lève plus jamais** : une trace ne commande pas la collecte ;
+4. la passe interrompue est **laissée se terminer** (bornée, 60 s) au lieu de
+   semer un orphelin qui tient le verrou ;
+5. **budget par cycle** pour la relecture (`RELECTURE_N1_MAX_POINTS=4000`,
+   `RELECTURE_N1_TIMEOUT_S=180`) — la reprise est automatique, les fenêtres
+   étant recalculées depuis ce qui manque réellement en base ;
+6. **catégorisation des erreurs** — `locale` (base/disque/budget) vs `portail`
+   (auth/HTTP/réseau) — exposée par `/api/sante`
+   (`sources_en_echec_detail`, `sources_bloquees_localement`,
+   `sources_portail_en_panne`, `collecte_bloquee_localement`) et reprise par le
+   badge de l'écran : « collecte bloquée localement — base verrouillée ».
+
+**Essayé puis écarté** : `BEGIN IMMEDIATE` (la réponse classique au piège WAL
+« lire puis écrire »). Avec lui, même une transaction de **lecture** prend le
+verrou d'écriture : deux sessions du même service s'attendent et échouent
+(7 suites de tests cassées, mesuré). Le vrai levier était la durée des
+transactions. Le mode reste disponible via `LSS_SQLITE_IMMEDIATE=1`, et les
+outils de contrôle (`verifier_*.py`) le désactivent explicitement pour ne pas
+gêner la collecte avec leurs longues analyses.
+
+### Où regarder désormais
+
+```json
+"statut": "COLLECTE_BLOQUEE_LOCALEMENT",
+"sources_bloquees_localement": ["MZONEX"],
+"sources_portail_en_panne": [],
+"sqlite": {"journal_mode": "wal", "busy_timeout": 30000, "synchronous": 1}
+```
+
+`sqlite.journal_mode` doit être **`wal`** et `busy_timeout` **30000**. Le champ
+`sqlite.erreur` (s'il apparaît) signalerait une base sur support partagé qui
+refuse le WAL.
+
+### Vérification
+
+`backend/test_verrous_sqlite_v150.py` — **18 OK / 0 KO** (6000 points + écrivain
+concurrent sans échec ; plage bloquée maximale < 1 s ; lots committés conservés
+malgré une panne ; checkpoint qui ne lève plus ; catégorisation de l'erreur
+exacte de votre relevé). Non-régression v1.48 (14/0) et v1.49 (13/0).
+
+> À retenir : SQLite est une base **mono-écrivain**. Pour 39 boîtiers + plusieurs
+> postes qui saisissent en même temps, le chemin propre est PostgreSQL — la
+> plateforme l'accepte déjà par simple `DATABASE_URL`, sans modification de code.

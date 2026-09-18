@@ -34,6 +34,8 @@ export default function Suivi() {
     lignes: SuiviLigne[]; seuils: Record<string, number>;
     /** v1.48 — sources portails dont la dernière collecte a échoué. */
     sources_en_echec?: string[];
+    /** v1.50 — parmi elles, celles dont la cause est LOCALE (base verrouillée). */
+    sources_bloquees_localement?: string[];
   } | null>(null);
   const [refs, setRefs] = useState<Referentiels | null>(null);
   const [recherche, setRecherche] = useState(params.get("q") || "");
@@ -351,6 +353,7 @@ export default function Suivi() {
         ) : (
           <GrilleSuivi lignes={lignes} seuils={data?.seuils} modeDetail={modeDetail}
             sourcesEnPanne={data?.sources_en_echec ?? []}
+            sourcesBloqueesLocalement={data?.sources_bloquees_localement ?? []}
             refs={refs} lectureSeule={lectureSeule}
             onEdit={lectureSeule ? undefined : programmer} pendingUI={pendingUI}
             /* §0vicies decies N1 — TCC « 0:00 » dès que le jour n'est plus le jour en cours */

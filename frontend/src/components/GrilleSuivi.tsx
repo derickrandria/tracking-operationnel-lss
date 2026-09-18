@@ -130,6 +130,9 @@ export interface GrilleSuiviProps {
   /** v1.48 — portails dont la collecte est EN PANNE (cf. /api/sante) :
       le badge « en transit » y devient trompeur, on le dit franchement. */
   sourcesEnPanne?: string[];
+  /** v1.50 — sources dont la collecte est bloquée LOCALEMENT (base
+      verrouillée, disque) : la cause est chez nous, pas chez le portail. */
+  sourcesBloqueesLocalement?: string[];
 }
 
 function extraireConducteursRelais(l: SuiviLigne): Array<{ nom: string; duree_s: number }> {
@@ -169,11 +172,20 @@ function fmtDureeRelais(sec: number): string {
 export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                                       lectureSeule, onEdit, pendingUI,
                                       masquerTCC, onRefresh,
-                                      sourcesEnPanne = [] }: GrilleSuiviProps) {
+                                      sourcesEnPanne = [],
+                                      sourcesBloqueesLocalement = [] }: GrilleSuiviProps) {
   const portailsEnPanne = new Set(
     (sourcesEnPanne || []).map((x) => (x || "").toUpperCase()));
   const pannePortail = (portail?: string | null) =>
     !!portail && portailsEnPanne.has(portail.toUpperCase());
+  // v1.50 — TROISIÈME SILENCE : une collecte bloquée chez nous (base
+  // verrouillée, disque plein) n'est pas une panne du portail. Confondre les
+  // deux faisait chercher la panne chez MZoneX le 18/09/2026 alors que la
+  // seule erreur était un verrou SQLite local.
+  const portailsBloques = new Set(
+    (sourcesBloqueesLocalement || []).map((x) => (x || "").toUpperCase()));
+  const blocageLocal = (portail?: string | null) =>
+    !!portail && portailsBloques.has(portail.toUpperCase());
   const [extra, setExtra] = useState<SuiviLigne | null>(null);
   const [arbitrageLigne, setArbitrageLigne] = useState<SuiviLigne | null>(null);
   const [choixArbitrage, setChoixArbitrage] = useState<"PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE">("PASSAGE_TEMPORAIRE");
@@ -275,7 +287,12 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                     · boîtier muet (§0nonies decies M4) : orange, zone sans
                       réseau probable, la relecture officielle complètera. */}
                 {!fige && l.gps_age_s != null && l.gps_age_s > 1800 && (
-                  pannePortail(l.plateforme_gps) ? (
+                  blocageLocal(l.plateforme_gps) ? (
+                    <div className="mt-0.5 text-[10px] font-semibold text-red-500"
+                      title={`La collecte ${l.plateforme_gps} est bloquée LOCALEMENT (base verrouillée / disque), pas chez le portail : voir /api/sante, champ « sources_bloquees_localement ». Rien à demander au portail — c'est une action technique côté serveur.`}>
+                      collecte {l.plateforme_gps} bloquée localement — base verrouillée
+                    </div>
+                  ) : pannePortail(l.plateforme_gps) ? (
                     <div className="mt-0.5 text-[10px] font-semibold text-red-500"
                       title={`La collecte ${l.plateforme_gps} est en panne (voir /api/sante) : la plateforme ne reçoit plus AUCUNE donnée de ce portail. Les trajets manquants ne pourront être complétés qu'après rétablissement de la source.`}>
                       source {l.plateforme_gps} en panne — collecte interrompue

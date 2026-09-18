@@ -68,7 +68,7 @@ import time
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from .config import (normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
@@ -231,6 +231,53 @@ _acquerir_verrou_collecte = _acquerir_verrou_n1
 _liberer_verrou_collecte = _liberer_verrou_n1
 
 
+# ═══════════ v1.50 — VERROUS SQLITE : CAUSE LOCALE, PAS PANNE PORTAIL ═══════
+# Constat du 18/09/2026 (/api/sante) : « MZONEX » annoncée EN PANNE alors que
+# le portail répondait — la seule erreur était notre « database is locked ».
+# Deux réglages rendent ce diagnostic impossible à confondre désormais.
+LOT_INSERTION = int(os.getenv("COLLECTE_LOT_INSERTION", "250"))
+# v1.50 — SOUFFLE ENTRE LES LOTS : SQLite n'a qu'UN écrivain à la fois et le
+# nôtre reprenait le verrou aussitôt (mesuré : verrou détenu 94 % du temps,
+# plages continues de 3,8 s). Ce court relâchement laisse passer les écritures
+# que le reste de la plateforme attend (validations, PATCH, audits) : quelques
+# millisecondes contre un ordre de grandeur de réactivité en moins pour elles.
+SOUFFLE_INTER_LOTS_S = float(os.getenv("COLLECTE_SOUFFLE_S", "0.01"))
+COMMIT_ESSAIS = int(os.getenv("COLLECTE_COMMIT_ESSAIS", "4"))
+ATTENTE_SORTIE_PASSE_S = float(os.getenv("COLLECTE_ATTENTE_SORTIE_S", "60"))
+RELECTURE_N1_MAX_POINTS = int(os.getenv("RELECTURE_N1_MAX_POINTS", "4000"))
+RELECTURE_N1_TIMEOUT_S = float(os.getenv("RELECTURE_N1_TIMEOUT_S", "180"))
+
+MOTIFS_ERREUR_LOCALE = (
+    "database is locked", "database table is locked", "sqlite_busy",
+    "budget de collecte",
+    "disk i/o error", "no space left", "readonly database", "read-only database",
+    "attempt to write a readonly", "unable to open database",
+)
+
+
+def _erreur_locale(exc: Exception) -> bool:
+    """Vrai si l'échec vient de NOTRE infrastructure (base verrouillée, disque,
+    droits) et non du portail."""
+    texte = f"{type(exc).__name__}: {exc}".lower()
+    return any(motif in texte for motif in MOTIFS_ERREUR_LOCALE)
+
+
+class DepassementBudgetCollecte(TimeoutError):
+    """v1.50 — la passe a dépassé le budget de temps imparti par NOTRE
+    planificateur : cause locale (notre orchestration), jamais une panne du
+    portail. Avant, ce cas était rangé du côté « source en panne »."""
+
+
+def categorie_erreur(exc: Exception) -> str:
+    """« locale » (base/disque — notre problème) ou « portail » (auth, HTTP,
+    réseau — le leur). Sans cette distinction, un verrou SQLite s'affichait
+    comme une panne de la source : le 18/09/2026 l'écran et /api/sante
+    annonçaient « MZONEX en panne » alors que MZoneX répondait."""
+    if isinstance(exc, DepassementBudgetCollecte):
+        return "locale"                    # notre planificateur, pas le portail
+    return "locale" if _erreur_locale(exc) else "portail"
+
+
 def _etat_collecte_debut(source: str):
     with _ETAT_COLLECTE_LOCK:
         instant = now_local().isoformat()
@@ -244,14 +291,16 @@ def _etat_collecte_fin(source: str, nombre: int):
         _ETAT_COLLECTE["dernier_cycle_fin"] = instant
         _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
             {"derniere_reussite": instant, "dernier_nombre": nombre,
-             "derniere_erreur": None})
+             "derniere_erreur": None, "derniere_erreur_categorie": None})
 
 
 def _etat_collecte_erreur(source: str, exc: Exception):
     with _ETAT_COLLECTE_LOCK:
         erreur = f"{type(exc).__name__}: {exc}"
         _ETAT_COLLECTE["derniere_erreur"] = erreur
-        _ETAT_COLLECTE["sources"].setdefault(source, {})["derniere_erreur"] = erreur
+        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
+            {"derniere_erreur": erreur,
+             "derniere_erreur_categorie": categorie_erreur(exc)})
 
 
 def etat_collecte_memoire() -> dict:
@@ -296,6 +345,22 @@ def sources_en_echec() -> list[str]:
                   if isinstance(etat, dict) and etat.get("derniere_erreur"))
 
 
+def sources_en_echec_detail() -> list[dict]:
+    """v1.50 — la liste des sources en échec AVEC la cause : c'est ce qui
+    permet de dire « source MZONEX en panne » (portail) ou « collecte bloquée
+    localement — base verrouillée » (nous) au lieu de tout confondre."""
+    with _ETAT_COLLECTE_LOCK:
+        sources = dict(_ETAT_COLLECTE.get("sources") or {})
+    return sorted(
+        ({"source": nom, "categorie": etat.get("derniere_erreur_categorie")
+          or categorie_erreur(Exception(etat.get("derniere_erreur") or "")),
+          "erreur": str(etat.get("derniere_erreur"))[:300],
+          "dernier_debut": etat.get("dernier_debut")}
+         for nom, etat in sources.items()
+         if isinstance(etat, dict) and etat.get("derniere_erreur")),
+        key=lambda d: d["source"])
+
+
 def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
     """Exécute une passe de source N1 sans chevauchement avec timeout dur de 30s."""
     if not _acquerir_verrou_n1(source):
@@ -308,8 +373,23 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
         _etat_collecte_fin(source, nombre)
         return nombre
     except (TimeoutError, FutureTimeoutError):
-        msg = f"Timeout dur de {timeout_s}s dépassé — replanifié au prochain cycle"
-        _etat_collecte_erreur(source, TimeoutError(msg))
+        msg = (f"Budget de collecte dépassé ({timeout_s}s) — replanifié au "
+               f"prochain cycle")
+        # v1.50 — le « timeout dur » ne tuait RIEN : le thread de la passe
+        # poursuivait son insertion (et tenait le VERROU D'ÉCRITURE de la
+        # base) pendant que le cycle suivant démarrait — un orphelin qui
+        # expliquait la cascade de « database is locked » du 18/09. Les
+        # transactions étant désormais courtes (lots), on laisse la passe
+        # finir — borné — plutôt que de semer un orphelin derrière soi.
+        try:
+            fut.result(timeout=ATTENTE_SORTIE_PASSE_S)
+            log.info("Collecte N1 %s : passe interrompue terminée proprement "
+                     "(verrou d'écriture rendu)", source)
+        except Exception:
+            log.warning("Collecte N1 %s : la passe interrompue n'a pas rendu "
+                        "la main en %ss — elle reste surveillée",
+                        source, ATTENTE_SORTIE_PASSE_S)
+        _etat_collecte_erreur(source, DepassementBudgetCollecte(msg))
         log.warning("Collecte N1 %s interrompue : %s", source, msg)
         if source == "MZONEX":
             try:
@@ -325,9 +405,15 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
         _liberer_verrou_n1()
 
 
-def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str:
-    db = SessionLocal()
+def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str | None:
+    """v1.50 — LE CHECKPOINT N'EST QU'UNE TRACE : son échec ne doit jamais
+    faire tomber la collecte. Le 18/09/2026, un « database is locked » sur cet
+    INSERT a avorté TOUTE la passe N1 MZoneX (le checkpoint est écrit AVANT
+    l'appel au portail) : la source était déclarée en panne alors que seul un
+    verrou d'écriture — chez nous — l'empêchait d'écrire sa ligne de journal."""
+    db = None
     try:
+        db = SessionLocal()
         cp = db.scalar(select(CollecteCheckpoint).where(
             CollecteCheckpoint.source == source,
             CollecteCheckpoint.fenetre_debut == debut,
@@ -343,20 +429,34 @@ def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str:
             cp.derniere_erreur = None
         db.commit()
         return cp.id
+    except Exception as exc:
+        log.warning("Checkpoint d'ouverture %s non écrit (%s) — la collecte "
+                    "CONTINUE (une trace ne commande pas la collecte)",
+                    source, f"{type(exc).__name__}: {exc}"[:120])
+        return None
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
-def _checkpoint_ferme(checkpoint_id: str, statut: str, erreur: str | None = None):
-    db = SessionLocal()
+def _checkpoint_ferme(checkpoint_id: str | None, statut: str,
+                      erreur: str | None = None):
+    if checkpoint_id is None:
+        return
+    db = None
     try:
+        db = SessionLocal()
         cp = db.get(CollecteCheckpoint, checkpoint_id)
         if cp is not None:
             cp.statut = statut
             cp.derniere_erreur = erreur
             db.commit()
+    except Exception as exc:
+        log.warning("Checkpoint de fermeture non écrit (%s) — sans effet sur "
+                    "la collecte", f"{type(exc).__name__}: {exc}"[:120])
     finally:
-        db.close()
+        if db is not None:
+            db.close()
 
 
 def _mzonex_api_active() -> bool:
@@ -1158,104 +1258,148 @@ class CollectorBase:
         propres.sort(key=lambda p: p["horodatage"])   # rejeu chronologique
         return propres
 
+    def _mapper_vehicules(self, db) -> dict:
+        """Plaque/gps_associe → véhicule (v1.50 : réutilisé après un rollback
+        de lot, pour ne jamais rejouer sur des objets détachés)."""
+        mapping: dict[str, Vehicule] = {}
+        for v in db.scalars(select(Vehicule)).all():
+            if v.gps_associe:
+                mapping[str(v.gps_associe).strip().upper()] = v
+            mapping[v.plaque.strip().upper()] = v
+        return mapping
+
+    def _inserer_tranche(self, db, tranche: list[dict],
+                         mapping: dict, vus: dict, historique: bool) -> int:
+        """Corps d'insertion d'UN LOT (le lot est committé par l'appelant)."""
+        n = 0
+        for p in tranche:
+            vehicule = mapping.get(p["gps_associe"].upper())
+            if vehicule is None:
+                # §0quater D1 (14/08/2026) — véhicule inconnu → fiche
+                # créée automatiquement (plateforme = ce collecteur) et
+                # exploitée immédiatement ; un identifiant parasite est
+                # écarté avec trace en fenêtre noire (D3).
+                plateforme = getattr(self.source, "value", str(self.source))
+                vehicule = creer_vehicule_auto(
+                    db, p["gps_associe"], plateforme)
+                if vehicule is None:
+                    continue
+                mapping[vehicule.plaque.strip().upper()] = vehicule
+                if vehicule.gps_associe:
+                    mapping[str(vehicule.gps_associe).strip().upper()] = vehicule
+            if p.get("conducteur"):
+                creer_conducteur_auto(db, p["conducteur"])   # §0quater D2
+            vus[vehicule.id] = vehicule
+
+            # Garantie fraîcheur position : maintien du dernier état connu
+            if vehicule.last_event_at is None or p["horodatage"] >= vehicule.last_event_at:
+                vehicule.last_lat, vehicule.last_lng = p["lat"], p["lng"]
+                vehicule.last_vitesse = p["vitesse"]
+                vehicule.last_event_at = p["horodatage"]
+                vehicule.moteur_on = (p["moteur"] == "ON")
+
+            # anti-rejeu : même événement déjà collecté à la passe
+            # précédente → ignoré (collecte périodique idempotente)
+            deja = db.scalar(select(func.count(EvenementGPS.id)).where(
+                EvenementGPS.vehicule_id == vehicule.id,
+                EvenementGPS.horodatage == p["horodatage"],
+                EvenementGPS.type_evenement == p.get("type_evenement")
+                if p.get("type_evenement") else True)) or 0
+            if deja:
+                continue
+            if historique:
+                cle = cle_idempotence_evenement(
+                    vehicule.id, p["horodatage"], p["lat"], p["lng"], self.source)
+                if db.scalar(select(EvenementGPS.id).where(
+                        EvenementGPS.idempotence_key == cle)):
+                    continue
+                try:
+                    with db.begin_nested():
+                        db.add(EvenementGPS(
+                            vehicule_id=vehicule.id, horodatage=p["horodatage"],
+                            latitude=p["lat"], longitude=p["lng"],
+                            adresse=p.get("adresse"), vitesse=p["vitesse"],
+                            etat_moteur=p["moteur"],
+                            type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
+                            source=self.source, idempotence_key=cle,
+                            received_at=now_local(), historique=True))
+                        db.flush()
+                        n += 1
+                except IntegrityError:
+                    pass
+                continue
+            try:
+                ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
+                             p.get("adresse"), p["vitesse"], p["moteur"],
+                             p.get("type_evenement"), self.source,
+                             observation=bool(p.get("observation")))
+                n += 1
+            except IntegrityError:
+                pass
+            # §0septies B4/B5 (20/08/2026) — alertes conduite EN DIRECT :
+            # vitesse > seuil hors géozone (B4) ; roulage sans clé MZoneX
+            # (B5 — badge None pour les sources qui ne la publient pas :
+            # la fonction n'évalue alors jamais « sans badge », loi B5)
+            try:
+                verifier_alertes_conduite(
+                    db, vehicule, p["horodatage"], p["vitesse"],
+                    (None if "badge_code" not in p
+                     else p["badge_code"] is not None),
+                    en_geozone(p["lat"], p["lng"]), self.source)
+            except Exception:
+                log.exception("Vérification conduite en échec (%s) — "
+                              "le point, lui, est enregistré",
+                              vehicule.plaque)
+            # NB : PAS de second `n += 1` ici — l'ancien double
+            # comptage faisait renvoyer 2 pour un seul point inséré
+            # (métriques de collecte fausses : « N points insérés »,
+            # etat_collecte, diagnostics).
+        # v1.17 — AUTO-RÉPARATION (bug métier 05/08) : un « Début du
+        # trajet » CONNU (anti-rejeu) mais resté SANS trajet (création
+        # manquée lors d'une passe défectueuse) n'était JAMAIS ré-essayé
+        # → le trajet en cours restait invisible (2736TCC 11:37, 4886TBU
+        # 11:00). On ré-ingère une fois ; la couverture est revérifiée à
+        # chaque passe (idempotent).
+        return n
+
     def inserer(self, points: list[dict], historique: bool = False) -> int:
         db = SessionLocal()
         inseres = 0
         try:
-            mapping: dict[str, Vehicule] = {}
-            for v in db.scalars(select(Vehicule)).all():
-                if v.gps_associe:
-                    mapping[str(v.gps_associe).strip().upper()] = v
-                mapping[v.plaque.strip().upper()] = v
+            mapping = self._mapper_vehicules(db)
             vus: dict[str, Vehicule] = {}
-            for p in points:
-                vehicule = mapping.get(p["gps_associe"].upper())
-                if vehicule is None:
-                    # §0quater D1 (14/08/2026) — véhicule inconnu → fiche
-                    # créée automatiquement (plateforme = ce collecteur) et
-                    # exploitée immédiatement ; un identifiant parasite est
-                    # écarté avec trace en fenêtre noire (D3).
-                    plateforme = getattr(self.source, "value", str(self.source))
-                    vehicule = creer_vehicule_auto(
-                        db, p["gps_associe"], plateforme)
-                    if vehicule is None:
-                        continue
-                    mapping[vehicule.plaque.strip().upper()] = vehicule
-                    if vehicule.gps_associe:
-                        mapping[str(vehicule.gps_associe).strip().upper()] = vehicule
-                if p.get("conducteur"):
-                    creer_conducteur_auto(db, p["conducteur"])   # §0quater D2
-                vus[vehicule.id] = vehicule
-
-                # Garantie fraîcheur position : maintien du dernier état connu
-                if vehicule.last_event_at is None or p["horodatage"] >= vehicule.last_event_at:
-                    vehicule.last_lat, vehicule.last_lng = p["lat"], p["lng"]
-                    vehicule.last_vitesse = p["vitesse"]
-                    vehicule.last_event_at = p["horodatage"]
-                    vehicule.moteur_on = (p["moteur"] == "ON")
-
-                # anti-rejeu : même événement déjà collecté à la passe
-                # précédente → ignoré (collecte périodique idempotente)
-                deja = db.scalar(select(func.count(EvenementGPS.id)).where(
-                    EvenementGPS.vehicule_id == vehicule.id,
-                    EvenementGPS.horodatage == p["horodatage"],
-                    EvenementGPS.type_evenement == p.get("type_evenement")
-                    if p.get("type_evenement") else True)) or 0
-                if deja:
-                    continue
-                if historique:
-                    cle = cle_idempotence_evenement(
-                        vehicule.id, p["horodatage"], p["lat"], p["lng"], self.source)
-                    if db.scalar(select(EvenementGPS.id).where(
-                            EvenementGPS.idempotence_key == cle)):
-                        continue
+            # v1.50 — COMMIT PAR LOTS. Avant, TOUT le lot vivait dans une seule
+            # transaction : mesuré 10 000 points = 10,9 s de verrou d'écriture
+            # (≈ 44 s pour une fenêtre d'arrêt de 25 h), au-dessus du
+            # busy_timeout de 30 s de la base → « database is locked » en
+            # cascade le 18/09/2026. Avec des lots de LOT_INSERTION (250), le
+            # verrou n'est tenu que ~0,3 s ; un verrou résiduel fait REJOUER le
+            # lot (idempotent : anti-rejeu par clé et par horodatage) au lieu de
+            # perdre la passe entière.
+            taille_lot = max(1, LOT_INSERTION)
+            for debut_lot in range(0, len(points), taille_lot):
+                tranche = points[debut_lot:debut_lot + taille_lot]
+                for tentative in range(1, COMMIT_ESSAIS + 1):
                     try:
-                        with db.begin_nested():
-                            db.add(EvenementGPS(
-                                vehicule_id=vehicule.id, horodatage=p["horodatage"],
-                                latitude=p["lat"], longitude=p["lng"],
-                                adresse=p.get("adresse"), vitesse=p["vitesse"],
-                                etat_moteur=p["moteur"],
-                                type_evenement=p.get("type_evenement") or TypeEvenement.POSITION,
-                                source=self.source, idempotence_key=cle,
-                                received_at=now_local(), historique=True))
-                            db.flush()
-                            inseres += 1
-                    except IntegrityError:
-                        pass
-                    continue
-                try:
-                    ingest_event(db, vehicule, p["horodatage"], p["lat"], p["lng"],
-                                 p.get("adresse"), p["vitesse"], p["moteur"],
-                                 p.get("type_evenement"), self.source,
-                                 observation=bool(p.get("observation")))
-                    inseres += 1
-                except IntegrityError:
-                    pass
-                # §0septies B4/B5 (20/08/2026) — alertes conduite EN DIRECT :
-                # vitesse > seuil hors géozone (B4) ; roulage sans clé MZoneX
-                # (B5 — badge None pour les sources qui ne la publient pas :
-                # la fonction n'évalue alors jamais « sans badge », loi B5)
-                try:
-                    verifier_alertes_conduite(
-                        db, vehicule, p["horodatage"], p["vitesse"],
-                        (None if "badge_code" not in p
-                         else p["badge_code"] is not None),
-                        en_geozone(p["lat"], p["lng"]), self.source)
-                except Exception:
-                    log.exception("Vérification conduite en échec (%s) — "
-                                  "le point, lui, est enregistré",
-                                  vehicule.plaque)
-                # NB : PAS de second `inseres += 1` ici — l'ancien double
-                # comptage faisait renvoyer 2 pour un seul point inséré
-                # (métriques de collecte fausses : « N points insérés »,
-                # etat_collecte, diagnostics).
-            # v1.17 — AUTO-RÉPARATION (bug métier 05/08) : un « Début du
-            # trajet » CONNU (anti-rejeu) mais resté SANS trajet (création
-            # manquée lors d'une passe défectueuse) n'était JAMAIS ré-essayé
-            # → le trajet en cours restait invisible (2736TCC 11:37, 4886TBU
-            # 11:00). On ré-ingère une fois ; la couverture est revérifiée à
-            # chaque passe (idempotent).
+                        inseres += self._inserer_tranche(
+                            db, tranche, mapping, vus, historique)
+                        db.commit()
+                        if SOUFFLE_INTER_LOTS_S > 0:
+                            time.sleep(SOUFFLE_INTER_LOTS_S)
+                        break
+                    except OperationalError as exc:
+                        db.rollback()
+                        if not _erreur_locale(exc) or tentative == COMMIT_ESSAIS:
+                            raise
+                        log.warning(
+                            "Collecte %s : verrou d'écriture sur le lot "
+                            "%d-%d (tentative %d/%d : %s) — lot rejoué",
+                            getattr(self.source, "value", self.source),
+                            debut_lot + 1, debut_lot + len(tranche),
+                            tentative, COMMIT_ESSAIS, str(exc)[:80])
+                        time.sleep(0.4 * tentative)
+                        mapping = self._mapper_vehicules(db)
+                        vus.clear()
             inseres += _reparer_debuts_sans_trajet(db, list(vus.values()),
                                                    self.source)
             db.commit()
@@ -2452,10 +2596,22 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
         return 0
     coll = MZoneXApiCollector()
     total = 0
+    # v1.50 — BUDGET PAR CYCLE : une fenêtre d'arrêt peut couvrir 20 h et
+    # des dizaines de milliers d'événements. Sans plafond, la relecture
+    # verrouillait la base pendant ~44 s (mesuré : 10 000 points = 11 s), bien
+    # au-delà du busy_timeout de 30 s — d'où les « database is locked » en
+    # cascade du 18/09. La collecte reste REPRENABLE : les fenêtres sont
+    # recalculées à chaque cycle à partir de ce qui manque réellement en base,
+    # donc les points non traités le sont au cycle suivant (idempotent).
+    budget = max(0, RELECTURE_N1_MAX_POINTS)
     # Traitement par petits lots de 2 fenêtres max pour garantir une exécution rapide (< 5s)
     fenetres_a_traiter = fenetres[:2]
     try:
         for debut_local, fin_local in fenetres_a_traiter:
+            if total >= budget:
+                log.info("Relecture N1 MZoneX : budget de %d point(s) atteint "
+                         "— la suite au prochain cycle", budget)
+                break
             debut_utc = coll.api._utc_naive(debut_local)
             fin_utc = coll.api._utc_naive(fin_local)
             checkpoint_id = _checkpoint_ouvre("MZONEX_N1_RELECTURE",
@@ -2466,6 +2622,17 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
                 _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
                 raise
             points = coll.normaliser(brut)
+            restant = max(0, budget - total)
+            if len(points) > restant:
+                # ordre chronologique garanti (CollectorBase.normaliser trie)
+                log.warning("Relecture N1 %s → %s : %d événement(s) lus, "
+                            "budget de %d point(s) — les %d restants sont "
+                            "laissés au prochain cycle (la fenêtre sera "
+                            "recalculée depuis la base)",
+                            debut_local.strftime("%m-%d %H:%M"),
+                            fin_local.strftime("%H:%M"), len(points), restant,
+                            len(points) - restant)
+                points = points[:restant]
             n = 0
             if points:
                 n = coll.inserer(points, historique=True)
@@ -2557,7 +2724,9 @@ def boucle_collecte():
                 or mono_n1 - _relecture_n1_memo["mono"] >= RELECTURE_N1_PERIODE_S):
             _relecture_n1_memo["mono"] = mono_n1
             try:
-                n_n1 = _collecte_protegee("MZONEX_RELECTURE", relecture_n1_mzonex)
+                n_n1 = _collecte_protegee("MZONEX_RELECTURE",
+                                          relecture_n1_mzonex,
+                                          timeout_s=RELECTURE_N1_TIMEOUT_S)
                 if n_n1:
                     log.info("Relecture N1 (Événements MZoneX, %d jours) : "
                              "%d point(s) rattrapé(s)", RELECTURE_N1_JOURS, n_n1)

@@ -4,7 +4,7 @@ FastAPI : API REST (/api), WebSocket (/ws) pour le temps réel (§9),
 documentation OpenAPI/Swagger (/docs), service du frontend React (SPA).
 """
 
-APP_VERSION = "1.45"   # visible au démarrage (fenêtre noire) et dans le bandeau latéral
+APP_VERSION = "1.50"   # visible au démarrage (fenêtre noire) et dans le bandeau latéral
 import asyncio
 import logging
 import os
@@ -761,12 +761,28 @@ def sante(db: Session = Depends(get_db)):
         # source totalement morte (MZoneX, SSO refusé — constat du 17/09/2026)
         # restait annoncée « COLLECTE_OK » tant que l'autre source fournissait
         # des points. Un état de santé qui ne voit pas la panne ne sert à rien.
-        from .scrapers import sources_en_echec as _sources_en_echec
+        # v1.48 — l'état de santé reflète la source la plus faible.
+        # v1.50 — AVEC LA CAUSE : le 18/09/2026 `/api/sante` annonçait
+        # « MZONEX en panne » alors que la seule erreur était notre propre
+        # « database is locked » sur l'écriture d'un checkpoint. Un échec
+        # LOCAL (base verrouillée, disque) n'est pas une panne du portail et
+        # ne se répare pas en attendant le portail.
+        from .scrapers import (sources_en_echec as _sources_en_echec,
+                               sources_en_echec_detail as _detail)
+        from .database import pragmas_sqlite
         sources_en_echec = _sources_en_echec()
+        detail = _detail()
+        locales = [d["source"] for d in detail if d.get("categorie") == "locale"]
+        portails = [d["source"] for d in detail if d.get("categorie") != "locale"]
+        bloquee_localement = bool(locales)
         if dernier_ev is None or retard_s is None:
             statut_str = "AUCUNE_COLLECTE"        # aucun point GPS en 24 h
         elif retard_s > 900:
             statut_str = "RETARD_COLLECTE"
+        elif bloquee_localement:
+            # la collecte est dégradée, mais PAS par le portail : ce statut
+            # conduit l'opérateur vers la base/le disque, pas vers MZoneX.
+            statut_str = "COLLECTE_BLOQUEE_LOCALEMENT"
         elif sources_en_echec:
             statut_str = "COLLECTE_DEGRADEE"
         else:
@@ -776,6 +792,15 @@ def sante(db: Session = Depends(get_db)):
             "statut": statut_str,
             "statut_collecte": statut_str,
             "sources_en_echec": sources_en_echec,
+            # v1.50 — qui échoue ET pourquoi (portail / local)
+            "sources_en_echec_detail": detail,
+            "sources_bloquees_localement": locales,
+            "sources_portail_en_panne": portails,
+            "collecte_bloquee_localement": bloquee_localement,
+            # v1.50 — réglages SQLite réellement en vigueur : un journal
+            # « delete » ou un busy_timeout retombé à 0 expliquerait les
+            # verrous, autant le montrer que le supposer.
+            "sqlite": pragmas_sqlite(),
             "collecte_par_source": sources,
             "pid": os.getpid(),
             "version": APP_VERSION,

@@ -27,6 +27,12 @@ R2, ou signal périmé). Aucune écriture en base.
 """
 from __future__ import annotations
 
+import os
+# v1.50 — outil de CONTRÔLE en lecture seule : on n'ouvre pas de transaction
+# d'écriture (sinon ses longues analyses prendraient le verrou de la base et
+# gêneraient la collecte du service en cours d'exécution).
+os.environ.setdefault("LSS_SQLITE_IMMEDIATE", "0")
+
 import argparse
 import os
 import sys
