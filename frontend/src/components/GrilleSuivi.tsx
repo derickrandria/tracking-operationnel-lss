@@ -14,7 +14,7 @@ import { api } from "../api";
 import Icon from "./icons";
 import { Modal } from "./ui";
 import { Referentiels, SuiviLigne } from "../types";
-import { cls, fmtDuree, fmtHeure } from "../utils";
+import { celluleTcc, cls, fmtDuree, fmtHeure } from "../utils";
 
 // §0vicies decies N2 (31/08/2026) : + 20h/22h (relevés automatiques du soir)
 const HEURES = ["08h", "10h", "12h", "14h", "16h", "18h", "20h", "22h"] as const;
@@ -74,8 +74,11 @@ function CelluleTCC({ secondes, seuilMax, masque }: { secondes: number; seuilMax
   // comme une mesure) mais « — » (non applicable à l'écran) ; l'EXPORT garde la
   // convention « 0:00 » accompagnée de sa note. Dans les deux cas la valeur
   // réelle reste en base : c'est un rendu, jamais une destruction du calcul.
-  if (masque) return <span className="font-bold tabular-nums text-slate-400" title="TCC non applicable à l'écran sur une journée close (chrono temps réel) — la valeur calculée reste conservée en base et dans l'archive">—</span>;
-  if (!secondes) return <span className="text-slate-400">—</span>;
+  // v1.53/P4 — la règle d'écran est PARTAGÉE et testée (`celluleTcc`).
+  const texte = celluleTcc(secondes, masque);
+  if (texte === "—") {
+    return <span className="font-bold tabular-nums text-slate-400" title="TCC non applicable à l'écran sur une journée close (chrono temps réel) — la valeur calculée reste conservée en base et dans l'archive">—</span>;
+  }
   const restant = seuilMax - secondes;
   const depasse = restant < 0;
   const alerte = !depasse && restant <= 1800;   // ≤ 30 min restantes (§4.3)

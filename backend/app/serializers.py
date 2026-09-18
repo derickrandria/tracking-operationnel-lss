@@ -233,6 +233,18 @@ def _dt_iso(texte) -> datetime | None:
         return None
 
 
+# ============================================================================
+# v1.54/P3 (18/09/2026) — VERSION DE SCHÉMA D'ARCHIVE
+# 0 = archive ANTÉRIEURE (aucune version inscrite, compteurs distincts absents)
+# 1 = v1.53 (compteurs distincts, pas de version inscrite)
+# 2 = v1.54 (version inscrite + garde-fous P1/P3)
+# Une archive sans version n'est JAMAIS lue comme si ses champs absents valaient
+# zéro : la lecture est rétrocompatible, elle DIT ce qu'elle reconstruit et
+# marque l'archive « à recalculer ».
+# ============================================================================
+ARCHIVE_SCHEMA_VERSION = 2
+
+
 def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAGE_S,
                                 seuil_pause_aff_s: float = PAUSE_AFFICHAGE_S) -> list[dict]:
     """§0undecies E1, amendée §0tricies decies G1/G2 (E3 abrogée le 25/08/2026)
@@ -340,6 +352,7 @@ def snapshot_canonique(s: SuiviJournalier, seuils: dict | None = None) -> dict:
     d["nb_sequences_affichees"] = nb_sequences
     d["nb_trajets"] = nb_sequences
     d["nb_trajets_fusionnes"] = max(0, len(bruts) - nb_sequences)
+    d["schema_version"] = ARCHIVE_SCHEMA_VERSION     # v1.54/P3 — traçabilité
     return d
 
 
@@ -390,12 +403,13 @@ def fusionner_snapshot(donnees: dict | None, seuils: dict | None = None) -> dict
         d["nb_trajets_valides_reels"] = _reels
         d["nb_trajets_fusionnes"] = max(0, _reels - len(fusionnes))
     else:
-        # aucune ligne exploitable (archive ancienne ou journée sans trajet) :
-        # on complète les compteurs sans jamais écraser une valeur présente.
-        _nb = int(d.get("nb_trajets") or 0)
-        d.setdefault("nb_sequences_affichees", _nb)
-        d.setdefault("nb_trajets_valides_reels", _nb)
-        d.setdefault("nb_trajets_fusionnes", 0)
+        # v1.54/P3 — aucune ligne exploitable (archive ancienne ou journée sans
+        # trajet) : on ne complète QUE ce qui est connu. Un champ ABSENT reste
+        # ABSENT (None), jamais 0 : « je ne sais pas » n'est pas « zéro trajet ».
+        if d.get("nb_trajets") is not None:
+            d.setdefault("nb_sequences_affichees", d.get("nb_trajets"))
+        d.setdefault("nb_trajets_valides_reels", None)
+        d.setdefault("nb_trajets_fusionnes", None)
     # N1 — l'affichage masque le TCC d'une journée close, la DONNÉE reste intacte.
     d["tcc_masque"] = True
     return d
@@ -692,6 +706,40 @@ def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = No
     # produire). Elle est ramenée à la borne pour l'affichage — sans jamais
     # réécrire l'archive — et le fait est DÉCLARÉ au client pour que
     # l'anomalie ne disparaisse pas silencieusement d'un rapport.
+    # ── v1.54/P3 — compteurs d'archive : source, reconstruction, statut ──
+    _brut = dict(h.donnees or {})            # archive TELLE QU'ÉCRITE
+    _schema_archive = int(_brut.get("schema_version") or 0)
+    _trajets_arch = list(_brut.get("trajets") or [])
+    _reels_stocke = _brut.get("nb_trajets_valides_reels")
+    _seq_stockee = _brut.get("nb_sequences_affichees")
+    _source_compteurs, _a_recalculer = "ARCHIVE", False
+    if _reels_stocke is not None or _seq_stockee is not None:
+        _reels_compteurs = (_reels_stocke if _reels_stocke is not None
+                            else compter_trajets_reels(_trajets_arch))
+        _seq_compteurs = (_seq_stockee if _seq_stockee is not None
+                          else (_brut.get("nb_trajets")
+                                if _brut.get("nb_trajets") is not None
+                                else len(_trajets_arch)))
+        _a_recalculer = _schema_archive < ARCHIVE_SCHEMA_VERSION
+    elif _trajets_arch:
+        _source_compteurs = "RECONSTRUIT"
+        _a_recalculer = True                    # archive antérieure à la v1.53
+        _reels_compteurs = compter_trajets_reels(_trajets_arch)
+        _seq_compteurs = len(fusionner_trajets_affichage(
+            _trajets_arch,
+            seuil_fusion_s=float((seuils or {}).get("SEUIL_FUSION_AFFICHAGE_S",
+                                                    FUSION_AFFICHAGE_S)),
+            seuil_pause_aff_s=float((seuils or {}).get("SEUIL_AFFICHAGE_PAUSE_MIN",
+                                                       PAUSE_AFFICHAGE_S))))
+    else:
+        # Aucune donnée : on PRÉTEND ne rien savoir — jamais « zéro trajet ».
+        _source_compteurs = "INDISPONIBLE"
+        _a_recalculer = True
+        _reels_compteurs = _seq_compteurs = None
+    _fusionnes_compteurs = (max(0, _reels_compteurs - _seq_compteurs)
+                            if (_reels_compteurs is not None
+                                and _seq_compteurs is not None) else None)
+
     _tcj_brut = int(d.get("tcj_s") or d.get("tcj_secondes") or 0)
     _ttj_brut = int(d.get("ttj_s") or d.get("ttj_secondes") or _tcj_brut)
     tcj_val = min(86400, max(0, _tcj_brut))
@@ -732,16 +780,19 @@ def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = No
         "total_pause_str": fmt_hms_journee(pause_val),
         "trajets": d.get("trajets") or [],
         # v1.53 — mêmes compteurs distincts qu'au suivi (un seul sens partagé)
-        "nb_trajets": (d.get("nb_sequences_affichees")
-                       or d.get("nb_trajets") or len(d.get("trajets") or [])),
-        "nb_sequences_affichees": (d.get("nb_sequences_affichees")
-                                   or d.get("nb_trajets")
-                                   or len(d.get("trajets") or [])),
-        "nb_trajets_valides_reels": (d.get("nb_trajets_valides_reels")
-                                     or compter_trajets_reels(d.get("trajets"))),
-        "nb_trajets_fusionnes": (d.get("nb_trajets_fusionnes")
-                                 or max(0, compter_trajets_reels(d.get("trajets"))
-                                        - int(d.get("nb_trajets") or 0))),
+        # v1.54/P3 — LECTURE RÉTROCOMPATIBLE : un champ ABSENT n'est JAMAIS
+        # interprété comme zéro. `compteurs_source` dit d'où vient le chiffre
+        # (ARCHIVE = écrit par la v1.53+ ; RECONSTRUIT = recalculé à la lecture
+        # depuis les lignes stockées ; INDISPONIBLE = aucune donnée, donc None
+        # et non 0) et `a_recalculer` signale les archives à reprendre — sans
+        # jamais les réécrire (aucun mode apply automatique, P3).
+        "nb_trajets": _seq_compteurs,
+        "nb_sequences_affichees": _seq_compteurs,
+        "nb_trajets_valides_reels": _reels_compteurs,
+        "nb_trajets_fusionnes": _fusionnes_compteurs,
+        "schema_version": _schema_archive,
+        "compteurs_source": _source_compteurs,
+        "a_recalculer": _a_recalculer,
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,
         # drapeaux de dépassement (v1.52 : calculés sur la valeur RÉELLE,

@@ -43,7 +43,8 @@ from sqlalchemy import select                                    # noqa: E402
 from app.database import SessionLocal                            # noqa: E402
 from app.models import (HistoriqueJournalier, SuiviJournalier,   # noqa: E402
                         Vehicule)
-from app.serializers import compter_trajets_reels                # noqa: E402
+from app.serializers import (ARCHIVE_SCHEMA_VERSION,            # noqa: E402
+                             compter_trajets_reels, s_historique)
 
 CLES_V153 = ("nb_trajets_valides_reels", "nb_sequences_affichees",
              "nb_trajets_fusionnes")
@@ -64,6 +65,11 @@ def diagnostiquer(donnees: dict) -> tuple[list[str], list[str]]:
 
     if not all(c in d for c in CLES_V153):
         anomalies.append("COMPTEURS_ABSENTS")
+    # v1.54/P3 — une archive sans VERSION de schéma est antérieure : elle doit
+    # être signalée « à recalculer » (jamais lue comme si ses champs absents
+    # valaient zéro, jamais réécrite sans validation explicite).
+    if int(d.get("schema_version") or 0) < ARCHIVE_SCHEMA_VERSION:
+        anomalies.append("SCHEMA_ANTERIEUR")
     if any(int(t.get("segments") or 1) > 1 for t in trajets):
         anomalies.append("TRAJETS_FUSIONNES_EN_BASE")
 
@@ -175,12 +181,25 @@ def main() -> int:
             plaque = None
             v = db.get(Vehicule, h.vehicule_id)
             plaque = v.plaque if v else h.vehicule_id
+            # v1.54/P3 — lecture CONTRAT (rétrocompatible) : dit ce que le
+            # logiciel sert réellement pour cette archive, et si elle doit être
+            # recalculée. Lecture pure : rien n'est écrit.
+            try:
+                _lu = s_historique(h, seuils=get_seuils(db))
+            except Exception as exc:                     # noqa: BLE001
+                _lu = {"compteurs_source": f"ERREUR_LECTURE:{type(exc).__name__}",
+                       "a_recalculer": True}
             a_reparer.append({
                 "archive_id": h.id,
                 "date_jour": h.date_jour.isoformat(),
                 "plaque": plaque,
                 "anomalies": anomalies,
                 "a_confirmer": a_confirmer,
+                "schema_version": int((h.donnees or {}).get("schema_version") or 0),
+                "compteurs_source": _lu.get("compteurs_source"),
+                "a_recalculer": bool(_lu.get("a_recalculer")),
+                "nb_trajets_valides_reels": _lu.get("nb_trajets_valides_reels"),
+                "nb_sequences_affichees": _lu.get("nb_sequences_affichees"),
                 "nb_trajets_stocke": (h.donnees or {}).get("nb_trajets"),
                 "tcc_s_stocke": (h.donnees or {}).get("tcc_s"),
                 "tcj_s_stocke": (h.donnees or {}).get("tcj_s"),
@@ -189,6 +208,11 @@ def main() -> int:
         rapport["anomalies"] = compteurs
         rapport["a_confirmer"] = compteurs_conf
         rapport["archives_a_reparer"] = a_reparer
+        rapport["archives_a_recalculer"] = sum(
+            1 for a in a_reparer if a.get("a_recalculer"))
+        rapport["schema_courant"] = ARCHIVE_SCHEMA_VERSION
+        rapport["conseil"] = ("Aucun mode apply automatique : toute reprise "
+                              "d'archive exige une validation humaine explicite.")
 
         print(f"\n  Archives examinées : {len(archives)}")
         print(f"  Archives conforme  : {len(archives) - len(a_reparer)}")
@@ -199,6 +223,10 @@ def main() -> int:
                 "COMPTEURS_ABSENTS":
                     "archive antérieure à v1.53 (compteurs distincts absents) "
                     "→ réparable par un recalcul encadré",
+                "SCHEMA_ANTERIEUR":
+                    "archive sans version de schéma (antérieure à la v1.54) "
+                    "→ statut « à recalculer » ; ses champs absents ne sont "
+                    "JAMAIS lus comme zéro",
                 "TRAJETS_FUSIONNES_EN_BASE":
                     "le snapshot ne garde que la vue fusionnée "
                     "→ les trajets individuels doivent être réécrits (validation requise)",
@@ -225,6 +253,10 @@ def main() -> int:
             for cle, n in sorted(compteurs.items(), key=lambda kv: -kv[1]):
                 print(f"    {n:>5}  {cle}")
                 print(f"           {libelles.get(cle, '')}")
+        print(f"\n  ── STATUT « À RECALCULER » ──")
+        print(f"    {rapport['archives_a_recalculer']:>5}  archive(s) à recalculer "
+              f"(version de schéma courante : {ARCHIVE_SCHEMA_VERSION})")
+        print("           Aucun mode apply automatique : rien n'est réécrit ici.")
         if compteurs_conf:
             print("\n  ── POINTS À CONFIRMER (pas des anomalies certaines) ──")
             for cle, n in sorted(compteurs_conf.items(), key=lambda kv: -kv[1]):

@@ -2178,20 +2178,168 @@ def _synchroniser_dernier_point_mzonex(db=None) -> dict:
             db.close()
 
 
-def _collecter_n2_mzonex(jours: list | None = None) -> tuple:
-    """§0sexies A2 : Niveau 2 MZoneX — API d'abord, repli écran si demandé."""
+# ============================================================================
+# v1.54/P2 (18/09/2026) — REPLI API : échec TRACÉ, ÉCRAN SYSTÉMATIQUE,
+# RÉSULTAT UTILISÉ SEULEMENT S'IL EST COMPLET, SOURCE IDENTIFIÉE PAR LIGNE.
+# Avant : un échec de l'API renvoyait une liste VIDE (données perdues pour le
+# cycle) sauf si MZONEX_REPLI_ECRAN=1 était positionné à la main — alors que la
+# règle documentée (§0sexies A2) dit « TOUT ÉCHEC API replie automatiquement ».
+# Le repli n'est JAMAIS utilisé partiellement : une lecture incomplète
+# (véhicules de la journée absents du relevé) est REJETÉE en bloc, pour ne
+# jamais produire d'archive partielle (R-11).
+# ============================================================================
+DERNIER_ETAT_N2: dict = {}
+
+# Origine de lecture portée par CHAQUE ligne collectée (traçabilité).
+ORIGINE_API = "API_N2"
+ORIGINE_ECRAN = "REPLI_ECRAN"
+
+
+def _plaque_cle(valeur) -> str:
+    """Forme comparable d'une plaque : « 4006 TBS (LSS) » → « 4006TBS »."""
+    return "".join(ch for ch in str(valeur or "").upper() if ch.isalnum())
+
+
+def _identifier_source(valides: list, origine: str) -> list:
+    """P2-6 : chaque ligne porte la SOURCE DE LECTURE utilisée."""
+    for item in valides or []:
+        if isinstance(item, dict):
+            item.setdefault("origine_lecture", origine)
+    return list(valides or [])
+
+
+def _completude_lecture(valides: list, recensement: list,
+                        attendues=None) -> tuple:
+    """P2-3 : le résultat couvre-t-il TOUT ce qu'on attend ?
+
+    `attendues` = plaques attendues pour les journées relues (véhicules suivis).
+    Sans référence connue (`attendues` vide), la complétude ne peut pas être
+    prouvée : la lecture est acceptée seulement si elle n'est pas vide, et le
+    mode est consigné (« sans_reference ») pour l'audit.
+    """
+    couvertes = {_plaque_cle(v.get("plaque")) for v in (valides or [])
+                 if isinstance(v, dict)}
+    couvertes |= {_plaque_cle(x) for x in (recensement or [])}
+    couvertes.discard("")
+    attendues_cles = {_plaque_cle(x) for x in (attendues or [])}
+    attendues_cles.discard("")
+    if not attendues_cles:
+        return bool(valides), {"mode": "sans_reference",
+                               "couvertes": len(couvertes), "attendues": 0,
+                               "manquantes": []}
+    manquantes = sorted(attendues_cles - couvertes)
+    return (bool(valides) and not manquantes,
+            {"mode": "reference", "couvertes": len(couvertes),
+             "attendues": len(attendues_cles), "manquantes": manquantes[:20]})
+
+
+def _plaques_attendues(jours: list | None) -> list:
+    """P2-3 — plaques SUIVIES ces journées-là : référence de complétude du repli."""
+    if not jours:
+        return []
+    try:
+        from .database import SessionLocal
+        from .models import SuiviJournalier, Vehicule
+        db = SessionLocal()
+        try:
+            lignes = db.execute(
+                select(Vehicule.plaque)
+                .join(SuiviJournalier, SuiviJournalier.vehicule_id == Vehicule.id)
+                .where(SuiviJournalier.date_jour.in_(list(jours)))
+                .distinct()).all()
+            return [l[0] for l in lignes if l[0]]
+        finally:
+            db.close()
+    except Exception:
+        log.exception("Référentiel de complétude indisponible — contrôle ignoré")
+        return []
+
+
+def _tracer_repli_n2(source: str, jours: list | None) -> None:
+    """P2-1 — l'échec de l'API et l'usage du repli sont CONSIGNÉS en base."""
+    etat = dict(DERNIER_ETAT_N2 or {})
+    if not etat.get("echec") or etat.get("origine") != ORIGINE_ECRAN:
+        return
+    try:
+        from .database import SessionLocal
+        from .models import AuditLog
+        db = SessionLocal()
+        try:
+            db.add(AuditLog(username="collecte-n2", action="lecture.repli_ecran",
+                            entite="source", entite_id=source,
+                            details={"echec_api": etat.get("echec"),
+                                     "origine_utilisee": etat.get("origine"),
+                                     "complet": etat.get("complet"),
+                                     "detail": etat.get("detail"),
+                                     "jours": [str(j) for j in (jours or [])]}))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        log.exception("Traçage du repli N2 en échec (collecte non bloquée)")
+
+
+def _collecter_n2_mzonex(jours: list | None = None, *,
+                         attendues=None) -> tuple:
+    """§0sexies A2 + P2 : API d'abord, ÉCRAN EN SECOURS SYSTÉMATIQUE, et le
+    secours n'est utilisé QUE S'IL EST COMPLET (jamais d'archive partielle).
+
+    1. l'échec de l'API est enregistré (journal + `DERNIER_ETAT_N2`) ;
+    2. le lecteur d'écran est TOUJOURS sollicité après un échec (désactivable
+       par `MZONEX_REPLI_ECRAN=0` pour un diagnostic) ;
+    3. la complétude du repli est vérifiée ;
+    4. le repli n'est utilisé que s'il est complet ;
+    5. sinon : listes vides (le cycle n'écrit rien — aucune archive partielle) ;
+    6. chaque ligne porte son origine de lecture.
+    """
+    etat = {"echec": None, "origine": None, "complet": None, "detail": {}}
+    repli_autorise = os.getenv("MZONEX_REPLI_ECRAN", "1") == "1"
     if _mzonex_api_active():
         try:
             c = MZoneXTrajetsApiCollector()
-            return c.collecter_valides(jours), list(c.recensement or [])
-        except Exception:
-            log.exception("MZoneX API (Trajets) en échec")
-            if os.getenv("MZONEX_REPLI_ECRAN", "0") != "1":
-                return [], []
-    if os.getenv("MZONEX_REPLI_ECRAN", "0") == "1":
-        c = MZoneXTrajetsCollector()
-        return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
-    return [], []
+            valides = list(c.collecter_valides(jours) or [])
+            rec = list(c.recensement or [])
+            complet, detail = _completude_lecture(valides, rec, attendues)
+            if valides and complet:
+                etat.update(origine=ORIGINE_API, complet=True, detail=detail)
+                DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
+                return _identifier_source(valides, ORIGINE_API), rec
+            etat["echec"] = ("api_incomplete" if valides else "api_sans_ligne")
+            etat["detail"] = detail
+            log.warning("MZoneX API (Trajets) %s — repli écran (A2/P2) : %s",
+                        etat["echec"], detail)
+        except Exception as exc:                              # P2-1
+            etat["echec"] = f"api_{type(exc).__name__}"
+            log.exception("MZoneX API (Trajets) en échec — repli écran (A2/P2)")
+    else:
+        etat["echec"] = "api_desactivee"
+    # P2-2 : repli écran (systématique par défaut — A2 « écran en secours »)
+    if not repli_autorise and etat["echec"] == "api_desactivee":
+        log.info("MZoneX : API désactivée et repli écran refusé "
+                 "(MZONEX_REPLI_ECRAN=0) — aucun relevé pour ce cycle")
+        etat.update(origine=None, complet=False)
+        DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
+        return [], []
+    if not repli_autorise:
+        log.warning("MZoneX API en échec et repli écran DÉSACTIVÉ "
+                    "(MZONEX_REPLI_ECRAN=0) — aucun relevé pour ce cycle")
+        etat.update(origine=None, complet=False)
+        DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
+        return [], []
+    c = MZoneXTrajetsCollector()
+    valides = list(c.collecter_valides() or [])
+    rec = list(getattr(c, "recensement", []) or [])
+    complet, detail = _completude_lecture(valides, rec, attendues)   # P2-3
+    etat.update(origine=ORIGINE_ECRAN, complet=bool(complet), detail=detail)
+    if not complet:                                                 # P2-5
+        log.warning("Repli ÉCRAN MZoneX INCOMPLET → relevé REJETÉ en bloc "
+                    "(aucune archive partielle) : %s", detail)
+        DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
+        return [], []
+    log.info("Repli ÉCRAN MZoneX utilisé (API %s) : %d ligne(s) — %s",
+             etat["echec"], len(valides), detail)
+    DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
+    return _identifier_source(valides, ORIGINE_ECRAN), rec      # P2-6
 
 
 class CamtrackProApiCollector(CollectorBase):
@@ -2369,8 +2517,11 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
             continue
         try:
             if nom == "MZONEX":
-                # §0sexies A2 — API MZoneX en principal, écran en secours
-                bruts, rec = _collecter_n2_mzonex(jours)
+                # §0sexies A2 + P2 — API MZoneX en principal, écran en secours
+                # SYSTÉMATIQUE, utilisé seulement s'il est COMPLET.
+                bruts, rec = _collecter_n2_mzonex(
+                    jours, attendues=_plaques_attendues(jours))
+                _tracer_repli_n2(nom, jours)
                 recensements[nom] = rec
             elif nom == "CAMTRACKPRO":
                 # §0sexies A2/A4 — API Wialon en principal, écran en secours

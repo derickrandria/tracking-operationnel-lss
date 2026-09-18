@@ -38,6 +38,7 @@ MÉTHODE (déterministe, sans mutation tant que la journée n'est pas jugée) :
     archives régénérées, journal AVANT/APRÈS, alerte.
 """
 import logging
+import os
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, select
@@ -241,7 +242,8 @@ def _reecrire_archives_jour(db, jour: date, plaques: dict) -> dict:
 
 
 # ----------------------------------------------------------------- une journée
-def verifier_et_reparer_jour(db, jour: date, items: list[dict]) -> dict:
+def verifier_et_reparer_jour(db, jour: date, items: list[dict], *,
+                             autoriser_reecriture: bool = False) -> dict:
     """D1 : compare la journée à la relecture portails et la répare si écart.
     Retourne un rapport {conforme, guéries, masquées, insérés, segments_b}."""
     seuils = get_seuils(db)
@@ -385,7 +387,18 @@ def verifier_et_reparer_jour(db, jour: date, items: list[dict]) -> dict:
     db.commit()
 
     cons = consolider_jour(db, jour)          # officiel 23:59:59 (v3 AM-3)
-    archives = _reecrire_archives_jour(db, jour, plaques)
+    # v1.54/P3 — aucune réécriture d'archive sans autorisation EXPLICITE : la
+    # réparation recalcule les trajets, elle ne remplace plus les snapshots en
+    # place par défaut (l'archive est marquée « à recalculer »).
+    if autoriser_reecriture or os.getenv("LSS_ARCHIVES_APPLY", "0") == "1":
+        archives = _reecrire_archives_jour(db, jour, plaques)
+    else:
+        archives = {"reecriture": "REFUSEE_P3",
+                    "motif": "aucune réécriture automatique — autoriser via "
+                             "LSS_ARCHIVES_APPLY=1 ou endpoint dédié"}
+        log.warning("v1.54/P3 : réécriture d'archive REFUSÉE pour le %s — "
+                    "archives laissées en place, marquées « à recalculer »",
+                    jour.isoformat())
     db.flush()
     _audit(db, ACT_REPARATION, None, {
         "jour": jour.isoformat(), "gueries": rapport["gueries"],
@@ -410,7 +423,7 @@ def verifier_et_reparer_jour(db, jour: date, items: list[dict]) -> dict:
 
 
 # -------------------------------------------------------------------- global
-def executer_reparation_v130() -> dict:
+def executer_reparation_v130(*, autoriser_reecriture: bool = False) -> dict:
     """§0decies D1/D3 — contrôle complet 19/08/2026 → veille, une seule fois ;
     idempotent par journée ; reprise au boot suivant tant qu'un portail manque."""
     db = SessionLocal()
@@ -441,7 +454,8 @@ def executer_reparation_v130() -> dict:
                             jour.isoformat(), ", ".join(echecs))
                 rapport["sautees"].append(jour.isoformat())
                 continue
-            res = verifier_et_reparer_jour(db, jour, items)
+            res = verifier_et_reparer_jour(db, jour, items,
+                                            autoriser_reecriture=autoriser_reecriture)
             if res.get("conforme"):
                 rapport["conformes"] += 1
             else:

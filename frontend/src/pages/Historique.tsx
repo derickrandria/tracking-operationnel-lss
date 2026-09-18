@@ -414,7 +414,7 @@ export default function Historique() {
                           {fmtDuree(ttjSec, true)}
                         </td>
                         <td className="tabular-nums">
-                          <span title={h.nb_trajets_valides_reels !== undefined
+                          <span title={h.nb_trajets_valides_reels != null
                             ? `${h.nb_trajets_valides_reels} trajet(s) valide(s) en base · `
                               + `${h.nb_trajets_fusionnes ?? 0} regroupé(s) à l'affichage`
                             : "Trajets affichés (séquences)"}>

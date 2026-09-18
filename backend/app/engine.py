@@ -907,6 +907,13 @@ def ingest_event(db, vehicule: Vehicule, ts: datetime, lat: float, lon: float,
         db.scalars(select(Trajet).where(
             Trajet.suivi_id == suivi.id).order_by(Trajet.numero)).all(),
         key=lambda t: t.numero)
+    # v1.54/P1 (18/09/2026) — une ligne ÉCARTÉE par la RÉCONCILIATION
+    # (`motif_rejet` renseigné) appartient au passé : elle ne fait plus partie de
+    # la « chaîne en cours » et ne doit JAMAIS être réactivée ni mutée par le
+    # direct — sinon la donnée observée que l'on vient de CONSERVER serait
+    # réécrite. Les rejets « distance » (< 0,3 km, `motif_rejet` NULL) gardent
+    # exactement leur comportement d'origine (R1/F2).
+    trajets = [t for t in trajets if not t.motif_rejet]
 
     type_ev = type_force
     # Référence v2 §5.1/§12.1 + arbitrage LSS 14/08/2026 : roule ⟺ vitesse >
@@ -3373,6 +3380,8 @@ def rattraper_ouvertures(maintenant: datetime | None = None) -> dict:
             victime = next(
                 (t for t in reversed(trajets)
                  if t.statut_validation == StatutValidationTrajet.REJETE
+                 and not t.motif_rejet        # v1.54/P1 — jamais une ligne
+                 #                               écartée par la réconciliation
                  and (t.heure_fin is None
                       or 0 <= (maintenant - t.heure_fin).total_seconds()
                       < pause_min_s)),

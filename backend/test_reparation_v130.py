@@ -16,6 +16,7 @@ Exécution (TOUJOURS sur une base de test !) :
   DATABASE_URL="sqlite:////tmp/test_v130.db" SIM_ENABLE=0 python3 test_reparation_v130.py
 La base est SUPPRIMÉE à la fin (protection des données production).
 """
+import json
 import os
 os.environ.setdefault("SIM_ENABLE", "0")
 import sys
@@ -237,7 +238,7 @@ def _rel1(jour):            # passage 1 : le 20/08 est injoignable (R5)
 
 
 reparation._relecture_portails = _rel1
-reparation.executer_reparation_v130()
+reparation.executer_reparation_v130(autoriser_reecriture=True)
 
 # --- J0 sain : intact ------------------------------------------------------------
 arch_j0_apres = {h.id: dict(h.donnees or {}) for h in db.scalars(
@@ -351,7 +352,7 @@ check("R3i : journal AVANT/APRÈS de la réécriture d'archive présent", reecr 
 
 # --- passage 2 : le 20/08 redevient joignable → réparé, marqueur global ---------
 reparation._relecture_portails = relire
-reparation.executer_reparation_v130()
+reparation.executer_reparation_v130(autoriser_reecriture=True)
 l0906 = lignes_affichees(v0906, J1)
 check("R4a : 0906TBV 20/08 — le trajet perdu 10:19→13:44 est REINSÉRÉ (3 lignes)",
       len(l0906) == 3 and l0906[1].heure_debut == dt(J1, 10, 19, 6)
@@ -392,12 +393,24 @@ check("R4f : alertes récapitulatives visibles dans l'onglet Alertes (par journ�
 nb_trajets = db.scalar(select(func.count(Trajet.id))) or 0
 nb_audits = db.scalar(select(func.count(AuditLog.id))) or 0
 nb_alertes = db.scalar(select(func.count(Alerte.id))) or 0
-rep_c = reparation.executer_reparation_v130()
+rep_c = reparation.executer_reparation_v130(autoriser_reecriture=True)
 check("R5a : 3ᵉ passage = statut « deja_faite », zéro nouvelle écriture",
       rep_c.get("statut") == "deja_faite"
       and nb_trajets == (db.scalar(select(func.count(Trajet.id))) or 0)
       and nb_audits == (db.scalar(select(func.count(AuditLog.id))) or 0)
       and nb_alertes == (db.scalar(select(func.count(Alerte.id))) or 0))
+# --- v1.54/P3 : le passage AUTOMATIQUE (défaut) ne réécrit aucune archive -------
+nb_hists = db.scalar(select(func.count(HistoriqueJournalier.id))) or 0
+_snap_av = {h.id: json.dumps(h.donnees or {}, sort_keys=True, default=str)
+            for h in db.scalars(select(HistoriqueJournalier)).all()}
+reparation.executer_reparation_v130()               # défaut = pas d'autorisation
+_snap_ap = {h.id: json.dumps(h.donnees or {}, sort_keys=True, default=str)
+            for h in db.scalars(select(HistoriqueJournalier)).all()}
+check("P3 : sans autorisation explicite, AUCUNE archive n'est réécrite "
+      "(le boot ne réécrit jamais)",
+      nb_hists == (db.scalar(select(func.count(HistoriqueJournalier.id))) or 0)
+      and _snap_av == _snap_ap)
+
 l4876_bis = lignes_affichees(v4876, J2)
 check("R5b : grille du 21/08 stable après re-exécution",
       [(t.heure_debut, t.heure_fin) for t in l4876_bis] == reelles)

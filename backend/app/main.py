@@ -161,6 +161,11 @@ def migrer_schema():
         if "statut_validation" not in cols_t:
             cx.execute(text("ALTER TABLE trajets ADD COLUMN statut_validation VARCHAR(20)"))
             log.info("Migration : trajets.statut_validation ajouté")
+        # v1.54/P1 (18/09/2026) — conservation intégrale des trajets observés :
+        # la ligne n'est plus supprimée, elle est marquée REJETE + motif.
+        if "motif_rejet" not in cols_t:
+            cx.execute(text("ALTER TABLE trajets ADD COLUMN motif_rejet VARCHAR(64)"))
+            log.info("Migration : trajets.motif_rejet ajouté (P1 — aucune suppression)")
         # §0septies (20/08/2026) — badge chauffeur + carnet de conduite
         for col, typ in (("conducteur_badge", "VARCHAR(160)"),
                          ("conducteur_badge_id", "VARCHAR(36)"),
@@ -640,11 +645,26 @@ def rattraper_7_derniers_jours():
                 # 1. Collecte et recalcul de l'archive (CamTrackPro / MZoneX)
                 #    (Ym@ne a été importé en une passe avant la boucle — v148)
                 try:
+                    # v1.54/P3 (18/09/2026) — AUCUN MODE APPLY AUTOMATIQUE :
+                    # le démarrage ne RÉÉCRIT plus les archives tout seul. La
+                    # réécriture doit être demandée explicitement (endpoint
+                    # /suivi/recalculer-archive ou LSS_ARCHIVES_APPLY=1) ; sinon
+                    # la journée est seulement MARQUÉE « à recalculer » et
+                    # signalée, sans toucher aux données en place.
+                    _apply = os.getenv("LSS_ARCHIVES_APPLY", "0") == "1"
                     res_recalc = recalculer_archives_journee(
-                        jour_cible, db=db, autoriser_reecriture=True,
-                        motif="boot_catchup_7j")  # v1.51 exigence 6
-                    log.info("Boot Catch-up: Journée du %s rattrapée avec succès (%s)",
-                             jour_cible.isoformat(), res_recalc)
+                        jour_cible, db=db, autoriser_reecriture=_apply,
+                        motif="boot_catchup_7j")  # v1.51 exigence 6 / P3
+                    if _apply:
+                        log.info("Boot Catch-up: Journée du %s rattrapée "
+                                 "(%s)", jour_cible.isoformat(), res_recalc)
+                    else:
+                        log.warning("Boot Catch-up: journée du %s incomplète — "
+                                    "archives MARQUÉES « à recalculer », "
+                                    "AUCUNE réécriture automatique (P3). "
+                                    "Validation explicite requise "
+                                    "(LSS_ARCHIVES_APPLY=1 ou endpoint dédié).",
+                                    jour_cible.isoformat())
                 except Exception as e:
                     log.warning("Boot Catch-up: Échec recalcul archive pour %s : %s", jour_cible, e)
     except Exception:

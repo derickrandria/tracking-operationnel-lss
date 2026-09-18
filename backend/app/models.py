@@ -344,6 +344,12 @@ class Trajet(Base):
 
     # --- Addendum v1.5 §7.1 — validité métier (règle absolue §2 : un trajet
     # REJETÉ — distance < 0,3 km — n'entre jamais dans TCC/TCJ/TTJ)
+    # v1.54/P1 (18/09/2026) — AUCUNE suppression physique d'un trajet observé.
+    # Motif du rejet quand la ligne est CONSERVÉE mais écartée (doublon jumeau,
+    # orphelin hors intervalle officiel, ouvert recouvert, résidu de structure).
+    # NULL = rejet « normal » (manœuvre < 0,3 km) ; renseigné = décision de
+    # réconciliation, journalisée en audit avec l'état AVANT/APRÈS.
+    motif_rejet: Mapped[str | None] = mapped_column(String(64), nullable=True)
     statut_validation: Mapped[StatutValidationTrajet] = mapped_column(
         SAEnum(StatutValidationTrajet, **SA_ENUM_KW),
         default=StatutValidationTrajet.EN_ATTENTE)

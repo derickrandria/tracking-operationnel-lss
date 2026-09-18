@@ -37,6 +37,37 @@ export function fmtDuree(s: number | string | null | undefined, max24h: boolean 
   return `${neg ? "-" : ""}${h}:${String(m).padStart(2, "0")}`;
 }
 
+// ============================================================================
+// v1.53 (18/09/2026) — RÈGLES D'AFFICHAGE TESTABLES (front)
+// Elles MIROITENT les règles du back (le drapeau `flag_ttj` reste la référence,
+// calculé côté serveur) : elles servent au rendu et sont couvertes par
+// `frontend/tests/affichage_v153.test.ts` (`npm run test`).
+// ============================================================================
+
+/** Seuil de SIGNALEMENT du TTJ : 12:00:00 — un seuil, jamais un plafond. */
+export const SEUIL_TTJ_SIGNAL_S = 43200;
+
+/** « ≥ 12:00 » est INCLUSIF : 12:00:00 pile est signalé (arbitrage 18/09). */
+export function seuilTtjAtteint(ttjS: number | null | undefined,
+                                seuilS: number = SEUIL_TTJ_SIGNAL_S): boolean {
+  return ttjS !== null && ttjS !== undefined && ttjS >= seuilS;
+}
+
+/** Convention d'export quand le TCC n'est pas applicable (« 0:00 » + note). */
+export const CONVENTION_TCC_EXPORT = "0:00";
+
+/**
+ * Contenu de la cellule TCC — règle d'écran (arbitrage Q3 du 18/09) :
+ * « — » quand la valeur n'est pas applicable ou inconnue, JAMAIS « 0:00 »
+ * (qui se lirait comme une mesure). La valeur calculée reste intacte en base.
+ */
+export function celluleTcc(secondes: number | null | undefined,
+                           masque?: boolean): string {
+  if (masque) return "—";
+  if (secondes === null || secondes === undefined) return "—";
+  return fmtDuree(secondes);
+}
+
 export function fmtHeure(iso: string | null | undefined): string {
   if (!iso) return "—";
   return iso.slice(11, 16);
