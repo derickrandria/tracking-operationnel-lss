@@ -436,7 +436,10 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
               {/* ---------------- Partie D (automatique) ----------------
                  Addendum v1.9 §4 : TCC/TCJ/TTJ AVANT les trajets */}
               <td className="bg-emerald-500/[0.04] text-center">
-                <CelluleTCC secondes={l.tcc_s} seuilMax={tccMax} masque={masquerTCC} />
+                {/* v1.52 — le back déclare l'intention d'affichage (`tcc_masque`) au lieu de
+                        détruire la valeur : le masquage reste une décision ÉCRAN. */}
+                <CelluleTCC secondes={l.tcc_s} seuilMax={tccMax}
+                            masque={masquerTCC ?? l.tcc_masque} />
               </td>
               <td className="bg-emerald-500/[0.04] text-center"><Temps secondes={l.tcj_s} depasse={l.flag_tcj} /></td>
               <td className="bg-emerald-500/[0.04] text-center"><Temps secondes={l.ttj_s} depasse={l.flag_ttj} /></td>

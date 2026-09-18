@@ -169,7 +169,8 @@ def journee_suivi(s: SuiviJournalier, seuils: dict | None = None,
         pause_min=float(seuils.get("DUREE_MIN_PAUSE_VALIDE", 1200)),
         seuil_km=float(seuils.get("SEUIL_DISTANCE_MIN_TRAJET_KM", 0.3)),
         roule=roule, fin_substitution=fin_sub,
-        pause_affichee_min=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC", 1800)),
+        # v1.52 — seuil d'AFFICHAGE, distinct du seuil MOTEUR de coupure du TCC
+        pause_affichee_min=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN", 1800)),
         # v1.48 — compteurs bornés à la dernière preuve : `fin_sub` est le
         # dernier événement GPS connu du véhicule (None si jamais vu).
         derniere_trace=fin_sub,
@@ -217,7 +218,9 @@ def s_ligne(lg: LigneJournee, numero: int):
 # seuils (`SEUIL_FUSION_AFFICHAGE_S`) ; la constante ci-dessous est le repli
 # utilisé aussi pour la relecture des archives (sans session/seuils à portée).
 FUSION_AFFICHAGE_S = 1800.0    # §0tricies decies G1 : rupture < 30 min → UNE ligne
-# Seuil d'affichage des pauses : 30 min, inchangé (`SEUIL_PAUSE_COUPURE_TCC`)
+# Seuil d'affichage des pauses : 30 min — repli de `SEUIL_AFFICHAGE_PAUSE_MIN`
+# (v1.52 : réglage PROPRE à l'affichage, distinct de `SEUIL_PAUSE_COUPURE_TCC`
+# qui coupe le TCC côté moteur ; sert à la relecture d'archives, sans seuils).
 PAUSE_AFFICHAGE_S = 1800.0
 
 
@@ -312,21 +315,33 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     return res
 
 
-def fusionner_snapshot(donnees: dict | None) -> dict:
+def fusionner_snapshot(donnees: dict | None, seuils: dict | None = None) -> dict:
     """Copie d'un snapshot (s_suivi / archive) avec trajets fusionnés E1 —
     jamais de mutation de `donnees` (les archives ne sont pas réécrites).
-    §0vicies decies N1 (31/08/2026) : un snapshot est par construction une
-    journée TERMINÉE → le TCC y est masqué (« 0:00 » ; chrono temps réel sans
-    sens une fois la journée closes). Copie seulement : la valeur interne
-    reste stockée dans l'archive pour la contre-vérification (§A.2 respecté,
-    jamais de réécriture)."""
+
+    v1.52 (18/09/2026) — CORRECTIF : cette fonction REMETTAIT `tcc_s` à zéro
+    (règle N1 « TCC masqué hors temps réel »). Un sérialiseur ne doit JAMAIS
+    détruire une valeur calculée : le masquage est une décision d'AFFICHAGE.
+    La valeur RÉELLE est désormais conservée et le drapeau `tcc_masque`
+    (journée terminée → cellule « 0:00 » à l'écran) porte l'intention
+    d'affichage. Export, contre-vérification et audit gardent la vraie valeur.
+
+    `seuils` (optionnel) : réglages courants pour la fusion d'affichage ;
+    sans eux, les constantes de repli s'appliquent (relecture d'archive)."""
     d = dict(donnees or {})
+    seuils = seuils or {}
     bruts = d.get("trajets") or []
     if bruts:
-        fusionnes = fusionner_trajets_affichage(bruts)
+        fusionnes = fusionner_trajets_affichage(
+            bruts,
+            seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S",
+                                            FUSION_AFFICHAGE_S)),
+            seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN",
+                                               PAUSE_AFFICHAGE_S)))
         d["trajets"] = fusionnes
         d["nb_trajets"] = len(fusionnes)
-    d["tcc_s"] = 0   # N1 — TCC masqué hors temps réel (cellule « 0:00 »)
+    # N1 — l'affichage masque le TCC d'une journée close, la DONNÉE reste intacte.
+    d["tcc_masque"] = True
     return d
 
 
@@ -341,7 +356,7 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         [s_ligne(lg, i) for i, lg in enumerate(journee.lignes, start=1)],
         seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S",
                                         FUSION_AFFICHAGE_S)),
-        seuil_pause_aff_s=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC",
+        seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN",
                                            PAUSE_AFFICHAGE_S)))
     tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
     if tcc_max <= 24:
@@ -590,11 +605,19 @@ def s_alerte(a: Alerte):
     }
 
 
-def s_historique(h: HistoriqueJournalier, detail=False):
+def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = None):
     # §0undecies E1 — la MÊME fusion d'affichage s'applique aux snapshots
     # d'archive (dont ceux d'avant v1.31, stockés non fusionnés) : copie,
     # jamais de mutation ; aucune archive n'est réécrite (§A.2).
-    d = fusionner_snapshot(h.donnees)
+    # v1.52 (18/09/2026) : `seuils` transmet les réglages COURANTS (fusion et
+    # pause d'affichage) au lieu des constantes de repli pour la relecture
+    # d'archive (règles 5 et 6 : un seuil d'AFFICHAGE ne se fige pas dans le code).
+    d = fusionner_snapshot(h.donnees, seuils)
+    seuils = seuils or {}
+    tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+    ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+    tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+    tcc_val = min(86400, max(0, int(d.get("tcc_s") or d.get("tcc_secondes") or 0)))
     tcj_val = min(86400, max(0, int(d.get("tcj_s") or d.get("tcj_secondes") or 0)))
     ttj_val = min(86400, max(0, int(d.get("ttj_s") or d.get("ttj_secondes") or 0)))
     if ttj_val < tcj_val:
@@ -615,7 +638,14 @@ def s_historique(h: HistoriqueJournalier, detail=False):
         "heure_depart": d.get("heure_depart"),
         "arret_final": d.get("arret_final"),
         "km_parcourus": round(d.get("km_parcourus") or 0, 1),
-        "tcc_s": 0,
+        # v1.52 (18/09/2026) — CORRECTIF : ce sérialiseur REMETTAIT `tcc_s`
+        # à zéro (règle N1 du 31/08/2026). Un sérialiseur ne détruit JAMAIS une
+        # valeur calculée : la donnée (contre-vérification, audit) est conservée
+        # et le masquage « 0:00 » devient un DRAPEAU de rendu (`tcc_masque`),
+        # appliqué par l'écran (Historique.tsx / GrilleSuivi) et par l'export.
+        "tcc_s": tcc_val,
+        "tcc_secondes": tcc_val,
+        "tcc_masque": True,
         "tcj_s": tcj_val,
         "tcj_secondes": tcj_val,
         "tcj_str": fmt_hms_journee(tcj_val),
@@ -628,9 +658,11 @@ def s_historique(h: HistoriqueJournalier, detail=False):
         "nb_trajets": d.get("nb_trajets") or len(d.get("trajets") or []),
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,
-        "flag_tcj": bool(tcj_val > 36000),
-        "flag_ttj": bool(ttj_val > 43200),
-        "flag_tcc": False,
+        # drapeaux de dépassement (v1.52 : calculés sur la valeur RÉELLE,
+        # comme s_suivi — un drapeau n'a de sens que si la valeur existe)
+        "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
+        "flag_ttj": bool(ttj_val and ttj_val > ttj_max),
+        "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
         "archive_le": iso(h.archive_le),
     }
     if detail:

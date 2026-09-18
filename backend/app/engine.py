@@ -56,10 +56,25 @@ _flags: dict = {}
 SEUILS_DEFAUT = {
     "SEUIL_TCC_MAX": (16200, "DUREE_S", "Temps de conduite continue maximal avant infraction (4h30)"),
     "SEUIL_TCJ_MAX": (36000, "DUREE_S", "Temps de conduite journalière maximal (10h)"),
-    "SEUIL_TTJ_MAX": (43200, "DUREE_S", "Temps de travail journalier maximal (12h)"),
+    "SEUIL_TTJ_MAX": (43200, "DUREE_S",
+                      "Temps de travail journalier maximal (12h). "
+                      "SEUIL DE SIGNALEMENT, JAMAIS UN PLAFOND (arbitrage LSS du "
+                      "18/09/2026) : le dépassement allume `flag_ttj` et déclenche "
+                      "l'alerte, mais la valeur STOCKÉE reste la durée réellement "
+                      "travaillée. Le seul écrêtage appliqué est TECHNIQUE (24 h/jour, "
+                      "durée aberrante) — voir chaines.construire_journee."),
     "DUREE_MIN_PAUSE_VALIDE": (1200, "DUREE_S", "Durée minimale d'une pause validante — 20 min (v3 : ne pilote plus que la couleur noir/orange des lignes — AM-2)"),
     # v3 AM-3/C1 (arbitrage LSS 22/08/2026) — consolidation quotidienne
     "HEURE_PRE_CONSOLIDATION": (86399, "DUREE_S", "Instant de consolidation quotidienne, en secondes depuis minuit — 23:59:59 (v3 AM-3 : split des trajets en cours à minuit)"),
+    # --- v1.52 (18/09/2026) — SEUIL D'AFFICHAGE des pauses, DISTINCT du seuil moteur ---
+    "SEUIL_AFFICHAGE_PAUSE_MIN": (1800, "DUREE_S",
+                                  "Seuil d'AFFICHAGE des pauses (30 min, v1.52) : en "
+                                  "dessous, la cellule pause reste VIDE à l'écran. La "
+                                  "durée brute (`gap_brut_s`) reste mesurée et stockée. "
+                                  "DISTINCT de SEUIL_PAUSE_COUPURE_TCC (seuil MOTEUR qui "
+                                  "coupe le TCC) : même valeur par défaut, réglages "
+                                  "indépendants — masquer une pause à l'écran ne doit "
+                                  "JAMAIS modifier le calcul."),
     # --- Addendum v1.9 §1.1/§2.2 — le TCC ne coupe QU'à partir de 30 min ---
     "SEUIL_PAUSE_COUPURE_TCC": (1800, "DUREE_S",
         "Pause qui COUPE le TCC (30 min — Addendum v1.9 : un arrêt 20-29 min est "

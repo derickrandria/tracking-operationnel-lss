@@ -114,6 +114,8 @@ export interface SuiviLigne {
   gps_age_s?: number | null;
   lieu_arret?: string | null;   // Addendum v1.9 §4.2 — colonne « Lieu Arrêt »
   tcc_s: number;
+  /** v1.52 — journée close : l'écran affiche « 0:00 », la donnée reste intacte. */
+  tcc_masque?: boolean;
   tcj_s: number;
   ttj_s: number;
   total_pause_s: number;

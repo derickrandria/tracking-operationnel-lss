@@ -481,6 +481,14 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
         for v in vehicules_cibles:
             s = ensure_suivi(db, v, jour)
             recalculer_temps(db, s, cloture)
+            # v1.52 (18/09/2026) — CORRECTIF : `s_suivi` lit la RELATION `s.trajets`.
+            # Sur une session longue, cette collection peut être PÉRIMÉE (chargée
+            # avant l'écriture des trajets) : l'archive était alors écrite avec
+            # TCJ = TTJ = TCC = 0 et zéro ligne, alors que la base contenait bien
+            # les trajets — le calcul était juste, la SÉRIALISATION lisait un cache.
+            # On force la relecture : « TCJ/TTJ/TCC calculés AVANT toute
+            # sérialisation » n'a de sens que si elle lit l'état réel.
+            db.expire(s, ["trajets"])
             d = s_suivi(s, seuils)
 
             nb_inf = db.scalar(select(func.count(Infraction.id)).where(
@@ -511,9 +519,17 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             d["ttj_secondes"] = ttj_sec
             d["ttj_str"] = format_secondes_vers_hhmm(ttj_sec)
 
-            d["tcc_s"] = 0
-            d["tcc_secondes"] = 0
-            d["tcc_str"] = "00:00"
+            # v1.52 (18/09/2026) — CORRECTIF : le TCC était ÉCRIT À ZÉRO ici,
+            # détruisant le temps de conduite continue à chaque reconstruction
+            # d'archive (le calcul l'avait pourtant produit : `recalculer_temps`
+            # puis `s_suivi` portent la valeur réelle). Un sérialiseur ne remet
+            # JAMAIS tcc_s à zéro : le masquage « 0:00 » d'une journée close est
+            # une décision d'AFFICHAGE (drapeau `tcc_masque`), jamais une
+            # destruction de donnée.
+            tcc_sec = max(0, min(86400, int(d.get("tcc_s") or d.get("tcc_secondes") or 0)))
+            d["tcc_s"] = tcc_sec
+            d["tcc_secondes"] = tcc_sec
+            d["tcc_str"] = format_secondes_vers_hhmm(tcc_sec)
 
             tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
             if tcj_max <= 24:
@@ -524,7 +540,10 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
 
             d["flag_tcj"] = bool(tcj_sec > tcj_max)
             d["flag_ttj"] = bool(ttj_sec > ttj_max)
-            d["flag_tcc"] = False
+            tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+            if tcc_max <= 24:
+                tcc_max *= 3600
+            d["flag_tcc"] = bool(tcc_sec > tcc_max)
 
             h_new = HistoriqueJournalier(
                 id=uid(),

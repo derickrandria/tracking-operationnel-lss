@@ -38,8 +38,12 @@ def _masquer_tcc_si_jour_passe(lignes: list[dict], jour: date) -> list[dict]:
     cours. Masquage à la lecture seulement — `tcc_s` reste stocké en base."""
     if jour >= now_local().date():
         return lignes
+    # v1.52 (18/09/2026) — le masquage DÉCLARE l'intention d'affichage au lieu de
+    # détruire la valeur : `tcc_s` part intact (export, contre-vérification,
+    # audit) et `tcc_masque` dit à l'écran d'afficher « 0:00 » — N1 conservée
+    # visuellement, sans perte de donnée.
     for l in lignes:
-        l["tcc_s"] = 0
+        l["tcc_masque"] = True
     return lignes
 
 

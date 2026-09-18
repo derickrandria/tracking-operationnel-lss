@@ -4,7 +4,10 @@ TCC masqué hors temps réel (« 0:00 ») & positions automatiques 18h/20h/22h.
 
 [A] Modèle & migration : 2 colonnes sur base EXISTANTE (ALTER idempotent) ;
 [B] N1 — masquage TCC : lecture seule (jamais réécrit), partout sauf le jour
-    en cours (Suivi passé, Historique liste/grille, synthèse, exports) ;
+    en cours (Suivi passé, Historique liste/grille, synthèse, exports).
+    v1.52 (18/09/2026) — RÉVISION : le masquage n'ÉCRASE plus `tcc_s` ; il est
+    porté par le drapeau d'affichage `tcc_masque` (valeur vérifiable en base,
+    dans les archives et les exports techniques) ;
 [C] N2 — auto 18h/20h/22h : dernière position connue SANS limite d'âge
     (sémantique « position affichée au portail »), réécriture jusqu'à minuit,
     colonnes manuelles 08h→16h jamais touchées ;
@@ -124,8 +127,17 @@ try:
     print("\n[B] N1 — TCC masqué « 0:00 » partout sauf le jour en cours")
     snap = {"tcc_s": 7200, "trajets": [], "plaque": "0000TST"}
     masque = fusionner_snapshot(snap)
-    check("B1 fusionner_snapshot : TCC masqué à la lecture (→ 0)",
-          masque["tcc_s"] == 0)
+    # ── v1.52 (18/09/2026) — RÉVISION DE N1 (arbitrage LSS ; SPEC_RULES_v3
+    # prime sur les addenda subordonnés). L'addendum du 31/08 demandait
+    # d'ÉCRASER `tcc_s` à zéro hors temps réel : une valeur calculée était
+    # détruite à la lecture, ce qui contredit la règle « le sérialiseur ne
+    # remet JAMAIS `tcc_s` à zéro » et prive l'audit de la contre-vérification.
+    # Le MÊME effet VISUEL est obtenu par le drapeau `tcc_masque` : l'écran
+    # (Historique.tsx, GrilleSuivi.tsx) et l'export affichent toujours « 0:00 ».
+    check("B1 fusionner_snapshot : valeur TCC CONSERVÉE (7200) + drapeau "
+          "d'affichage `tcc_masque` (masquage déplacé de la donnée vers le rendu)",
+          masque["tcc_s"] == 7200 and masque.get("tcc_masque") is True,
+          f"tcc={masque['tcc_s']} masque={masque.get('tcc_masque')}")
     check("B2 …sans jamais muter le snapshot stocké (§A.2 — archive intacte)",
           snap["tcc_s"] == 7200)
     jour_h = AUJ - timedelta(days=1)
@@ -139,8 +151,12 @@ try:
     h.donnees = s_suivi(sh)                 # snapshot contrôlé (tcc 1:30 stocké)
     db.commit()
     db.refresh(h)
-    check("B3 archive lue (s_historique) : TCC « 0:00 » malgré 1:30 stocké",
-          s_historique(h)["tcc_s"] == 0 and (h.donnees or {}).get("tcc_s") == 5400)
+    arch = s_historique(h)
+    check("B3 archive lue (s_historique) : valeur 1:30 CONSERVÉE + drapeau "
+          "d'affichage levé (le rendu écran/export reste « 0:00 »)",
+          arch["tcc_s"] == 5400 and arch.get("tcc_masque") is True
+          and (h.donnees or {}).get("tcc_s") == 5400,
+          f"tcc={arch['tcc_s']} masque={arch.get('tcc_masque')}")
     from app.routers.historique import _lignes_export
     lig = _lignes_export([h])[0]
     check("B4 synthèse mensuelle (export) : colonne TCC = « 0:00 »",
@@ -153,9 +169,11 @@ try:
           lignes_j[0]["tcc_s"] == 7200)
     lignes_h = _suivis_filtres(db, jour_h, None, None)
     cible = [l for l in lignes_h if l["vehicule_id"] == v.id]
-    check("B6 export Suivi d'un jour PASSÉ : TCC masqué « 0:00 »",
-          bool(cible) and all(l["tcc_s"] == 0 for l in cible),
-          f"{[l['tcc_s'] for l in cible]}")
+    check("B6 export Suivi d'un jour PASSÉ : valeur CONSERVÉE + drapeau "
+          "`tcc_masque` (le rendu export reste « 0:00 » — cf. B4)",
+          bool(cible) and all(l["tcc_s"] == 5400 and l.get("tcc_masque")
+                             for l in cible),
+          f"{[(l['tcc_s'], l.get('tcc_masque')) for l in cible]}")
     check("B7 s_historique détail : la fusion d'affichage E1 reste appliquée "
           "(régression v1.31)", "donnees" in s_historique(h, detail=True))
 
