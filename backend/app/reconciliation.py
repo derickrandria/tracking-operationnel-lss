@@ -64,7 +64,8 @@ from .engine import (PUBLISH_ENABLED, _verifier_temps, appliquer_badge_et_eco,
 from .event_bus import publish
 from .models import (AuditLog, HistoriqueJournalier, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet, Vehicule)
-from .serializers import iso, journee_suivi, s_ligne, s_suivi, s_trajet
+from .serializers import (compter_trajets_reels, fusionner_trajets_affichage,
+                       iso, journee_suivi, s_ligne, s_suivi, s_trajet)
 
 log = logging.getLogger("lss.reconciliation")
 
@@ -233,7 +234,18 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
                  suivi.vehicule.plaque if suivi.vehicule else "?",
                  len(avant_lignes), len(donnees["trajets"]),
                  " (+ positions N3)" if change_pos else "")
-    donnees["nb_trajets"] = len(journee.lignes)
+    # v1.53 (18/09/2026) — le snapshot conserve les trajets BRUTS (aucun trajet
+    # valide n'est perdu en base) et déclare les SÉQUENCES affichées à côté :
+    # `nb_trajets` ne porte plus qu'un seul sens, partout = nombre de séquences.
+    _seqs = fusionner_trajets_affichage(
+        donnees["trajets"],
+        seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S", 1800)),
+        seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN", 1800)))
+    _reels = len(journee.lignes)
+    donnees["nb_trajets_valides_reels"] = _reels
+    donnees["nb_sequences_affichees"] = len(_seqs)
+    donnees["nb_trajets_fusionnes"] = max(0, _reels - len(_seqs))
+    donnees["nb_trajets"] = len(_seqs)
     donnees["heure_depart"] = iso(suivi.heure_depart)
     donnees["tcc_s"], donnees["tcj_s"] = suivi.tcc_s, suivi.tcj_s
     donnees["ttj_s"], donnees["total_pause_s"] = suivi.ttj_s, suivi.total_pause_s

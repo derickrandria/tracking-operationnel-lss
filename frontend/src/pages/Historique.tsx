@@ -376,8 +376,10 @@ export default function Historique() {
                       const nomPrincipal = h.conducteur?.prenom_usuel || h.conducteur?.nom_prenom;
                       const tcjSec = parseDureeEnSecondes(h.tcj_s ?? h.donnees?.tcj_s);
                       const ttjSec = parseDureeEnSecondes(h.ttj_s ?? h.donnees?.ttj_s);
-                      const depasseTcj = tcjSec > 36000;
-                      const depasseTtj = ttjSec > 43200;
+                      // v1.53 — les seuils viennent du BACK (`flag_tcj` / `flag_ttj`,
+                      // seuils PARAMÉTRÉS) ; plus de seuil figé dans l'affichage.
+                      const depasseTcj = Boolean(h.flag_tcj);
+                      const depasseTtj = Boolean(h.flag_ttj);
                       return (
                       <tr key={h.id} className="cursor-pointer"
                         title="Voir la grille complète de cette journée (identique au Suivi Journalier)"
@@ -412,7 +414,12 @@ export default function Historique() {
                           {fmtDuree(ttjSec, true)}
                         </td>
                         <td className="tabular-nums">
-                          {h.nb_trajets || "—"}
+                          <span title={h.nb_trajets_valides_reels !== undefined
+                            ? `${h.nb_trajets_valides_reels} trajet(s) valide(s) en base · `
+                              + `${h.nb_trajets_fusionnes ?? 0} regroupé(s) à l'affichage`
+                            : "Trajets affichés (séquences)"}>
+                            {h.nb_trajets || "—"}
+                          </span>
                           {h.nb_trajets > 9 && (
                             <span title="Trajets 10+ stockés (alerte « nombre exceptionnel »)"
                               className="ml-1 rounded bg-sky-500/15 px-1 text-[10px] font-bold text-sky-500">+{h.nb_trajets - 9}</span>

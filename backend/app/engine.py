@@ -477,29 +477,30 @@ def recalculer_temps(db, suivi: SuiviJournalier, maintenant: datetime):
             and (maintenant - derniere.fin).total_seconds() >= pause_tcc):
         tcc = 0.0
 
-    # ── Correctif v1.46 (arbitrage LSS du 04/09/2026) — deux garde-fous qui
-    # ramènent le chrono à ZÉRO, demandés par l'exploitant :
-    # (a) MINI-MANŒUVRES CUMULÉES : la durée TOTALE des trajets invalides
-    #     (manœuvres < 0,3 km, rejetées) de la session courante atteint
-    #     SEUIL_PAUSE_COUPURE_TCC (30 min) → le camion est en réalité à l'arrêt
-    #     depuis une pause coupante → TCC = 0 (AM-6 étendu : avant, une
-    #     manœuvre ne coupait que si ELLE SEULE faisait ≥ 30 min).
-    # (b) LIGNE OUVERTE + CAMION ARRÊTÉ : une ligne « en cours » (GPS muet ou
-    #     signal de roulage absent) faisait courir le chrono INDÉFINIMENT —
-    #     même camion garé depuis des heures. Si le camion ne roule PAS
-    #     (etat_roulage, signal > 15 min ou vitesse ≤ 3 km/h) et que le
-    #     dernier signal connu date de ≥ 30 min → TCC = 0 (H2 honoré :
-    #     en dessous de 30 min le chrono continue de s'écouler).
-    if session:
-        debut_session = session[0].debut
-        fin_session_ref = fin_session
-        manoeuvres_s = sum(
-            (s.fin - s.debut).total_seconds()
-            for s in segs_tous
-            if s.rejete and s.debut is not None and s.fin is not None
-            and debut_session <= s.debut <= fin_session_ref)
-        if manoeuvres_s >= pause_tcc:
-            tcc = 0.0
+    # ── v1.53 (18/09/2026) — ARBITRAGE LSS : le TCC se coupe par
+    # INTERRUPTION, jamais par cumul. La règle v1.46 (a) « mini-manœuvres
+    # CUMULÉES de la session ≥ 30 min → TCC = 0 » est ABROGÉE : sa fenêtre
+    # (`debut_session` → `fin_session_ref`) ne se refermait jamais, si bien que
+    # 32 min de manœuvres réparties sur la journée figeaient le chrono à zéro
+    # POUR TOUT LE RESTE DE LA JOURNÉE, alors que deux interruptions de 16 min
+    # séparées par de la conduite ne constituent pas une pause de 30 min.
+    #
+    # La coupure est portée par la durée de l'INTERRUPTION entre deux trajets
+    # valides consécutifs — boucle ci-dessus, `lg.gap_brut_s ≥ 30 min` — et
+    # cette interruption CONTIENT les mini-manœuvres (un segment rejeté ne
+    # produit aucune ligne, il est donc compté dans l'écart, jamais ajouté au
+    # temps de conduite). Une interruption ≥ 30 min qui contient des
+    # mini-manœuvres coupe donc la session ET s'affiche en pause (colonne
+    # pause : `pause_apres_s`, seuil SEUIL_AFFICHAGE_PAUSE_MIN). Les
+    # mini-manœuvres ne deviennent jamais des trajets affichés et ne démarrent
+    # jamais une session (le départ est le 1ᵉʳ trajet valide — AM-6).
+    #
+    # Reste le garde-fou (b), INCHANGÉ : une ligne « en cours » (GPS muet ou
+    # signal de roulage absent) faisait courir le chrono INDÉFINIMENT — même
+    # camion garé depuis des heures. Si le camion ne roule PAS (etat_roulage,
+    # signal > 15 min ou vitesse ≤ 3 km/h) et que le dernier signal connu date
+    # de ≥ 30 min → TCC = 0 (H2 honoré : en dessous de 30 min, le chrono
+    # continue de s'écouler).
     if (session and session[-1].fin is None
             and not roule and fin_sub is not None
             and (maintenant - fin_sub).total_seconds() >= pause_tcc):

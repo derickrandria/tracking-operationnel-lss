@@ -450,15 +450,18 @@ try:
           >= int((h.donnees or {}).get("tcj_s") or 0),
           f"tcj={None if h is None else (h.donnees or {}).get('tcj_s')} "
           f"ttj={None if h is None else (h.donnees or {}).get('ttj_s')}")
-    # ARBITRAGE G1 (CONSERVÉ le 18/09/2026) : l'archive fige la vue d'ÉCRAN
-    # (v1.13 « écran = export = archive ») — les 2 trajets séparés de 10 min y
-    # apparaissent comme UNE ligne fusionnée. Le CALCUL, lui, a bien compté les
-    # deux (TCJ = 1 h 30 + 1 h 15 = 9 900 s). C'est la séparation des domaines :
-    # la projection peut fusionner, les compteurs ne dépendent jamais d'elle.
-    check("l'archive fige la vue d'écran fusionnée (G1 conservée : 1 ligne "
-          "pour 2 trajets séparés de 10 min)",
-          h is not None and int((h.donnees or {}).get("nb_trajets") or 0) == 1,
-          f"nb={None if h is None else (h.donnees or {}).get('nb_trajets')}")
+    # ARBITRAGE G1 (CONSERVÉ le 18/09/2026) puis v1.53 : le snapshot conserve
+    # les trajets BRUTS (aucun trajet valide perdu en base) et `nb_trajets`
+    # compte les SÉQUENCES affichées — les 2 trajets séparés de 10 min forment
+    # UNE séquence à l'écran et restent DEUX en base. Le CALCUL, lui, a bien
+    # compté les deux (TCJ = 1 h 30 + 1 h 15 = 9 900 s).
+    check("l'archive conserve les 2 trajets valides BRUTS et compte 1 séquence "
+          "affichée (G1 conservée : la projection ne réécrit pas la base)",
+          h is not None and len((h.donnees or {}).get("trajets") or []) == 2
+          and int((h.donnees or {}).get("nb_trajets") or 0) == 1
+          and int((h.donnees or {}).get("nb_trajets_valides_reels") or 0) == 2,
+          f"bruts={None if h is None else len((h.donnees or {}).get('trajets') or [])} "
+          f"seq={None if h is None else (h.donnees or {}).get('nb_trajets')}")
     check("…tandis que le CALCUL a bien compté les DEUX trajets (TCJ = 9 900 s)",
           h is not None and int((h.donnees or {}).get("tcj_s") or 0) == 9900,
           f"tcj={None if h is None else (h.donnees or {}).get('tcj_s')}")

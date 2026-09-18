@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from ..config import now_local
 from ..database import get_db
 from ..engine import get_seuils
-from ..exporters import export_excel, export_pdf
+from ..exporters import NOTE_TCC_CONVENTION, export_excel, export_pdf
 from ..models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
                       Vehicule)
 from ..security import TOUS, audit, require_roles
@@ -224,6 +224,9 @@ def _lignes_export(items):
             # sérialiseur ; on rend « 0:00 » quand le drapeau d'affichage est levé).
             ("0:00" if d.get("tcc_masque") else fmt_hms(d.get("tcc_s") or 0)),
             fmt_hms(d.get("tcj_s") or 0), fmt_hms(d.get("ttj_s") or 0),
+            # v1.53 — « Trajets » = nb_trajets = SÉQUENCES affichées (un seul
+            # sens partagé base / écran / export ; le réel est dans
+            # `nb_trajets_valides_reels`, les absorbés dans `nb_trajets_fusionnes`).
             d.get("nb_trajets") or 0, round(d.get("km_parcourus") or 0, 1),
             h.nb_infractions, h.nb_alertes,
         ])
@@ -243,7 +246,8 @@ def export_historique_xlsx(annee: int | None = None, mois: int | None = None,
     items = db.scalars(select(HistoriqueJournalier).where(
         HistoriqueJournalier.annee == annee, HistoriqueJournalier.mois == mois)
         .order_by(HistoriqueJournalier.date_jour.desc())).all()
-    contenu = export_excel(f"Historique {mois:02d}/{annee}", HEADERS, _lignes_export(items))
+    contenu = export_excel(f"Historique {mois:02d}/{annee}", HEADERS,
+                           _lignes_export(items), note=NOTE_TCC_CONVENTION)
     return Response(contenu, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f"attachment; filename=historique_{annee}_{mois:02d}.xlsx"})
 
@@ -256,7 +260,8 @@ def export_historique_pdf(annee: int | None = None, mois: int | None = None,
     items = db.scalars(select(HistoriqueJournalier).where(
         HistoriqueJournalier.annee == annee, HistoriqueJournalier.mois == mois)
         .order_by(HistoriqueJournalier.date_jour.desc()).limit(1500)).all()
-    contenu = export_pdf(f"Historique de {mois:02d}/{annee}", HEADERS, _lignes_export(items))
+    contenu = export_pdf(f"Historique de {mois:02d}/{annee}", HEADERS,
+                         _lignes_export(items), note=NOTE_TCC_CONVENTION)
     return Response(contenu, media_type="application/pdf",
                     headers={"Content-Disposition": f"attachment; filename=historique_{annee}_{mois:02d}.pdf"})
 

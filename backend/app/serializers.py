@@ -315,6 +315,18 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     return res
 
 
+def compter_trajets_reels(trajets: list[dict] | None) -> int:
+    """Nombre de trajets valides RÉELS représentés par une liste de lignes —
+    fusionnée ou non (v1.53, 18/09/2026).
+
+    `fusionner_trajets_affichage` pose sur chaque séquence la clé `segments` =
+    nombre de trajets valides absorbés ; une ligne non fusionnée vaut 1. Cette
+    fonction est la SEULE façon de retrouver le réel à partir de la vue
+    d'affichage — y compris pour les archives écrites avant v1.53 (dont le
+    snapshot ne porte pas encore `nb_trajets_valides_reels`)."""
+    return sum(max(1, int(t.get("segments") or 1)) for t in (trajets or []))
+
+
 def fusionner_snapshot(donnees: dict | None, seuils: dict | None = None) -> dict:
     """Copie d'un snapshot (s_suivi / archive) avec trajets fusionnés E1 —
     jamais de mutation de `donnees` (les archives ne sont pas réécrites).
@@ -339,7 +351,23 @@ def fusionner_snapshot(donnees: dict | None, seuils: dict | None = None) -> dict
             seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN",
                                                PAUSE_AFFICHAGE_S)))
         d["trajets"] = fusionnes
+        # v1.53 (18/09/2026) — TROIS COMPTEURS DISTINCTS (arbitrage LSS) :
+        # `nb_trajets` ne porte plus qu'UNE signification, partout (écran,
+        # export, archive) = le nombre de SÉQUENCES affichées ; le réel et les
+        # absorbés sont exposés séparément. Recalculés ici depuis `segments`,
+        # ils sont donc corrects même pour les archives antérieures à v1.53.
+        _reels = compter_trajets_reels(fusionnes)
         d["nb_trajets"] = len(fusionnes)
+        d["nb_sequences_affichees"] = len(fusionnes)
+        d["nb_trajets_valides_reels"] = _reels
+        d["nb_trajets_fusionnes"] = max(0, _reels - len(fusionnes))
+    else:
+        # aucune ligne exploitable (archive ancienne ou journée sans trajet) :
+        # on complète les compteurs sans jamais écraser une valeur présente.
+        _nb = int(d.get("nb_trajets") or 0)
+        d.setdefault("nb_sequences_affichees", _nb)
+        d.setdefault("nb_trajets_valides_reels", _nb)
+        d.setdefault("nb_trajets_fusionnes", 0)
     # N1 — l'affichage masque le TCC d'une journée close, la DONNÉE reste intacte.
     d["tcc_masque"] = True
     return d
@@ -422,7 +450,18 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         # §0undecies E1 (24/08/2026) : fusion d'AFFICHAGE des ruptures < 20 min
         # (« sans bonder les colonnes » ; compteurs AM-1/TCC intacts, E2).
         "trajets": lignes_json,
+        # v1.53 (18/09/2026) — compteurs DISTINCTS (arbitrage LSS du 18/09) :
+        #   nb_trajets_valides_reels = trajets valides en BASE (distance ≥ 0,3 km)
+        #   nb_sequences_affichees   = lignes réellement rendues (après regroupement)
+        #   nb_trajets_fusionnes     = trajets valides absorbés par le regroupement
+        # `nb_trajets` garde UN SEUL sens : c'est le nombre de séquences
+        # affichées (identique à `nb_sequences_affichees`), donc identique en
+        # base, à l'écran et à l'export.
         "nb_trajets": len(lignes_json),
+        "nb_sequences_affichees": len(lignes_json),
+        "nb_trajets_valides_reels": compter_trajets_reels(lignes_json),
+        "nb_trajets_fusionnes": max(
+            0, compter_trajets_reels(lignes_json) - len(lignes_json)),
         "mission_id": s.mission_id,
         # drapeaux de dépassement (pour coloration frontend)
         "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
@@ -655,7 +694,17 @@ def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = No
         "total_pause_s": pause_val,
         "total_pause_str": fmt_hms_journee(pause_val),
         "trajets": d.get("trajets") or [],
-        "nb_trajets": d.get("nb_trajets") or len(d.get("trajets") or []),
+        # v1.53 — mêmes compteurs distincts qu'au suivi (un seul sens partagé)
+        "nb_trajets": (d.get("nb_sequences_affichees")
+                       or d.get("nb_trajets") or len(d.get("trajets") or [])),
+        "nb_sequences_affichees": (d.get("nb_sequences_affichees")
+                                   or d.get("nb_trajets")
+                                   or len(d.get("trajets") or [])),
+        "nb_trajets_valides_reels": (d.get("nb_trajets_valides_reels")
+                                     or compter_trajets_reels(d.get("trajets"))),
+        "nb_trajets_fusionnes": (d.get("nb_trajets_fusionnes")
+                                 or max(0, compter_trajets_reels(d.get("trajets"))
+                                        - int(d.get("nb_trajets") or 0))),
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,
         # drapeaux de dépassement (v1.52 : calculés sur la valeur RÉELLE,

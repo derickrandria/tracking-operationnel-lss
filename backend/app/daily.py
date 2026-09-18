@@ -41,7 +41,8 @@ from .models import (Alerte, AuditLog, GraviteAlerte, HistoriqueJournalier,
                      Infraction, StatutAlerte, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet,
                      TypeAlerte, Vehicule, uid)
-from .serializers import iso, s_suivi
+from .serializers import (compter_trajets_reels, fusionner_trajets_affichage,
+                       iso, journee_suivi, s_ligne, s_suivi)
 
 log = logging.getLogger("lss.daily")
 
@@ -490,6 +491,23 @@ def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | Non
             # sérialisation » n'a de sens que si elle lit l'état réel.
             db.expire(s, ["trajets"])
             d = s_suivi(s, seuils)
+
+            # v1.53 (18/09/2026) — le snapshot d'archive conserve les trajets
+            # BRUTS (un trajet valide n'est JAMAIS perdu en base : ici on
+            # stockait la vue déjà fusionnée) et déclare les compteurs
+            # distincts — `nb_trajets` = SÉQUENCES affichées, un seul sens.
+            _journee_brute = journee_suivi(s, seuils)
+            d["trajets"] = [s_ligne(lg, i)
+                            for i, lg in enumerate(_journee_brute.lignes, start=1)]
+            _seqs = fusionner_trajets_affichage(
+                d["trajets"],
+                seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S", 1800)),
+                seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN", 1800)))
+            d["nb_trajets_valides_reels"] = compter_trajets_reels(d["trajets"])
+            d["nb_sequences_affichees"] = len(_seqs)
+            d["nb_trajets_fusionnes"] = max(
+                0, d["nb_trajets_valides_reels"] - len(_seqs))
+            d["nb_trajets"] = len(_seqs)
 
             nb_inf = db.scalar(select(func.count(Infraction.id)).where(
                 Infraction.date_jour == jour, Infraction.vehicule_id == v.id,

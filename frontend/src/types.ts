@@ -121,7 +121,12 @@ export interface SuiviLigne {
   total_pause_s: number;
   km_parcourus: number;
   trajets: Trajet[];
+  /** v1.53 — `nb_trajets` = nb de SÉQUENCES affichées (un seul sens, partagé
+      base / écran / export) ; le réel et les regroupés sont exposés à part. */
   nb_trajets: number;
+  nb_sequences_affichees?: number;
+  nb_trajets_valides_reels?: number;
+  nb_trajets_fusionnes?: number;
   mission_id: string | null;
   flag_tcc: boolean;
   flag_tcj: boolean;

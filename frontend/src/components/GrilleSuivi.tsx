@@ -51,7 +51,11 @@ function Temps({ secondes, depasse }: { secondes: number | string | null | undef
   if (secondes === null || secondes === undefined) return <span className="text-slate-400">—</span>;
   const sNum = typeof secondes === "number" ? secondes : (Number(secondes) || 0);
   if (!sNum) return <span className="text-slate-400">—</span>;
-  const isDepasse = Boolean(depasse || sNum > 36000);
+  // v1.53 — le drapeau vient du BACK (`flag_tcj` / `flag_ttj`), calculé sur les
+  // seuils PARAMÉTRÉS (TCJ 10 h, TTJ 12 h). Le repli codé en dur à 10 h
+  // (`sNum > 36000`) rougissait un TTJ de 10 h 30 alors que son seuil est 12 h :
+  // il est supprimé — un seuil ne se fige pas dans l'affichage.
+  const isDepasse = Boolean(depasse);
   return (
     <span className={cls("font-bold tabular-nums", isDepasse ? "text-red-500 font-extrabold" : "text-slate-700 dark:text-slate-200")}>
       {fmtDuree(sNum, true)}
@@ -66,7 +70,11 @@ function Temps({ secondes, depasse }: { secondes: number | string | null | undef
 function CelluleTCC({ secondes, seuilMax, masque }: { secondes: number; seuilMax: number; masque?: boolean }) {
   // §0vicies decies N1 (31/08/2026) : journée terminée → cellule TCC « 0:00 »
   // (le chrono temps réel n'a pas de sens sur des trajets déjà terminés).
-  if (masque) return <span className="font-bold tabular-nums text-slate-500 dark:text-slate-400" title="Le TCC est un chrono temps réel : il n'est affiché que sur la journée en cours">0:00</span>;
+  // v1.53 (18/09/2026) — une journée close n'affiche plus « 0:00 » (qui se lit
+  // comme une mesure) mais « — » (non applicable à l'écran) ; l'EXPORT garde la
+  // convention « 0:00 » accompagnée de sa note. Dans les deux cas la valeur
+  // réelle reste en base : c'est un rendu, jamais une destruction du calcul.
+  if (masque) return <span className="font-bold tabular-nums text-slate-400" title="TCC non applicable à l'écran sur une journée close (chrono temps réel) — la valeur calculée reste conservée en base et dans l'archive">—</span>;
   if (!secondes) return <span className="text-slate-400">—</span>;
   const restant = seuilMax - secondes;
   const depasse = restant < 0;

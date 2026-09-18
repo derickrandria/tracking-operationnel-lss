@@ -4,7 +4,7 @@ FastAPI : API REST (/api), WebSocket (/ws) pour le temps réel (§9),
 documentation OpenAPI/Swagger (/docs), service du frontend React (SPA).
 """
 
-APP_VERSION = "1.51"   # visible au démarrage (fenêtre noire) et dans le bandeau latéral
+APP_VERSION = "1.53"   # visible au démarrage (fenêtre noire) et dans le bandeau latéral
 import asyncio
 import logging
 import os

@@ -174,10 +174,25 @@ check("A5 manœuvre 06:08 (0,0 km) ignorée — aucune ligne posée",
 h2 = db.scalar(select(HistoriqueJournalier).where(
     HistoriqueJournalier.date_jour == JOUR,
     HistoriqueJournalier.vehicule_id == v.id))
-check("A6 archive J-1 régénérée EN PLACE : 5 lignes dans le snapshot",
-      bool(h2) and h2.donnees.get("nb_trajets") == 5
-      and len(h2.donnees.get("trajets") or []) == 5,
-      str(h2.donnees.get("nb_trajets")) if h2 else "archive absente")
+# v1.53 (18/09/2026) — RÉVISION DE L'ASSERTION A6 (arbitrage LSS « nb_trajets n'a
+# qu'un seul sens »). Jusqu'ici `nb_trajets` valait, DANS LE SNAPSHOT, le nombre
+# de trajets valides réels, tandis que la lecture le réinterprétait comme le
+# nombre de SÉQUENCES affichées : le même nom portait deux valeurs. Depuis
+# v1.53 : le snapshot conserve les trajets BRUTS (aucun trajet valide perdu en
+# base) et `nb_trajets` = `nb_sequences_affichees` ; le réel est exposé par
+# `nb_trajets_valides_reels`. L'assertion d'origine (5 lignes ET nb_trajets == 5)
+# confondait les deux — elle est remplacée par les deux contrôles distincts.
+check("A6 archive J-1 régénérée EN PLACE : 5 trajets valides BRUTS dans le snapshot",
+      bool(h2) and len(h2.donnees.get("trajets") or []) == 5
+      and h2.donnees.get("nb_trajets_valides_reels") == 5,
+      str(h2.donnees.get("nb_trajets_valides_reels")) if h2 else "archive absente")
+check("A6bis v1.53 — `nb_trajets` = SÉQUENCES affichées = `nb_sequences_affichees` "
+      "(plus de double sens), et regroupés = 5 − séquences",
+      bool(h2) and h2.donnees.get("nb_trajets") == h2.donnees.get("nb_sequences_affichees")
+      and h2.donnees.get("nb_trajets_fusionnes")
+      == 5 - h2.donnees.get("nb_trajets"),
+      f"{h2.donnees.get('nb_trajets')}/{h2.donnees.get('nb_sequences_affichees')}"
+      f"/{h2.donnees.get('nb_trajets_fusionnes')}" if h2 else "archive absente")
 aud_raff = db.scalar(select(func.count(AuditLog.id)).where(
     AuditLog.action == "archive.raffraichie")) or 0
 check("A7 audit « archive.raffraichie » inscrit (avant → après)",

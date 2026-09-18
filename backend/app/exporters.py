@@ -33,7 +33,22 @@ def _logo_excel(hauteur_px: int = 30):
         return None
 
 
-def export_excel(titre: str, headers: list[str], rows: list[list]) -> bytes:
+# v1.53 (18/09/2026) — NOTE DE CONVENTION d'affichage. L'interface masque le
+# TCC d'une journée close par « — » ; l'export, lui, porte « 0:00 » : cette
+# convention doit être ÉCRITE dans le fichier, sinon elle se lit comme une
+# donnée (le vrai TCC reste conservé en base et dans les archives).
+NOTE_TCC_CONVENTION = (
+    "Convention d'affichage : dans la colonne TCC, « 0:00 » signale une journée "
+    "clôturée pour laquelle le temps de conduite continue (chrono de session) "
+    "n'est pas applicable. C'est une valeur d'AFFICHAGE : le TCC réellement "
+    "calculé reste conservé en base et dans les archives (audit / "
+    "contre-vérification)." + " Une colonne « Trajets » compte les SÉQUENCES "
+    "affichées : le nombre de trajets valides RÉELS et le nombre de trajets "
+    "regroupés à l'affichage sont indiqués séparément dans la synthèse.")
+
+
+def export_excel(titre: str, headers: list[str], rows: list[list],
+                 note: str | None = None) -> bytes:
     import re
     wb = Workbook()
     ws = wb.active
@@ -66,12 +81,24 @@ def export_excel(titre: str, headers: list[str], rows: list[list]) -> bytes:
     ws.freeze_panes = "A3"
     ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}{len(rows) + 2}"
 
+    # v1.53 — note de convention, sous le tableau (jamais dans une colonne de
+    # données : un lecteur ne peut pas la confondre avec une valeur calculée).
+    if note:
+        ligne = len(rows) + 4
+        ws.merge_cells(start_row=ligne, start_column=1,
+                       end_row=ligne, end_column=len(headers))
+        cell = ws.cell(row=ligne, column=1, value="ⓘ  " + note)
+        cell.font = Font(size=8.5, italic=True, color="5A6B7C")
+        cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        ws.row_dimensions[ligne].height = 42
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def export_pdf(titre: str, headers: list[str], rows: list[list]) -> bytes:
+def export_pdf(titre: str, headers: list[str], rows: list[list],
+               note: str | None = None) -> bytes:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet
@@ -103,6 +130,11 @@ def export_pdf(titre: str, headers: list[str], rows: list[list]) -> bytes:
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(table)
+    # v1.53 — note de convention sous le tableau
+    if note:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"<i>ⓘ  {note}</i>",
+                               getSampleStyleSheet()["Normal"]))
     doc.build(story)
     return buf.getvalue()
 
@@ -227,7 +259,12 @@ def _valeurs_suivi(l: dict, detail: bool, excel: bool) -> list:
         # §0vicies decies N2 — Pos. 20h/22h (relevés automatiques du soir)
         l.get("position_20h") or "—", l.get("position_22h") or "—",
         # Addendum v1.9 §4 — TCC/TCJ/TTJ en premier (alerte en priorité)
-        duree(l.get("tcc_s")), duree(l.get("tcj_s")), duree(l.get("ttj_s")),
+        # v1.53 (18/09/2026) — convention d'AFFICHAGE à l'export : une journée
+        # close porte « 0:00 » (l'interface affiche « — ») et la note
+        # NOTE_TCC_CONVENTION accompagne le fichier. La valeur `tcc_s` n'est
+        # jamais détruite : elle reste en base, contrôlable et exportable.
+        duree(0 if l.get("tcc_masque") else l.get("tcc_s")),
+        duree(l.get("tcj_s")), duree(l.get("ttj_s")),
         _hhmm(l.get("heure_depart")),
     ]
     if detail:
@@ -372,6 +409,18 @@ def _ecrire_feuille_suivi(wb: Workbook, nom: str, ligne_titre: str,
                        value="ⓘ  " + NOTE_LEGENDE_PROVISOIRE)
         note.font = Font(size=8.5, italic=True, color=COULEUR_PROVISOIRE)
         note.alignment = Alignment(horizontal="left")
+
+    # --- v1.53 (18/09/2026) — note de CONVENTION TCC, dans les DEUX modes :
+    # l'export porte « 0:00 » là où l'interface affiche « — » pour une journée
+    # close. Sans cette note, « 0:00 » se lirait comme une donnée alors que le
+    # TCC réel reste conservé en base et dans les archives (arbitrage LSS).
+    ligne_tcc = len(lignes) + 4 + (2 if detail else 0)
+    ws.merge_cells(start_row=ligne_tcc, start_column=1,
+                   end_row=ligne_tcc, end_column=ncols)
+    cell_tcc = ws.cell(row=ligne_tcc, column=1, value="ⓘ  " + NOTE_TCC_CONVENTION)
+    cell_tcc.font = Font(size=8.5, italic=True, color="5A6B7C")
+    cell_tcc.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    ws.row_dimensions[ligne_tcc].height = 42
 
     # --- finitions : largeurs auto, figeage, filtres (§3.4)
     echantillon_txt = [_valeurs_suivi(l, detail, excel=False) for l in lignes[:120]]
@@ -813,6 +862,9 @@ def export_missions_pdf(titre_periode: str, missions: list[dict],
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(t)
+    # v1.53 — note de convention TCC (« 0:00 » = affichage, donnée conservée)
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"<i>ⓘ  {NOTE_TCC_CONVENTION}</i>", petit))
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()
