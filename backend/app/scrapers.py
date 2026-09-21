@@ -2893,6 +2893,13 @@ def boucle_collecte():
                      "— jeton API absent, §5)",
                      ", ".join(nom for nom, _ in classes))
     log.info("Boucle de collecte %s démarrée (toutes les %ds)", source, periode)
+    # QC étape 1 (21/09/2026) — la configuration de la fenêtre de rattrapage est
+    # AFFICHÉE au démarrage : profondeur (3 h) et taille de tranche (15 min) sont
+    # deux réglages distincts, contrôlables dans le journal du serveur.
+    log.info("MZoneX — profondeur de rattrapage : %d s (%dh) · tranche de payload : "
+             "%d s · %d tranche(s) pour une fenêtre pleine",
+             FENETRE_MAX_S, FENETRE_MAX_S // 3600, TRANCHE_S,
+             max(1, FENETRE_MAX_S // max(60, TRANCHE_S)))
     # §0septies B4 — géozones des deux portails (gate « en zone / hors zone »
     # de l'alerte vitesse en direct) : chargée au démarrage, auto-rechargée
     # toutes les 6 h par le cache interne — jamais d'exception ici (§10)
