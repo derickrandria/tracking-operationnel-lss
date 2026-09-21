@@ -67,16 +67,25 @@ def liste_suivi(date: str | None = None, db: Session = Depends(get_db),
     # « source X en panne — collecte interrompue » (badge rouge) au lieu de
     # « boîtier muet — données en transit » (orange) quand la panne est
     # GLOBALE à un portail, et non propre à un boîtier.
-    from ..scrapers import sources_en_echec, sources_en_echec_detail
+    from ..messages_collecte import messages_par_source
+    from ..scrapers import (etat_metriques_par_source, sources_en_echec,
+                            sources_en_echec_detail)
     # v1.50 — l'écran doit pouvoir dire POURQUOI il est muet : un portail en
     # panne (rien à attendre du portail) et une collecte bloquée localement
     # (base verrouillée, disque) n'appellent pas la même réaction.
     detail = sources_en_echec_detail()
+    # R7 — l'écran reçoit la CAUSE RÉELLE par source (issue + classe + phase) et
+    # le message correspondant : il n'a plus à la déduire d'une catégorie
+    # grossière (« locale »), qui faisait afficher « base verrouillée » pour un
+    # simple dépassement de budget ou un portail lent.
     return {"date": jour.isoformat(), "seuils": seuils, "lignes": lignes,
             "sources_en_echec": sources_en_echec(),
             "sources_en_echec_detail": detail,
+            "collecte_par_source": messages_par_source(
+                etat_metriques_par_source()),
             "sources_bloquees_localement": [
-                d["source"] for d in detail if d.get("categorie") == "locale"]}
+                d["source"] for d in detail
+                if d.get("classe") == "attente_sqlite"]}
 
 
 class SuiviPatch(BaseModel):

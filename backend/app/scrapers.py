@@ -72,10 +72,13 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from .concurrence import (BudgetDepasse, PasseCourante, Possession,
                           VerrouOccupe, activer_passe, chrono, classer_erreur,
-                          compter, enregistrer_passe, etat_famille,
-                          forcer_famille, metriques_publiees, passe_courante, passe_de,
-                          passes_en_cours, publier_metriques, retirer_passe,
-                          verifier_etape, verrou_de)
+                          ETAPES, commit_autorise, compter, cumul_publie,
+                          cycles_par_source, enregistrer_passe,
+                          enregistrer_progression, etat_famille, fermer_cycle,
+                          forcer_famille, metriques_publiees, ouvrir_cycle,
+                          passe_courante, passe_de, passes_en_cours,
+                          progression, publier_metriques, restant_budget,
+                          retirer_passe, verifier_etape, verrou_de)
 from .config import (TZ, normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
@@ -280,22 +283,46 @@ def categorie_erreur(exc: Exception) -> str:
 
 
 def _etat_collecte_debut(source: str):
+    """Début de cycle — PAR SOURCE (R18).
+
+    Les clés globales `dernier_cycle_debut`/`_fin` restent publiées pour la
+    compatibilité de lecture, mais elles ne servent plus à juger une inversion :
+    chaque source a SON cycle (`concurrence.cycles_par_source`).
+    """
+    instant = now_local().isoformat()
+    ouvrir_cycle(source, instant)
     with _ETAT_COLLECTE_LOCK:
-        instant = now_local().isoformat()
         _ETAT_COLLECTE["dernier_cycle_debut"] = instant
         _ETAT_COLLECTE["sources"].setdefault(source, {})["dernier_debut"] = instant
 
 
 def _etat_collecte_fin(source: str, nombre: int):
+    """Fin de cycle RÉUSSIE — efface l'erreur de CETTE source (R15).
+
+    L'erreur n'est pas perdue : elle passe dans l'historique
+    (`derniere_erreur_historique`), la dernière réussite et la dernière passe
+    réussie restent visibles. Avant le 21/09, une erreur N2 restait affichée
+    indéfiniment parce que la passe N2 n'appelait jamais cette fonction.
+    """
+    instant = now_local().isoformat()
+    fermer_cycle(source, instant, "TERMINE")
     with _ETAT_COLLECTE_LOCK:
-        instant = now_local().isoformat()
         _ETAT_COLLECTE["dernier_cycle_fin"] = instant
-        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
-            {"derniere_reussite": instant, "dernier_nombre": nombre,
-             "derniere_erreur": None, "derniere_erreur_categorie": None})
+        etat = _ETAT_COLLECTE["sources"].setdefault(source, {})
+        if etat.get("derniere_erreur"):
+            etat["derniere_erreur_historique"] = {
+                "erreur": etat.get("derniere_erreur"),
+                "classe": etat.get("derniere_erreur_classe"),
+                "etape": etat.get("derniere_erreur_etape"),
+                "vue_le": etat.get("derniere_erreur_le")}
+        etat.update({"derniere_reussite": instant, "dernier_nombre": nombre,
+                     "derniere_erreur": None, "derniere_erreur_categorie": None,
+                     "derniere_erreur_classe": None, "derniere_erreur_etape": None})
 
 
 def _etat_collecte_erreur(source: str, exc: Exception):
+    """R14 — consigne la PHASE réelle, le MOTIF d'annulation et l'ISSUE dans des
+    champs distincts, sans jamais écraser une phase connue par un motif."""
     """Enregistre l'échec AVEC sa classe fine (v1.54) : c'est cette classe qui
     alimente le statut de santé. `categorie` reste la valeur historique
     (« locale » / « portail ») pour ne rien casser des contrats existants."""
@@ -303,11 +330,26 @@ def _etat_collecte_erreur(source: str, exc: Exception):
     with _ETAT_COLLECTE_LOCK:
         erreur = f"{type(exc).__name__}: {exc}"
         _ETAT_COLLECTE["derniere_erreur"] = erreur
-        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
+        etat = _ETAT_COLLECTE["sources"].setdefault(source, {})
+        etat.update(
             {"derniere_erreur": erreur,
+             "derniere_erreur_le": now_local().isoformat(),
              "derniere_erreur_categorie": categorie_erreur(exc),
              "derniere_erreur_classe": classe["classe"],
-             "derniere_erreur_etape": classe.get("etape")})
+             "derniere_erreur_etape": classe.get("etape"),
+             "derniere_erreur_phase": (getattr(exc, "etape", None)
+                                       if getattr(exc, "etape", None) in ETAPES
+                                       else etat.get("derniere_erreur_phase")),
+             "derniere_erreur_raison": getattr(exc, "raison_annulation", None),
+             "derniere_erreur_issue": getattr(exc, "issue", None)})
+
+
+def _sources_en_erreur() -> set:
+    """Sources ayant une erreur ACTIVE (pour distinguer une réussite réelle
+    d'une passe qui a échoué en chemin)."""
+    with _ETAT_COLLECTE_LOCK:
+        return {nom for nom, etat in _ETAT_COLLECTE["sources"].items()
+                if isinstance(etat, dict) and etat.get("derniere_erreur")}
 
 
 def _noter_verrou_refuse(source: str) -> None:
@@ -318,6 +360,73 @@ def _noter_verrou_refuse(source: str) -> None:
             {"dernier_verrou_refuse": now_local().isoformat()})
         refus = _ETAT_COLLECTE.setdefault("verrous_refuses", {})
         refus[source] = int(refus.get(source, 0)) + 1
+
+
+def etat_metriques_par_source() -> dict[str, dict]:
+    """R2/R6/R9 — l'état COMPLET d'une source, en cinq blocs SÉPARÉS.
+
+    Ne jamais mélanger la passe en cours et la dernière passe publiée : ce sont
+    deux mesures différentes, à deux instants différents.
+
+      · `passe_actuelle`  : en cours (fin = null, issue = "en_cours", durée vive) ;
+      · `derniere_passe`  : dernière passe PUBLIÉE (durée, phase, issue, annulée) ;
+      · `dernier_resultat`: ce qu'elle a produit (pages, lignes, écritures) ;
+      · `cumul`           : passes, somme des durées, moyenne ;
+      · `derniere_erreur` : l'erreur ACTIVE (None après une réussite — R15).
+    """
+    publiees = metriques_publiees()
+    cumuls = cumul_publie()
+    actives = passes_en_cours()
+    with _ETAT_COLLECTE_LOCK:
+        sources = {k: dict(v) for k, v in _ETAT_COLLECTE["sources"].items()}
+    cycles = cycles_par_source().get("cycles", {})
+
+    def _nom_ressource(source: str) -> str:
+        return source
+
+    etat: dict[str, dict] = {}
+    for source in sorted(set(publiees) | set(cumuls) | set(sources)
+                         | set(actives) | set(cycles)):
+        derniere = dict(publiees.get(source) or {})
+        cumul = dict(cumuls.get(source) or {})
+        passes = int(cumul.get("passes") or 0)
+        total_cumule = float(cumul.get("total_s") or 0.0)
+        etat_source = sources.get(source) or {}
+        erreur_active = etat_source.get("derniere_erreur")
+        etat[_nom_ressource(source)] = {
+            "source": source,
+            "passe_actuelle": dict(actives[source]) if source in actives else None,
+            "derniere_passe": derniere or None,
+            "dernier_resultat": ({"pages": derniere.get("nb_pages"),
+                                  "lignes_lues": derniere.get("nb_lignes_lues"),
+                                  "lignes_ecrites": derniere.get("nb_lignes_ecrites"),
+                                  "points_ecrits": derniere.get("nb_points_ecrits"),
+                                  "vehicules": derniere.get("nb_vehicules"),
+                                  "issue": derniere.get("issue"),
+                                  "phase": derniere.get("phase")}
+                                 if derniere else None),
+            "cumul": {"passes": passes, "total_s": round(total_cumule, 3),
+                      "moyenne_s": (round(total_cumule / passes, 3) if passes else None),
+                      "issues": dict(cumul.get("issues") or {}),
+                      "derniere_reussie": cumul.get("derniere_reussie"),
+                      "dernier_echec": cumul.get("dernier_echec")},
+            "derniere_erreur": ({"erreur": erreur_active,
+                                 "classe": etat_source.get("derniere_erreur_classe"),
+                                 "etape": etat_source.get("derniere_erreur_etape"),
+                                 "phase": etat_source.get("derniere_erreur_phase"),
+                                 "raison_annulation": etat_source.get("derniere_erreur_raison"),
+                                 "issue": etat_source.get("derniere_erreur_issue"),
+                                 "vue_le": etat_source.get("derniere_erreur_le")}
+                                if erreur_active else None),
+            "erreur_active": bool(erreur_active),
+            "historique_erreur": etat_source.get("derniere_erreur_historique"),
+            "derniere_reussite": etat_source.get("derniere_reussite"),
+            "dernier_debut": etat_source.get("dernier_debut"),
+            "derniere_issue": etat_source.get("derniere_issue"),
+            "cycle": cycles.get(source),
+            "non_applicables": (derniere.get("non_applicables") or []),
+        }
+    return etat
 
 
 def etat_collecte_memoire() -> dict:
@@ -344,6 +453,11 @@ def etat_collecte_memoire() -> dict:
         "verrous_par_source": verrous_n1["par_source"],
         "collecte_en_cours": bool(verrous_n1["acquis_par"]),
         "metriques_collecte": metriques_publiees(),
+        # R2/R6/R9 — état COMPLET par source (passe en cours séparée de la
+        # dernière passe publiée, cumul, moyenne, erreur active, cycle).
+        "metriques_par_source": etat_metriques_par_source(),
+        "cycles_par_source": cycles_par_source(),
+        "progression_relecture": progression(),
     }
 
 
@@ -378,9 +492,17 @@ def sources_en_echec_detail() -> list[dict]:
                 "categorie": etat.get("derniere_erreur_categorie")
                 or categorie_erreur(Exception(erreur)),
                 "classe": classe,
-                "etape": etape,
+                # R14 — la PHASE réelle de l'erreur (jamais « inconnue » quand
+                # une phase a été mesurée) et, séparément, le motif d'annulation.
+                "etape": etape or etat.get("derniere_erreur_phase"),
+                "phase": etat.get("derniere_erreur_phase") or etape,
+                "raison_annulation": etat.get("derniere_erreur_raison"),
                 "erreur": erreur[:300],
-                "dernier_debut": etat.get("dernier_debut")}
+                "vue_le": etat.get("derniere_erreur_le"),
+                "dernier_debut": etat.get("dernier_debut"),
+                "derniere_reussite": etat.get("derniere_reussite"),
+                "erreur_active": True,
+                "historique": etat.get("derniere_erreur_historique")}
 
     return sorted((_detail(nom, etat) for nom, etat in sources.items()
                    if isinstance(etat, dict) and etat.get("derniere_erreur")),
@@ -408,16 +530,25 @@ def _finaliser_passe(passe: PasseCourante, issue: str,
     (`derniere_issue_cycle` le dit explicitement). La DERNIÈRE RÉUSSITE reste
     publiée séparément (`derniere_reussite`).
     """
-    depouillees = passe.terminer(issue)
+    instant = now_local().isoformat()
+    depouillees = passe.terminer(issue, fin_le=instant)
+    # R18 — le cycle de CETTE source est fermé (succès comme échec). La clôture
+    # « TERMINE » passe par `_etat_collecte_fin` ; ici, ce sont les autres issues.
+    if issue != "TERMINE":
+        fermer_cycle(passe.source, instant, issue)
     publier_metriques(depouillees)
     if exc is not None:
         _etat_collecte_erreur(passe.source, exc)
     with _ETAT_COLLECTE_LOCK:
-        _ETAT_COLLECTE["dernier_cycle_fin"] = now_local().isoformat()
+        _ETAT_COLLECTE["dernier_cycle_fin"] = instant
         _ETAT_COLLECTE["derniere_issue_cycle"] = issue
         _ETAT_COLLECTE["sources"].setdefault(passe.source, {}).update(
             {"derniere_issue": issue,
-             "etape_bloquante": depouillees.get("etape_bloquante")})
+             # R14 — la PHASE publiée : la métrique d'abord (mesurée), le motif
+             # d'annulation en second recours, jamais « inconnue » si l'on sait.
+             "etape_bloquante": depouillees.get("etape_bloquante"),
+             "phase": depouillees.get("phase"),
+             "raison_annulation": depouillees.get("raison_annulation")})
     if issue != "TERMINE":
         log.warning("Collecte %s : cycle clôturé en %s — étape « %s », %.1fs "
                     "(budget %.1fs)", passe.source, issue,
@@ -451,7 +582,8 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
                     etat.get("duree_s") or 0.0, etat.get("jeton"))
         return 0
 
-    passe = PasseCourante(source=source, budget_s=timeout_s)
+    passe = PasseCourante(source=source, budget_s=timeout_s,
+                          debut_le=now_local().isoformat())
     passe.metriques.attente_verrou_s = round(attente_verrou_s, 3)
     enregistrer_passe(source, passe)
     _etat_collecte_debut(source)
@@ -477,7 +609,7 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
             passe.annuler("echeance_sans_point_d_arret")
             _finaliser_passe(passe, "BUDGET_DEPASSE", BudgetDepasse(
                 etape=limite, ecoule_s=passe.ecoule_s(), budget_s=timeout_s,
-                source=source))
+                source=source, etape_connue=passe.metriques.phase))
             try:
                 fut.result(timeout=ATTENTE_SORTIE_PASSE_S)
                 log.info("Collecte N1 %s : passe interrompue terminée proprement "
@@ -493,7 +625,10 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
             log.exception("Échec collecte protégée N1 %s", source)
             return 0
         _etat_collecte_fin(source, nombre)
-        passe.metriques.nb_points_ecrits = nombre
+        # R14 — la PHASE d'une passe réussie est celle de son dernier travail.
+        passe.metriques.phase = passe.etape_courante
+        if "nb_points_ecrits" not in passe.metriques.non_applicables:
+            passe.metriques.nb_points_ecrits = nombre
         _finaliser_passe(passe, "TERMINE")
         return nombre
     finally:
@@ -1551,16 +1686,16 @@ class CollectorBase:
                     _pasee.metriques.ajouter("attente_sqlite_s",
                                              _attente_base - SQLITE_COMMIT_BASE_S)
             for debut_lot in range(0, len(points), taille_lot):
-                # v1.54 — POINT D'ARRÊT CONTRÔLÉ AVANT CHAQUE LOT : une passe
-                # qui a dépassé son budget N'ÉCRIT PLUS RIEN. L'écriture en
-                # cours est terminée (transaction courte et atomique), puis la
-                # passe se retire : plus de demi-lot écrit après l'échéance.
+                # R16 — POINT D'ARRÊT **AVANT** CHAQUE LOT : une passe qui a
+                # dépassé son budget N'ÉCRIT PLUS RIEN (aucune transaction ne
+                # COMMENCE après l'échéance).
                 verifier_etape("ecriture")
                 tranche = points[debut_lot:debut_lot + taille_lot]
                 for tentative in range(1, COMMIT_ESSAIS + 1):
                     t_lot = time.monotonic()
                     avant_tranche = inseres
                     try:
+                        commit_autorise()   # R4 — le commit ne COMMENCE pas après l'échéance
                         t_commit = None
                         with chrono("ecriture"):
                             inseres += self._inserer_tranche(
@@ -1580,7 +1715,13 @@ class CollectorBase:
                                     _duree_commit - SQLITE_COMMIT_BASE_S)
                         # métrique EXACTE : on ne compte que ce qui a été écrit
                         # (un lot entièrement dédoublonné ne « compte » pas).
-                        compter("nb_points_ecrits", inseres - avant_tranche)
+                        _ecrites = inseres - avant_tranche
+                        compter("nb_points_ecrits", _ecrites)
+                        compter("nb_lignes_ecrites", _ecrites)
+                        compter("nb_commits")
+                        passes_ = passe_courante()
+                        if passes_ is not None:
+                            passes_.metriques.nb_lignes_lues += len(tranche)
                         if SOUFFLE_INTER_LOTS_S > 0:
                             time.sleep(SOUFFLE_INTER_LOTS_S)
                         break
@@ -1605,9 +1746,18 @@ class CollectorBase:
                         time.sleep(0.4 * tentative)
                         mapping = self._mapper_vehicules(db)
                         vus.clear()
+                # R16 — POINT D'ARRÊT **APRÈS** CHAQUE LOT : si l'échéance a été
+                # franchie PENDANT le lot, la passe s'arrête ici (le lot, lui,
+                # est intégralement committé : aucune écriture partielle).
+                verifier_etape("ecriture")
+            verifier_etape("ecriture")          # R16 — avant la CLÔTURE
             inseres += _reparer_debuts_sans_trajet(db, list(vus.values()),
                                                    self.source)
+            verifier_etape("ecriture")          # R16 — avant le commit de clôture
+            commit_autorise()                   # R4 — aucun commit après échéance
             db.commit()
+            compter("nb_commits")
+            verifier_etape("ecriture")          # R16 — APRÈS la clôture
             return inseres
         except Exception:
             db.rollback()
@@ -2720,22 +2870,41 @@ def synchroniser_trajets_valides(source: str | None = None) -> dict:
                     "détenu par « %s » — aucune écriture de ma part",
                     source_nom, verrou_de(ressource).proprietaire)
         return {"occupee": True}
-    passe = PasseCourante(source=ressource, budget_s=LOCK_N2_TIMEOUT_S)
+    passe = PasseCourante(source=ressource, budget_s=LOCK_N2_TIMEOUT_S,
+                          debut_le=now_local().isoformat())
     enregistrer_passe(ressource, passe)
+    # R15 — un cycle N2 a un DÉBUT visible (`dernier_debut` restait null : la
+    # passe N2 n'appelait jamais `_etat_collecte_debut`).
+    _etat_collecte_debut(ressource)
+    erreurs_avant = _sources_en_erreur()
     try:
         with activer_passe(passe):
             stats = _synchroniser_trajets_valides(source)
-        publier_metriques(passe.terminer("TERMINE"))
+        # R15 — la RÉUSSITE efface l'erreur de cette source (une erreur N2
+        # restait affichée indéfiniment après des passes réussies)… SAUF si une
+        # source a échoué PENDANT cette passe : l'échec doit rester VISIBLE.
+        nouvelles = _sources_en_erreur() - erreurs_avant
+        passe.metriques.phase = passe.etape_courante
+        if nouvelles:
+            passe.metriques.nb_lignes_ecrites = int(
+                stats.get("nb_lignes_ecrites") or 0)
+            _finaliser_passe(passe, "ECHEC")
+            log.warning("Passes N2 (%s) : échec partiel — source(s) en erreur : "
+                        "%s (l'erreur reste publiée)", source_nom,
+                        ", ".join(sorted(nouvelles)))
+        else:
+            _etat_collecte_fin(ressource, int(stats.get("nb_lignes_ecrites") or 0))
+            _finaliser_passe(passe, "TERMINE")
         return stats
     except BudgetDepasse as exc:
-        publier_metriques(passe.terminer("BUDGET_DEPASSE"))
-        _etat_collecte_erreur(ressource, exc)
-        log.warning("Synchronisation Niveau 2 (%s) arrêtée proprement : %s",
-                    source_nom, exc)
-        return {"budget_depasse": True, "etape": exc.etape}
+        _finaliser_passe(passe, "BUDGET_DEPASSE", exc)
+        log.warning("Synchronisation Niveau 2 (%s) arrêtée proprement : %s "
+                    "(phase « %s », motif « %s »)", source_nom, exc, exc.etape,
+                    exc.raison_annulation)
+        return {"budget_depasse": True, "etape": exc.etape,
+                "raison_annulation": exc.raison_annulation}
     except Exception as exc:
-        publier_metriques(passe.terminer("ECHEC"))
-        _etat_collecte_erreur(ressource, exc)
+        _finaliser_passe(passe, "ECHEC", exc)
         raise
     finally:
         retirer_passe(ressource, passe)
@@ -2765,7 +2934,7 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
             log.info("Pas de validateur Niveau 2 pour %s — sync ignorée", nom)
             continue
         try:
-            verifier_etape("pagination")   # v1.54 — arrêt avant un appel réseau
+            verifier_etape("attente_http")   # R16 — AVANT l'appel réseau
             if nom == "MZONEX":
                 # §0sexies A2 + P2 — API MZoneX en principal, écran en secours
                 # SYSTÉMATIQUE, utilisé seulement s'il est COMPLET.
@@ -2782,6 +2951,9 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
                 bruts = collecteur.collecter_valides()
                 recensements[nom] = list(getattr(collecteur, "recensement", [])
                                          or [])
+            # R16 — APRÈS l'appel réseau : si l'échéance a été franchie pendant
+            # la lecture, on n'enchaîne PAS sur la réconciliation.
+            verifier_etape("attente_http")
             items = normaliser_valides(bruts)
         except BudgetDepasse:
             raise                          # v1.54 — signal d'ARRÊT : jamais absorbé
@@ -2803,10 +2975,11 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
                 if _p is not None:
                     _p.metriques.ajouter("attente_sqlite_s",
                                          _attente_n2 - SQLITE_COMMIT_BASE_S)
-            verifier_etape("ecriture")     # v1.54 — arrêt avant une écriture
+            verifier_etape("ecriture")     # R16 — AVANT l'unité d'écriture
             with chrono("ecriture"):
                 stats = reconcilier_trajets_valides(
                     db, items, username=f"collecteur-{nom.lower()}")
+            verifier_etape("ecriture")     # R16 — APRÈS l'unité d'écriture
         except BudgetDepasse:
             raise                          # échéance : la PASSE s'arrête ici
         except Exception as exc:
@@ -3007,6 +3180,28 @@ def _fenetres_manquantes_mzonex(db, jours: int, maintenant: datetime) -> list[tu
     return fenetres
 
 
+def laisser_passer_temps_reel(limite_s: float | None = None) -> float:
+    """R11 — la relecture HISTORIQUE attend que le temps réel respire.
+
+    Elle a son propre verrou (elle ne bloque donc jamais MZONEX/CAMTRACKPRO),
+    mais elle peut encore les gêner en monopolisant la base. Entre deux unités,
+    elle cède la place : tant qu'une passe temps réel est en cours, elle attend
+    — borné par `RELECTURE_N1_ATTENTE_TEMPS_REEL_S` (défaut 5 s), pour ne jamais
+    s'arrêter indéfiniment. Renvoie le temps réellement attendu.
+    """
+    limite = float(limite_s if limite_s is not None
+                   else os.getenv("RELECTURE_N1_ATTENTE_TEMPS_REEL_S", "5"))
+    t0 = time.monotonic()
+    while (verrou_de("MZONEX").occupe or verrou_de("CAMTRACKPRO").occupe):
+        if time.monotonic() - t0 >= limite:
+            log.info("Relecture N1 : temps réel toujours actif après %.1fs "
+                     "d'attente — reprise du rattrapage (verrou dédié, aucune "
+                     "gêne de blocage)", limite)
+            break
+        time.sleep(0.2)
+    return round(time.monotonic() - t0, 3)
+
+
 def relecture_n1_mzonex(jours: int | None = None) -> int:
     """Rattrape les TROUS de la base en rejouant les Événements MZoneX des
     fenêtres manquantes uniquement (J-7 → J, découpage horaire v1.46) et les
@@ -3034,6 +3229,12 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
     # donc les points non traités le sont au cycle suivant (idempotent).
     tracees: list[dict] = []           # v1.54 — périodes réellement relues
     budget = max(0, RELECTURE_N1_MAX_POINTS)
+    # R10 (21/09/2026) — PROGRESSION MÉMORISÉE : où en est la relecture ?
+    # (journée, page, véhicule, dernier identifiant traité). Publiée par
+    # /api/sante, elle permet de reprendre sans rejouer ce qui est fait.
+    enregistrer_progression("MZONEX_RELECTURE",
+                            journee=fenetres[0][0].date().isoformat(), page=0)
+    pages_relues = 0
     # Traitement par petits lots de 2 fenêtres max pour garantir une exécution rapide (< 5s)
     fenetres_a_traiter = fenetres[:2]
     try:
@@ -3047,7 +3248,11 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
             checkpoint_id = _checkpoint_ouvre("MZONEX_N1_RELECTURE",
                                               debut_utc, fin_utc)
             try:
+                verifier_etape("attente_http")      # R16 — avant l'appel réseau
                 brut = coll.api.evenements(debut_utc, fin_utc)
+                verifier_etape("attente_http")      # R16 — après l'appel réseau
+            except BudgetDepasse:
+                raise                               # R4 — signal d'ARRÊT
             except Exception as exc:
                 _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
                 _audit_collecte("collecte.relecture_n1_echec", {
@@ -3074,13 +3279,25 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
                 n = coll.inserer(points, historique=True)
                 total += n
             _checkpoint_ferme(checkpoint_id, "TERMINE")
+            pages_relues += 1
+            # R10 — la progression avance APRÈS chaque fenêtre traitée, avec le
+            # dernier identifiant vu (reprise + anti-rejeu).
+            enregistrer_progression(
+                "MZONEX_RELECTURE", journee=debut_local.date().isoformat(),
+                page=pages_relues,
+                dernier_id=(brut[-1].get("id") if brut else None),
+                unite_traitee=True)
             tracees.append({"debut": debut_local.isoformat(),
                             "fin": fin_local.isoformat(),
                             "lus": len(brut), "points": n})
             log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
                      "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
                      fin_local.strftime("%H:%M"), len(brut), n)
-            time.sleep(0.2)
+            # R11 — PRIORITÉ INFÉRIEURE : entre deux fenêtres, la relecture
+            # laisse passer le temps réel (passe MZONEX/CAMTRACKPRO en cours).
+            laisser_passer_temps_reel()
+    except BudgetDepasse:
+        raise                                     # R4 — signal d'ARRÊT
     except Exception:
         log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
                       "passage)")
@@ -3100,6 +3317,7 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
 # v1.54 — WORKER DE RELECTURE HISTORIQUE (priorité inférieure, verrou séparé)
 # ══════════════════════════════════════════════════════════════════════════
 _RELECTURE_WORKER = {"demarre": False, "mono": 0.0}
+_SURVEILLANCE = {"demarre": False}
 
 
 def relecture_due(maintenant_mono: float | None = None) -> bool:
@@ -3159,6 +3377,61 @@ def demarrer_worker_relecture() -> bool:
     return True
 
 
+def surveiller_passes(origine: str = "surveillance") -> list:
+    """R4/R5 — ANNULATION COOPÉRATIVE des passes au-delà de leur limite.
+
+    Aucun verrou n'est VOLÉ : la passe périmée s'arrête à son prochain point
+    d'arrêt et libère elle-même son jeton. Renvoie les ressources annulées.
+    """
+    annulees = []
+    for _ressource, _info in passes_en_cours().items():
+        _limite = (LOCK_N2_TIMEOUT_S if _ressource.startswith("N2_")
+                   else LOCK_N1_TIMEOUT_S)
+        if _info.get("ecoule_s", 0) > _limite and not _info.get("annulee"):
+            _passe = passe_de(_ressource)
+            if _passe is not None:
+                log.warning("Passe « %s » au-delà de sa limite (%.1fs > %.1fs, "
+                            "phase « %s ») — ANNULATION COOPÉRATIVE par %s "
+                            "(arrêt au prochain point d'arrêt)",
+                            _ressource, _info.get("ecoule_s"), _limite,
+                            _info.get("phase"), origine)
+                _passe.annuler("surveillance_limite_depassee")
+                annulees.append(_ressource)
+    return annulees
+
+
+def worker_surveillance(sommeil_s: float = 5.0,
+                        arret: threading.Event | None = None) -> None:
+    """Surveillance dans SON PROPRE FIL (R11/R5).
+
+    Avant, la surveillance ne s'exécutait qu'au tour de la boucle de collecte :
+    si cette boucle était elle-même retenue dans une passe, l'annulation
+    coopérative n'arrivait JAMAIS (le dépassement restait sans effet).
+    """
+    log.info("Surveillance des passes démarrée (intervalle %.1fs)", sommeil_s)
+    while True:
+        if arret is not None and arret.is_set():
+            return
+        try:
+            surveiller_passes("worker_surveillance")
+        except Exception:
+            log.exception("Surveillance des passes en échec (reprise au tour "
+                          "suivant)")
+        time.sleep(max(0.5, sommeil_s))
+
+
+def demarrer_surveillance() -> bool:
+    """Démarre le fil de surveillance UNE SEULE FOIS."""
+    if _SURVEILLANCE["demarre"]:
+        return False
+    _SURVEILLANCE["demarre"] = True
+    threading.Thread(target=worker_surveillance,
+                     kwargs={"sommeil_s": float(os.getenv(
+                         "COLLECTE_SURVEILLANCE_PERIODE_S", "5"))},
+                     name="lss-surveillance", daemon=True).start()
+    return True
+
+
 def boucle_collecte():
     """Collecte planifiée Niveau 1 en continu (période COLLECTOR_PERIODE_S, §10).
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
@@ -3202,6 +3475,10 @@ def boucle_collecte():
     # v1.54 — le worker de relecture (priorité inférieure, verrou dédié) est
     # démarré ICI, une seule fois : le temps réel ne l'attend jamais.
     demarrer_worker_relecture()
+    # R5 — la SURVEILLANCE des passes a son propre fil : elle ne dépend plus du
+    # tour de boucle (une boucle retenue dans une passe n'empêche plus
+    # l'annulation coopérative).
+    demarrer_surveillance()
 
     while True:
         # §0bis — SURVEILLANCE COOPÉRATIVE des verrous (v1.54).
@@ -3210,19 +3487,7 @@ def boucle_collecte():
         # ANNULE la passe qui dépasse sa limite : elle s'arrête à son prochain
         # point d'arrêt et libère ELLE-MÊME son jeton. Aucun vol, aucune double
         # écriture.
-        for _passes in passes_en_cours().items():
-            _ressource, _info = _passes
-            _limite = (LOCK_N2_TIMEOUT_S if _ressource.startswith("N2_")
-                       else LOCK_N1_TIMEOUT_S)
-            if _info["ecoule_s"] > _limite and not _info["annulee"]:
-                _passe = passe_de(_ressource)
-                if _passe is not None:
-                    log.warning("Passe « %s » au-delà de sa limite (%.1fs > %.1fs, "
-                                "étape « %s ») — ANNULATION COOPÉRATIVE (arrêt au "
-                                "prochain point d'arrêt)",
-                                _ressource, _info["ecoule_s"], _limite,
-                                _info["etape"])
-                    _passe.annuler("surveillance_limite_depassee")
+        surveiller_passes("boucle_collecte")
 
         try:
             charger_zones()          # rechargement périodique (cache 6 h)

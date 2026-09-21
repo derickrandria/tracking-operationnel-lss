@@ -10,6 +10,8 @@
  * `onEdit` absent / `lectureSeule` → cellules désactivées, structure inchangée.
  */
 import { Fragment, useMemo, useState } from "react";
+
+import { messageCollecte, type EtatCollecteSource } from "../lib/santeMessages.ts";
 import { api } from "../api";
 import Icon from "./icons";
 import { Modal } from "./ui";
@@ -144,6 +146,11 @@ export interface GrilleSuiviProps {
   /** v1.50 — sources dont la collecte est bloquée LOCALEMENT (base
       verrouillée, disque) : la cause est chez nous, pas chez le portail. */
   sourcesBloqueesLocalement?: string[];
+  /** R7 (v1.54) — CAUSE RÉELLE par source, fournie par le backend (issue +
+      classe + phase + message). Prioritaire sur les deux listes ci-dessus : un
+      dépassement de budget pendant l'écriture ne doit JAMAIS s'afficher
+      « base verrouillée ». */
+  collecteParSource?: Record<string, EtatCollecteSource>;
 }
 
 function extraireConducteursRelais(l: SuiviLigne): Array<{ nom: string; duree_s: number }> {
@@ -184,7 +191,8 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                                       lectureSeule, onEdit, pendingUI,
                                       masquerTCC, onRefresh,
                                       sourcesEnPanne = [],
-                                      sourcesBloqueesLocalement = [] }: GrilleSuiviProps) {
+                                      sourcesBloqueesLocalement = [],
+                                      collecteParSource = {} }: GrilleSuiviProps) {
   const portailsEnPanne = new Set(
     (sourcesEnPanne || []).map((x) => (x || "").toUpperCase()));
   const pannePortail = (portail?: string | null) =>
@@ -197,6 +205,24 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
     (sourcesBloqueesLocalement || []).map((x) => (x || "").toUpperCase()));
   const blocageLocal = (portail?: string | null) =>
     !!portail && portailsBloques.has(portail.toUpperCase());
+  // R7 — la CAUSE RÉELLE d'abord : si le backend publie un état pour cette
+  // source, c'est LUI qui parle (issue + classe + phase). Les deux listes
+  // historiques ne servent plus que de repli quand l'état n'est pas fourni.
+  const etatCollecte = (portail?: string | null): EtatCollecteSource | null => {
+    if (!portail) return null;
+    const cle = portail.toUpperCase();
+    const direct = collecteParSource[cle] || collecteParSource[portail];
+    if (direct) return direct;
+    const trouve = Object.entries(collecteParSource)
+      .find(([k]) => k.toUpperCase() === cle);
+    return trouve ? trouve[1] : null;
+  };
+  const messageSource = (portail?: string | null): string | null => {
+    const etat = etatCollecte(portail);
+    if (!etat) return null;
+    // Le message du backend est la vérité ; sinon on le compose (même règle).
+    return etat.message || messageCollecte(portail || "", etat);
+  };
   const [extra, setExtra] = useState<SuiviLigne | null>(null);
   const [arbitrageLigne, setArbitrageLigne] = useState<SuiviLigne | null>(null);
   const [choixArbitrage, setChoixArbitrage] = useState<"PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE">("PASSAGE_TEMPORAIRE");
@@ -298,7 +324,13 @@ export default function GrilleSuivi({ lignes, seuils, modeDetail, refs,
                     · boîtier muet (§0nonies decies M4) : orange, zone sans
                       réseau probable, la relecture officielle complètera. */}
                 {!fige && l.gps_age_s != null && l.gps_age_s > 1800 && (
-                  blocageLocal(l.plateforme_gps) ? (
+                  messageSource(l.plateforme_gps) ? (
+                    <div className="mt-0.5 text-[10px] font-semibold text-red-500"
+                      title={etatCollecte(l.plateforme_gps)?.action
+                        || "Cause fournie par /api/sante (issue, classe, phase)."}>
+                      {messageSource(l.plateforme_gps)}
+                    </div>
+                  ) : blocageLocal(l.plateforme_gps) ? (
                     <div className="mt-0.5 text-[10px] font-semibold text-red-500"
                       title={`La collecte ${l.plateforme_gps} est bloquée LOCALEMENT (base verrouillée / disque), pas chez le portail : voir /api/sante, champ « sources_bloquees_localement ». Rien à demander au portail — c'est une action technique côté serveur.`}>
                       collecte {l.plateforme_gps} bloquée localement — base verrouillée

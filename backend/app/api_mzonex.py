@@ -31,7 +31,7 @@ import httpx
 
 socket.setdefaulttimeout(10.0)
 
-from .concurrence import chrono, compter, verifier_etape
+from .concurrence import chrono, compter, restant_budget, verifier_etape
 from .config import TZ, plaque_depuis_libelle_portail
 from .oauth_mzonex import ErreurAuthMZoneX, gestionnaire
 
@@ -249,8 +249,13 @@ class ApiMZoneX:
             "Accept": "application/json"
         }
         try:
+            # R3 — le timeout HTTP se dimensionne sur le temps RESTANT : un
+            # timeout de 30 s sur une passe qui n'a plus que 2 s garantissait un
+            # dépassement. Hors passe, le timeout nominal reste inchangé.
+            _restant = restant_budget()
+            _timeout = _TIMEOUT if _restant is None else max(1.0, min(_TIMEOUT, _restant))
             with chrono("attente_http"):
-                with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
+                with httpx.Client(timeout=httpx.Timeout(_timeout, connect=min(5.0, _timeout))) as client:
                     resp = client.get(url, headers=headers)
                     if resp.status_code == 401 and reessai:
                         log.info("MZoneX API : jeton refusé (401) — ré-authentification")
@@ -292,6 +297,9 @@ class ApiMZoneX:
             vals = lot.get("value", [])
             compter("nb_lignes", len(vals))
             lignes.extend(vals)
+            # R16 — point d'arrêt APRÈS chaque page : la suite n'est demandée
+            # que si l'échéance n'est pas franchie.
+            verifier_etape("pagination")
             if len(vals) < TAILLE_PAGE:
                 break
             saute += TAILLE_PAGE
@@ -366,6 +374,8 @@ class ApiMZoneX:
             chemin = ("Events?" + self._fenetre(borne, bout)
                       + "&$orderby=utcTimestamp")
             evs.extend(self._pages(chemin))
+            # R16 — point d'arrêt APRÈS chaque tranche lue.
+            verifier_etape("pagination")
             borne = bout
         return evs
 

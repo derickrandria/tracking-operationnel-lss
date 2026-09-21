@@ -41,6 +41,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from datetime import datetime
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -303,18 +304,43 @@ ETAPES = ("verrou", "authentification", "attente_http", "pagination",
 
 
 class BudgetDepasse(Exception):
-    """La passe a atteint son échéance. `etape` dit OÙ le temps a été passé :
-    c'est cette étape (et non un « échec local » générique) qui est publiée."""
+    """La passe a atteint son échéance.
 
-    def __init__(self, etape: str, ecoule_s: float, budget_s: float,
-                 source: str | None = None) -> None:
-        self.etape = etape if etape in ETAPES else "inconnue"
+    R14 (21/09/2026) — QUATRE INFORMATIONS SÉPARÉES, jamais confondues :
+      · `etape`             : la PHASE réelle où le temps a été passé
+                              (écriture, attente_http, pagination…) ;
+      · `raison_annulation`  : le MOTIF de l'arrêt (surveillance, échéance
+                              sans point d'arrêt…), quand il y en a un ;
+      · `issue`              : l'issue de la passe (« BUDGET_DEPASSE ») ;
+      · `etape_brute`        : le libellé d'origine, conservé même s'il n'est
+                              pas une phase connue (plus de perte silencieuse :
+                              un ancien libellé `surveillance_...` affichait
+                              « inconnue » alors que la phase était connue).
+    """
+
+    def __init__(self, etape: str = "inconnue", ecoule_s: float = 0.0,
+                 budget_s: float = 0.0, source: str | None = None,
+                 raison_annulation: str | None = None,
+                 etape_connue: str | None = None) -> None:
+        self.etape_brute = str(etape)
+        # La PHASE ne se perd jamais : « inconnue » et les motifs de surveillance
+        # ne sont PAS des phases — on retient alors celle de la métrique
+        # (`etape_connue`), qui est toujours mesurée. Avant, le motif
+        # `surveillance_limite_depassee` était retenu comme phase puis écrasé en
+        # « inconnue » : l'écran affichait « étape inconnue » pour un
+        # dépassement dont la phase (écriture, attente_http…) était connue.
+        fournie = etape if (etape in ETAPES and etape != "inconnue") else None
+        phase = fournie or etape_connue or "inconnue"
+        self.etape = phase if phase in ETAPES else "inconnue"
+        self.raison_annulation = raison_annulation
+        self.issue = "BUDGET_DEPASSE"
         self.ecoule_s = round(float(ecoule_s), 1)
         self.budget_s = round(float(budget_s), 1)
         self.source = source
+        motif = f" (motif : {raison_annulation})" if raison_annulation else ""
         super().__init__(
-            f"Budget de collecte dépassé ({self.budget_s}s, étape « {self.etape} ») "
-            f"— arrêt contrôlé, replanifié au prochain cycle")
+            f"Budget de collecte dépassé ({self.budget_s}s, étape « {self.etape} »)"
+            f"{motif} — arrêt contrôlé, replanifié au prochain cycle")
 
 
 class VerrouOccupe(Exception):
@@ -336,11 +362,24 @@ class Metriques:
     attente_verrou_s: float = 0.0
     attente_sqlite_s: float = 0.0
     nb_pages: int = 0
-    nb_vehicules: int = 0
+    nb_vehicules: int | None = 0
     nb_lignes: int = 0
-    nb_points_ecrits: int = 0
+    nb_lignes_lues: int = 0
+    nb_lignes_ecrites: int = 0
+    nb_points_ecrits: int | None = 0
+    nb_commits: int = 0
+    commits_apres_echeance: int = 0
     etape_bloquante: str | None = None
+    phase: str = "inconnue"
     issue: str = "EN_COURS"
+    annulee: bool = False
+    raison_annulation: str | None = None
+    budget_s: float = 0.0
+    debut_le: str | None = None
+    fin_le: str | None = None
+    # R19 — champs qu'une source NE PEUT PAS mesurer : publiés `null`, jamais
+    # « 0 » (un 0 se lirait comme une mesure : « rien n'a été écrit »).
+    _non_applicables: tuple = ()
 
     def _champ(self, champ: str, suffixe: str = "") -> str | None:
         """Résout le nom RÉEL du champ : `chrono("auth")` doit alimenter
@@ -351,14 +390,26 @@ class Metriques:
                 return candidat
         return None
 
+    @property
+    def non_applicables(self) -> list:
+        """Compteurs NON MESURABLES pour cette source (publiés `null`)."""
+        return list(self._non_applicables)
+
+    def marquer_non_applicable(self, *champs: str) -> None:
+        """R19 — déclare des compteurs NON MESURABLES pour cette source."""
+        self._non_applicables = tuple(dict.fromkeys(self._non_applicables + champs))
+        for champ in self._non_applicables:
+            if hasattr(self, champ):
+                setattr(self, champ, None)
+
     def ajouter(self, champ: str, secondes: float) -> None:
         nom = self._champ(champ, "_s")
-        if nom:
+        if nom and nom not in self._non_applicables:
             setattr(self, nom, round(getattr(self, nom) + float(secondes), 3))
 
     def compter(self, champ: str, n: int = 1) -> None:
         nom = self._champ(champ)
-        if nom:
+        if nom and nom not in self._non_applicables:
             setattr(self, nom, int(getattr(self, nom)) + int(n))
 
     def depouiller(self) -> dict:
@@ -366,7 +417,18 @@ class Metriques:
             "source", "total_s", "auth_s", "attente_http_s", "pagination_s",
             "vehicule_s", "parsing_s", "ecriture_s", "attente_verrou_s",
             "attente_sqlite_s", "nb_pages", "nb_vehicules", "nb_lignes",
-            "nb_points_ecrits", "etape_bloquante", "issue")}
+            "nb_lignes_lues", "nb_lignes_ecrites", "nb_points_ecrits",
+            "nb_commits", "commits_apres_echeance", "etape_bloquante", "phase",
+            "issue", "annulee", "raison_annulation", "budget_s",
+            "debut_le", "fin_le", "non_applicables")}
+
+    def phases_s(self) -> dict:
+        """Durées par phase (pour l'interface : « où est passé le temps »)."""
+        return {"authentification": self.auth_s, "attente_http": self.attente_http_s,
+                "pagination": self.pagination_s, "vehicule": self.vehicule_s,
+                "parsing": self.parsing_s, "ecriture": self.ecriture_s,
+                "attente_verrou": self.attente_verrou_s,
+                "attente_sqlite": self.attente_sqlite_s}
 
     def etape_dominante(self) -> str:
         """Étape qui a le plus consommé de temps — sert à nommer la cause d'un
@@ -387,14 +449,23 @@ class Metriques:
 class PasseCourante:
     """Budget + métriques de la passe en cours DANS CE FIL D'EXÉCUTION."""
 
-    def __init__(self, source: str, budget_s: float) -> None:
+    def __init__(self, source: str, budget_s: float,
+                 debut_le: str | None = None) -> None:
         self.source = source
         self.budget_s = float(budget_s)
         self.debut_mono = time.monotonic()
-        self.metriques = Metriques(source=source)
+        self.debut_le = debut_le
+        self.metriques = Metriques(source=source, budget_s=float(budget_s),
+                                   debut_le=debut_le)
         self.annulee = False
         self.annulee_raison: str | None = None
         self.etape_courante = "inconnue"
+        # R19 — compteurs qu'une source ne peut pas mesurer (publiés `null`).
+        if source.startswith("N2_"):
+            self.metriques.marquer_non_applicable("nb_vehicules",
+                                                  "nb_points_ecrits")
+        elif source in ("MZONEX", "MZONEX_RELECTURE"):
+            self.metriques.marquer_non_applicable("nb_vehicules")
 
     # ----------------------------------------------------------- échéance
     def ecoule_s(self) -> float:
@@ -403,40 +474,72 @@ class PasseCourante:
     def restant_s(self) -> float:
         return self.budget_s - self.ecoule_s()
 
+    def instantane(self) -> dict:
+        """R9/R2 — la PASSE EN COURS, décrite séparément de la dernière passe
+        publiée : `fin = null`, `issue = "en_cours"`, durée courante."""
+        d = self.metriques.depouiller()
+        d.update({"total_s": round(self.ecoule_s(), 3), "fin_le": None,
+                  "issue": "en_cours", "phase": self.etape_courante,
+                  "annulee": self.annulee,
+                  "raison_annulation": self.annulee_raison,
+                  "budget_s": self.budget_s, "debut_le": self.debut_le,
+                  "restant_s": round(self.restant_s(), 3)})
+        return d
+
     def depassee(self) -> bool:
         return self.annulee or self.restant_s() <= 0
 
     def verifier(self, etape: str = "inconnue") -> None:
         """Point d'arrêt contrôlé : lève BudgetDepasse si l'échéance est
-        atteinte. À appeler AVANT chaque travail coûteux (page, véhicule,
-        lot d'écriture) : c'est ce qui garantit qu'aucune écriture n'a lieu
-        après l'échéance."""
+        atteinte. À appeler AVANT **et APRÈS** chaque travail coûteux (appel
+        réseau, lot, unité d'écriture, clôture) : c'est ce qui garantit
+        qu'aucune écriture ne commence après l'échéance.
+
+        R14 — la phase est TOUJOURS transmise (`etape`) ; le motif d'annulation
+        voyage dans un champ distinct. Avant le 21/09, la raison d'annulation
+        REMPLAÇAIT la phase, et le statut affichait « étape inconnue » alors que
+        la métrique connaissait la phase.
+        """
         self.etape_courante = etape
+        self.metriques.phase = etape
         if self.depassee():
             self.annulee = True
             self.metriques.etape_bloquante = etape
-            raise BudgetDepasse(
-                etape if self.annulee_raison is None else self.annulee_raison,
-                self.ecoule_s(), self.budget_s, source=self.source)
+            self.metriques.annulee = True
+            raise BudgetDepasse(etape, self.ecoule_s(), self.budget_s,
+                                source=self.source,
+                                raison_annulation=self.annulee_raison)
 
     def annuler(self, raison: str = "annulation") -> None:
+        """R14 — l'annulation ne fait que DEMANDER l'arrêt : elle ne remplace
+        jamais la phase (celle-ci reste celle du dernier point d'arrêt)."""
         self.annulee = True
         self.annulee_raison = raison
+        self.metriques.annulee = True
+        self.metriques.raison_annulation = raison
 
     # ----------------------------------------------------------- clôture
-    def terminer(self, issue: str) -> dict:
+    def terminer(self, issue: str, fin_le: str | None = None) -> dict:
         self.metriques.total_s = round(self.ecoule_s(), 3)
         self.metriques.issue = issue
+        self.metriques.fin_le = fin_le
         if self.metriques.etape_bloquante is None and self.annulee:
             self.metriques.etape_bloquante = self.annulee_raison
         if self.metriques.etape_bloquante is None:
             self.metriques.etape_bloquante = self.metriques.etape_dominante()
+        # R14 — la phase publiée est TOUJOURS connue quand elle peut l'être :
+        # « inconnue » est réservé au cas où aucune phase n'a été mesurée.
+        if self.metriques.phase in ("inconnue", "", None):
+            self.metriques.phase = self.metriques.etape_bloquante
+        self.metriques.annulee = self.annulee
+        self.metriques.raison_annulation = self.annulee_raison
         return self.metriques.depouiller()
 
 
 # ────────────────────────────────────────────────── passe courante (par fil)
 _COURANT = threading.local()
 _DERNIERES_METRIQUES: dict[str, dict] = {}
+_CUMUL: dict[str, dict] = {}
 _METRIQUES_MUTEX = threading.Lock()
 
 
@@ -456,6 +559,101 @@ def passe_courante() -> PasseCourante | None:
     return getattr(_COURANT, "passe", None)
 
 
+def restant_budget(defaut: float | None = None) -> float | None:
+    """R3 — temps restant de la passe courante (None hors passe).
+
+    Sert à dimensionner un appel réseau sur le temps RESTANT : un timeout HTTP
+    de 30 s sur une passe qui n'a plus que 2 s garantit un dépassement.
+    """
+    passe = passe_courante()
+    return None if passe is None else passe.restant_s()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2bis. CYCLES **PAR SOURCE** (R18) — jamais de comparaison croisée
+# ════════════════════════════════════════════════════════════════════════════
+# Avant : `dernier_cycle_debut` et `dernier_cycle_fin` étaient DEUX CLÉS
+# GLOBALES écrites par toutes les passes. Deux passes concurrentes (MZONEX et
+# CAMTRACKPRO) produisaient une « fin antérieure au début » qui ne signalait
+# rien de réel — et faisait croire à un cycle terminé avant d'avoir commencé.
+_CYCLES: dict[str, dict] = {}
+_CYCLES_MUTEX = threading.Lock()
+
+
+def ouvrir_cycle(source: str, quand: str) -> None:
+    with _CYCLES_MUTEX:
+        _CYCLES[source] = {"source": source, "debut": quand, "fin": None,
+                           "en_cours": True, "issue": "en_cours"}
+
+
+def fermer_cycle(source: str, quand: str, issue: str) -> None:
+    with _CYCLES_MUTEX:
+        cycle = _CYCLES.setdefault(source, {"source": source, "debut": None})
+        cycle.update({"fin": quand, "en_cours": False, "issue": issue})
+
+
+def cycles_par_source() -> dict[str, dict]:
+    """Cycles par source + verdict d'inversion CALCULÉ PAR SOURCE.
+
+    R18 — `CYCLES_EN_ECHEC` ne peut naître que de la comparaison du début et de
+    la fin d'UN MÊME cycle : jamais du début de l'une et de la fin de l'autre.
+    Une passe en cours publie `fin = null` (R9) — aucune date de fin inventée.
+    """
+    with _CYCLES_MUTEX:
+        cycles = {source: dict(c) for source, c in _CYCLES.items()}
+    en_echec = []
+    for source, cycle in cycles.items():
+        debut, fin = cycle.get("debut"), cycle.get("fin")
+        duree = None
+        if debut and fin:
+            try:
+                duree = round((datetime.fromisoformat(fin)
+                               - datetime.fromisoformat(debut)).total_seconds(), 3)
+            except ValueError:
+                duree = None
+        cycle["duree_s"] = duree
+        inversion = bool(duree is not None and duree < 0)
+        cycle["inversion"] = inversion
+        if inversion:
+            en_echec.append(source)
+        elif cycle.get("en_cours"):
+            en_echec.append(source) if cycle.get("issue") == "ECHEC" else None
+    return {"cycles": cycles, "sources_en_echec_cycle": sorted(en_echec),
+            "cycles_en_echec": bool(en_echec)}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2ter. PROGRESSION DE LA RELECTURE HISTORIQUE (R10/R11)
+# ════════════════════════════════════════════════════════════════════════════
+_PROGRESSION: dict[str, dict] = {}
+_PROGRESSION_MUTEX = threading.Lock()
+
+
+def enregistrer_progression(source: str, *, journee=None, page=None,
+                            vehicule=None, dernier_id=None,
+                            unite_traitee: bool = False) -> None:
+    """Mémorise où en est la relecture : journée, page, véhicule, dernier
+    identifiant traité. La reprise et l'anti-rejeu s'appuient dessus."""
+    with _PROGRESSION_MUTEX:
+        etat = _PROGRESSION.setdefault(source, {
+            "source": source, "journee": None, "page": 0, "vehicule": None,
+            "dernier_id": None, "unites_traitees": 0, "maj_le": None})
+        for cle, valeur in (("journee", journee), ("page", page),
+                            ("vehicule", vehicule), ("dernier_id", dernier_id)):
+            if valeur is not None:
+                etat[cle] = valeur
+        if unite_traitee:
+            etat["unites_traitees"] = int(etat["unites_traitees"]) + 1
+        etat["maj_le"] = datetime.now().isoformat(timespec="seconds")
+
+
+def progression(source: str | None = None) -> dict:
+    with _PROGRESSION_MUTEX:
+        if source is not None:
+            return dict(_PROGRESSION.get(source) or {})
+        return {k: dict(v) for k, v in _PROGRESSION.items()}
+
+
 @contextmanager
 def activer_passe(passe: PasseCourante):
     """Installe la passe pour CE fil (les passes concurrentes ne se mélangent
@@ -469,8 +667,40 @@ def activer_passe(passe: PasseCourante):
 
 
 def publier_metriques(depouillees: dict) -> None:
+    """Publie la DERNIÈRE passe ET met à jour le CUMUL de la source.
+
+    R6 (21/09/2026) — les trois mesures ne doivent JAMAIS être confondues :
+      · `total_s` de la dernière passe  = durée de CETTE passe ;
+      · `cumul.total_s`                 = somme des passes terminées ;
+      · `cumul.moyenne_s`               = cumul / nombre de passes.
+    """
+    source = depouillees.get("source", "?")
     with _METRIQUES_MUTEX:
-        _DERNIERES_METRIQUES[depouillees.get("source", "?")] = depouillees
+        _DERNIERES_METRIQUES[source] = depouillees
+        cumul = _CUMUL.setdefault(source, {
+            "passes": 0, "total_s": 0.0, "issues": {},
+            "derniere_reussie": None, "dernier_echec": None})
+        cumul["passes"] += 1
+        cumul["total_s"] = round(cumul["total_s"] + float(depouillees.get("total_s") or 0), 3)
+        issue = str(depouillees.get("issue") or "?")
+        cumul["issues"][issue] = int(cumul["issues"].get(issue, 0)) + 1
+        instant = depouillees.get("fin_le") or depouillees.get("debut_le")
+        if issue == "TERMINE":
+            cumul["derniere_reussie"] = {"fin_le": instant, "debut_le": depouillees.get("debut_le"),
+                                         "total_s": depouillees.get("total_s"),
+                                         "budget_s": depouillees.get("budget_s"),
+                                         "nb_lignes_ecrites": depouillees.get("nb_lignes_ecrites"),
+                                         "nb_pages": depouillees.get("nb_pages")}
+        else:
+            cumul["dernier_echec"] = {"fin_le": instant, "issue": issue,
+                                      "etape": depouillees.get("etape_bloquante")}
+
+
+def cumul_publie(source: str | None = None) -> dict:
+    with _METRIQUES_MUTEX:
+        if source is not None:
+            return dict(_CUMUL.get(source) or {})
+        return {k: dict(v) for k, v in _CUMUL.items()}
 
 
 def metriques_publiees() -> dict[str, dict]:
@@ -505,11 +735,10 @@ def passe_de(ressource: str) -> PasseCourante | None:
 
 
 def passes_en_cours() -> dict[str, dict]:
+    """R9 — une passe EN COURS : `fin = null`, `issue = "en_cours"`, durée
+    courante. Utilisé par la surveillance et publié par /api/sante."""
     with _PASSES_MUTEX:
-        return {r: {"source": p.source, "ecoule_s": round(p.ecoule_s(), 1),
-                    "budget_s": p.budget_s, "etape": p.etape_courante,
-                    "annulee": p.annulee}
-                for r, p in _PASSES.items()}
+        return {r: p.instantane() for r, p in _PASSES.items()}
 
 
 # ─────────────────────────── aides utilisées par le code instrumenté
@@ -538,6 +767,25 @@ def verifier_etape(etape: str) -> None:
     passe = passe_courante()
     if passe is not None:
         passe.verifier(etape)
+
+
+def commit_autorise() -> bool:
+    """R4 — l'échéance interdit de COMMENCER une écriture.
+
+    Appelé juste avant chaque `commit()` : si la passe a dépassé son échéance,
+    l'écriture n'est pas engagée (la donnée est reposée et rejouée au cycle
+    suivant — idempotence). Le refus est COMPTÉ (`commits_apres_echeance`) et le
+    point d'arrêt lève `BudgetDepasse` : la passe s'arrête proprement.
+    """
+    passe = passe_courante()
+    if passe is None:
+        return True
+    if passe.depassee():
+        passe.metriques.commits_apres_echeance += 1
+        passe.annulee = True
+        passe.verifier(passe.etape_courante or "ecriture")
+        return False
+    return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -589,14 +837,15 @@ def classer_erreur(exc: BaseException) -> dict:
         return {"classe": CLASSE_VERROU_OCCUPE, "categorie": "locale",
                 "etape": "verrou"}
     if isinstance(exc, BudgetDepasse):
-        if etape in ETAPES_PORTAIL:
-            return {"classe": CLASSE_PORTAIL_LENT, "categorie": "locale",
-                    "etape": etape}
-        if etape in ETAPES_LOCALES:
-            return {"classe": (CLASSE_ATTENTE_SQLITE if etape == "ecriture"
-                               else CLASSE_VERROU_OCCUPE),
-                    "categorie": "locale", "etape": etape}
-        return {"classe": CLASSE_BUDGET_DEPASSE, "categorie": "locale",
+        # R14 — UN DÉPASSEMENT DE BUDGET EST UNE **ISSUE**, PAS UNE CAUSE.
+        # Quelle que soit la phase où le temps a été consommé (attente du
+        # portail, écriture, verrou), la classe publiée reste « budget_depasse » ;
+        # la PHASE, elle, est publiée à part (`etape`). Avant le 21/09, un
+        # dépassement survenu pendant la phase d'écriture était annoncé
+        # « attente_sqlite » : l'écran affichait « collecte bloquée localement —
+        # base verrouillée » alors que la base n'y était pour rien.
+        return {"classe": CLASSE_BUDGET_DEPASSE,
+                "categorie": ("locale" if etape in ETAPES_LOCALES else "portail"),
                 "etape": etape}
     if any(m in texte for m in MOTIFS_SQLITE):
         return {"classe": CLASSE_ATTENTE_SQLITE, "categorie": "locale",

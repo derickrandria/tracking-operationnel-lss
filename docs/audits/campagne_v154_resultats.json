@@ -1,16 +1,14 @@
 {
-  "total": 58,
+  "total": 59,
   "compte": {
-    "RÉUSSI": 52,
+    "RÉUSSI": 54,
     "ÉCHOUÉ": 3,
     "CRASH": 0,
     "NON EXÉCUTÉ": 2,
     "NON CONCLUANT": 0,
-    "INSTABLE": 1
+    "INSTABLE": 0
   },
-  "flaky": [
-    "test_verrous_sqlite_v150"
-  ],
+  "flaky": [],
   "suites": {
     "test_addendum_v18": {
       "categorie": "RÉUSSI",
@@ -19,7 +17,7 @@
       ],
       "instable": false,
       "detail": "28 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.3
     },
     "test_addendum_v19": {
       "categorie": "RÉUSSI",
@@ -28,7 +26,7 @@
       ],
       "instable": false,
       "detail": "24 contrôles, 0 en échec",
-      "duree_s": 0.8
+      "duree_s": 1.1
     },
     "test_affichage_position_v131": {
       "categorie": "RÉUSSI",
@@ -37,7 +35,7 @@
       ],
       "instable": false,
       "detail": "49 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.2
     },
     "test_ameliorations_v129": {
       "categorie": "RÉUSSI",
@@ -46,7 +44,7 @@
       ],
       "instable": false,
       "detail": "22 contrôles, 0 en échec",
-      "duree_s": 2.1
+      "duree_s": 1.9
     },
     "test_api_v125": {
       "categorie": "RÉUSSI",
@@ -55,7 +53,7 @@
       ],
       "instable": false,
       "detail": "20 contrôles, 0 en échec",
-      "duree_s": 1.3
+      "duree_s": 1.2
     },
     "test_api_wialon_v126": {
       "categorie": "RÉUSSI",
@@ -73,7 +71,7 @@
       ],
       "instable": false,
       "detail": "bilan texte « tout est passé »",
-      "duree_s": 1.0
+      "duree_s": 1.1
     },
     "test_archives_retrocompat_v154": {
       "categorie": "RÉUSSI",
@@ -82,7 +80,7 @@
       ],
       "instable": false,
       "detail": "17 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.3
     },
     "test_boitiers_muets_v143": {
       "categorie": "RÉUSSI",
@@ -91,7 +89,7 @@
       ],
       "instable": false,
       "detail": "33 contrôles, 0 en échec",
-      "duree_s": 1.2
+      "duree_s": 1.6
     },
     "test_calcul_affichage_v152": {
       "categorie": "RÉUSSI",
@@ -100,7 +98,7 @@
       ],
       "instable": false,
       "detail": "69 contrôles, 0 en échec",
-      "duree_s": 1.1
+      "duree_s": 1.6
     },
     "test_calcul_affichage_v153": {
       "categorie": "RÉUSSI",
@@ -109,7 +107,7 @@
       ],
       "instable": false,
       "detail": "61 contrôles, 0 en échec",
-      "duree_s": 1.6
+      "duree_s": 1.9
     },
     "test_chaines_v113": {
       "categorie": "ÉCHOUÉ",
@@ -118,7 +116,7 @@
       ],
       "instable": false,
       "detail": "1 contrôle(s) en échec sur 41",
-      "duree_s": 1.2
+      "duree_s": 1.5
     },
     "test_coherence_archives_v153": {
       "categorie": "RÉUSSI",
@@ -127,7 +125,7 @@
       ],
       "instable": false,
       "detail": "18 contrôles, 0 en échec",
-      "duree_s": 1.3
+      "duree_s": 1.6
     },
     "test_compteurs_muets_v148": {
       "categorie": "RÉUSSI",
@@ -136,7 +134,7 @@
       ],
       "instable": false,
       "detail": "14 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.1
     },
     "test_concurrence_n2_v154": {
       "categorie": "RÉUSSI",
@@ -145,7 +143,16 @@
       ],
       "instable": false,
       "detail": "64 contrôles, 0 en échec",
-      "duree_s": 5.8
+      "duree_s": 6.1
+    },
+    "test_concurrence_sante_v154": {
+      "categorie": "RÉUSSI",
+      "etats_observes": [
+        "RÉUSSI"
+      ],
+      "instable": false,
+      "detail": "70 contrôles, 0 en échec",
+      "duree_s": 2.4
     },
     "test_concurrence_verrous_v154": {
       "categorie": "RÉUSSI",
@@ -153,8 +160,8 @@
         "RÉUSSI"
       ],
       "instable": false,
-      "detail": "123 contrôles, 0 en échec",
-      "duree_s": 5.6
+      "detail": "125 contrôles, 0 en échec",
+      "duree_s": 5.9
     },
     "test_conducteurs_dedoublonnage_v138": {
       "categorie": "RÉUSSI",
@@ -163,7 +170,7 @@
       ],
       "instable": false,
       "detail": "26 contrôles, 0 en échec",
-      "duree_s": 1.1
+      "duree_s": 1.4
     },
     "test_conducteurs_fusion": {
       "categorie": "RÉUSSI",
@@ -172,7 +179,7 @@
       ],
       "instable": false,
       "detail": "33 contrôles, 0 en échec",
-      "duree_s": 1.3
+      "duree_s": 1.7
     },
     "test_conduite_v127": {
       "categorie": "RÉUSSI",
@@ -181,7 +188,7 @@
       ],
       "instable": false,
       "detail": "37 contrôles, 0 en échec",
-      "duree_s": 1.2
+      "duree_s": 1.4
     },
     "test_convention_24h_v154": {
       "categorie": "RÉUSSI",
@@ -190,7 +197,7 @@
       ],
       "instable": false,
       "detail": "12 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.1
     },
     "test_correctifs_v124": {
       "categorie": "RÉUSSI",
@@ -199,7 +206,7 @@
       ],
       "instable": false,
       "detail": "5 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.2
     },
     "test_doublons_v132": {
       "categorie": "RÉUSSI",
@@ -208,7 +215,7 @@
       ],
       "instable": false,
       "detail": "63 contrôles, 0 en échec",
-      "duree_s": 1.1
+      "duree_s": 1.2
     },
     "test_e2e_reel_v113": {
       "categorie": "NON EXÉCUTÉ",
@@ -226,7 +233,7 @@
       ],
       "instable": false,
       "detail": "17 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.1
     },
     "test_fenetre_3h_v154": {
       "categorie": "RÉUSSI",
@@ -235,7 +242,7 @@
       ],
       "instable": false,
       "detail": "26 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.2
     },
     "test_fuseau_v128": {
       "categorie": "RÉUSSI",
@@ -244,7 +251,7 @@
       ],
       "instable": false,
       "detail": "14 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.2
     },
     "test_fusion30_v133": {
       "categorie": "RÉUSSI",
@@ -253,7 +260,7 @@
       ],
       "instable": false,
       "detail": "37 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.1
     },
     "test_heure_depart_v149": {
       "categorie": "RÉUSSI",
@@ -262,7 +269,7 @@
       ],
       "instable": false,
       "detail": "13 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.2
     },
     "test_historique_integrite_bdd": {
       "categorie": "RÉUSSI",
@@ -271,7 +278,7 @@
       ],
       "instable": false,
       "detail": "bilan texte « tout est passé »",
-      "duree_s": 2.6
+      "duree_s": 3.3
     },
     "test_historique_scroll_v142": {
       "categorie": "RÉUSSI",
@@ -289,7 +296,7 @@
       ],
       "instable": false,
       "detail": "25 contrôles, 0 en échec",
-      "duree_s": 1.1
+      "duree_s": 1.5
     },
     "test_infractions_ymane_v135": {
       "categorie": "RÉUSSI",
@@ -298,7 +305,7 @@
       ],
       "instable": false,
       "detail": "50 contrôles, 0 en échec",
-      "duree_s": 1.4
+      "duree_s": 2.1
     },
     "test_missions_v2026": {
       "categorie": "RÉUSSI",
@@ -307,7 +314,7 @@
       ],
       "instable": false,
       "detail": "bilan texte « tout est passé »",
-      "duree_s": 2.1
+      "duree_s": 3.4
     },
     "test_missions_v2026_complet": {
       "categorie": "RÉUSSI",
@@ -316,7 +323,7 @@
       ],
       "instable": false,
       "detail": "bilan texte « tout est passé »",
-      "duree_s": 1.2
+      "duree_s": 1.6
     },
     "test_mzonex_ping": {
       "categorie": "NON EXÉCUTÉ",
@@ -334,7 +341,7 @@
       ],
       "instable": false,
       "detail": "21 contrôles, 0 en échec",
-      "duree_s": 1.2
+      "duree_s": 1.5
     },
     "test_ouverture_v19": {
       "categorie": "RÉUSSI",
@@ -343,7 +350,7 @@
       ],
       "instable": false,
       "detail": "59 contrôles, 0 en échec",
-      "duree_s": 1.9
+      "duree_s": 2.3
     },
     "test_positions_portails_v145": {
       "categorie": "ÉCHOUÉ",
@@ -352,7 +359,7 @@
       ],
       "instable": false,
       "detail": "1 contrôle(s) en échec sur 48",
-      "duree_s": 2.5
+      "duree_s": 2.8
     },
     "test_positions_tcc_v144": {
       "categorie": "RÉUSSI",
@@ -361,7 +368,7 @@
       ],
       "instable": false,
       "detail": "42 contrôles, 0 en échec",
-      "duree_s": 1.2
+      "duree_s": 1.5
     },
     "test_rattrapage_archivage_v151": {
       "categorie": "RÉUSSI",
@@ -370,7 +377,7 @@
       ],
       "instable": false,
       "detail": "53 contrôles, 0 en échec",
-      "duree_s": 1.4
+      "duree_s": 2.2
     },
     "test_recensement_v122": {
       "categorie": "RÉUSSI",
@@ -379,7 +386,7 @@
       ],
       "instable": false,
       "detail": "26 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.4
     },
     "test_recettes_exports_v154": {
       "categorie": "RÉUSSI",
@@ -388,7 +395,7 @@
       ],
       "instable": false,
       "detail": "13 contrôles, 0 en échec",
-      "duree_s": 1.2
+      "duree_s": 1.5
     },
     "test_reconciliation_v14": {
       "categorie": "RÉUSSI",
@@ -397,7 +404,7 @@
       ],
       "instable": false,
       "detail": "27 contrôles, 0 en échec",
-      "duree_s": 1.2
+      "duree_s": 1.5
     },
     "test_reference_v118": {
       "categorie": "RÉUSSI",
@@ -406,7 +413,7 @@
       ],
       "instable": false,
       "detail": "29 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.4
     },
     "test_referentiel_v121": {
       "categorie": "RÉUSSI",
@@ -415,7 +422,7 @@
       ],
       "instable": false,
       "detail": "20 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.4
     },
     "test_reglement_metier_missions": {
       "categorie": "RÉUSSI",
@@ -424,7 +431,7 @@
       ],
       "instable": false,
       "detail": "unittest : 4 test(s), 0 en échec",
-      "duree_s": 0.4
+      "duree_s": 0.6
     },
     "test_reparation_v130": {
       "categorie": "ÉCHOUÉ",
@@ -433,7 +440,7 @@
       ],
       "instable": false,
       "detail": "1 contrôle(s) en échec sur 28",
-      "duree_s": 1.8
+      "duree_s": 2.4
     },
     "test_repli_api_v154": {
       "categorie": "RÉUSSI",
@@ -442,7 +449,7 @@
       ],
       "instable": false,
       "detail": "12 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.1
     },
     "test_runner_complet": {
       "categorie": "RÉUSSI",
@@ -451,7 +458,7 @@
       ],
       "instable": false,
       "detail": "8 contrôles, 0 en échec",
-      "duree_s": 10.7
+      "duree_s": 15.2
     },
     "test_statuts_v123": {
       "categorie": "RÉUSSI",
@@ -460,7 +467,7 @@
       ],
       "instable": false,
       "detail": "7 contrôles, 0 en échec",
-      "duree_s": 0.9
+      "duree_s": 1.5
     },
     "test_suppression_zero_v154": {
       "categorie": "RÉUSSI",
@@ -469,7 +476,7 @@
       ],
       "instable": false,
       "detail": "20 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.5
     },
     "test_tcc_chrono_v134": {
       "categorie": "RÉUSSI",
@@ -478,7 +485,7 @@
       ],
       "instable": false,
       "detail": "23 contrôles, 0 en échec",
-      "duree_s": 1.0
+      "duree_s": 1.9
     },
     "test_temps_conduite": {
       "categorie": "RÉUSSI",
@@ -487,7 +494,7 @@
       ],
       "instable": false,
       "detail": "bilan texte « tout est passé »",
-      "duree_s": 1.1
+      "duree_s": 1.3
     },
     "test_validite_v15": {
       "categorie": "RÉUSSI",
@@ -496,17 +503,16 @@
       ],
       "instable": false,
       "detail": "33 contrôles, 0 en échec",
-      "duree_s": 1.3
+      "duree_s": 1.6
     },
     "test_verrous_sqlite_v150": {
-      "categorie": "INSTABLE",
+      "categorie": "RÉUSSI",
       "etats_observes": [
-        "RÉUSSI",
-        "ÉCHOUÉ"
+        "RÉUSSI"
       ],
-      "instable": true,
-      "detail": "états observés : RÉUSSI / ÉCHOUÉ — rien de stable",
-      "duree_s": 9.0
+      "instable": false,
+      "detail": "18 contrôles, 0 en échec",
+      "duree_s": 10.8
     },
     "test_ymane_branchement_v136": {
       "categorie": "RÉUSSI",
@@ -515,7 +521,7 @@
       ],
       "instable": false,
       "detail": "33 contrôles, 0 en échec",
-      "duree_s": 0.8
+      "duree_s": 1.2
     },
     "test_ymane_observabilite_v139": {
       "categorie": "RÉUSSI",
@@ -524,7 +530,7 @@
       ],
       "instable": false,
       "detail": "35 contrôles, 0 en échec",
-      "duree_s": 1.1
+      "duree_s": 1.5
     },
     "test_zeroquater_v120": {
       "categorie": "RÉUSSI",
@@ -533,7 +539,7 @@
       ],
       "instable": false,
       "detail": "21 contrôles, 0 en échec",
-      "duree_s": 1.1
+      "duree_s": 1.4
     }
   }
 }

@@ -5,6 +5,10 @@
 **Commit analysé** : `c976124` (correctif de concurrence `17ee6f1` inclus)
 **Branche `main`** : inchangée (`9a8f3ee`) — **aucune fusion, aucun déploiement**
 **Campagne exécutée** : 58 suites, 2 passages par suite — résultats bruts : `docs/audits/campagne_v154_resultats.json`
+**Mise à jour du 21/09/2026 (2ᵉ passe — correctifs R14→R19)** : **voir §9**.
+Elle ajoute une suite de tests (59 suites), sépare définitivement *issue / classe /
+phase / raison d'annulation*, prouve l'absence d'écriture après échéance et rend la
+réconciliation N2 interruptible. **Le verdict reste NO-GO** (§9, §1).
 
 ---
 
@@ -348,10 +352,21 @@ DATABASE_URL="sqlite:////tmp/t150.db" python -m unittest test_verrous_sqlite_v15
 python test_runner_complet.py
 #   → RÉSULTAT GLOBAL : 8 OK / 0 KO (suites exécutées : 8)
 
-# 5. Campagne complète (58 suites, 2 passages par suite)
+# 4bis. NOUVELLE suite R14→R19 (phases, erreurs, points d'arrêt, métriques)
+cd backend
+DATABASE_URL="sqlite:////tmp/test_sante_v154.db" python test_concurrence_sante_v154.py
+#   → RÉSULTAT : 70 OK / 0 KO
+
+# 4ter. Interface : messages de collecte (cause réelle, jamais supposée)
+cd ../frontend && npm test && npx tsc --noEmit && npm run build
+#   → tests 28 / pass 28 / fail 0 — TypeScript : 0 erreur
+
+# 5. Campagne complète (59 suites, 2 passages par suite)
 cd /home/user/tracking-operationnel-lss
-/tmp/lssvenv/bin/python backend/campagne_tests_v154.py --flaky 2 --discret \
-    --json /tmp/campagne_v154.json
+/tmp/lssvenv/bin/python backend/campagne_tests_v154.py --json \
+    docs/audits/campagne_v154_resultats.json
+#   → 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante
+#     (v150 : instable — voir §9.6)
 ```
 
 - Environnement : sandbox sans accès réseau, Python 3.11, SQLite (WAL), bases de
@@ -361,3 +376,102 @@ cd /home/user/tracking-operationnel-lss
 - Commits de la branche : `17ee6f1` (correctif de concurrence P0) puis `c976124`
   (couverture N2, budget par phase, 9 états de santé, mécanisme SQLite, lanceur
   portable) ; `main` reste à `9a8f3ee`, **PR #1 non fusionnée, rien déployé**.
+
+---
+
+## 9. Mise à jour du 21/09/2026 (2ᵉ passe) — correctifs R14 → R19
+
+Cette section **complète** §1 à §8 et **remplace les chiffres de campagne** qui y
+figurent (58 suites → **59**). Le reste du rapport reste valable tel quel.
+
+### 9.1 Ce que le diagnostic de la 2ᵉ passe a trouvé (et qui est corrigé)
+
+| Défaut constaté | Preuve du diagnostic | Correction |
+|---|---|---|
+| La **phase** était écrasée par le **motif d'annulation**, puis publiée « inconnue » | `concurrence.py` : `etape` recevait `etape_connue` = un motif (`surveillance_limite_depassee`) → repli forcé sur `"inconnue"` | **R14** : `phase`, `raison_annulation`, `classe`, `issue` sont **quatre champs distincts** ; « inconnue » n'est plus une phase valide et n'écrase plus une phase mesurée |
+| Un dépassement survenu pendant l'**écriture** était classé « attente SQLite » | `classer_erreur()` : `etape == "ecriture"` → `attente_sqlite` | **R14** : un dépassement est **toujours** `budget_depasse` (l'issue) ; `categorie` et `phase` disent *où* le temps est passé ; à l'écran, plus jamais « base verrouillée » pour un budget |
+| L'erreur d'une source **ne s'effaçait jamais** après une réussite ; N2 laissait `dernier_debut` à `null` | 1 échec N2 puis 3 succès → erreur toujours active | **R15** : une réussite **efface** l'erreur (l'historique est conservé) ; `dernier_debut` est publié pour N1 **et** N2 ; une source qui échoue *pendant* une passe garde son erreur visible |
+| La réconciliation N2 pouvait écrire **après l'échéance** (2 commits sur 2, le dernier +0,08 s après) | compteur `commits_apres_echeance` | **R16/R4** : points d'arrêt **avant et après** chaque appel réseau, chaque lot, chaque unité d'écriture, et **avant et après la clôture** ; un commit qui commence après l'échéance est **refusé et compté** |
+| L'arrêt de la passe était **avalé** comme « erreur de trajet » (`except Exception`) | réconciliation : `except Exception` après le point d'arrêt | **R5** : `except BudgetDepasse: raise` avant tout `except` large : l'échéance arrête la passe, elle ne devient pas une erreur d'unité |
+| `total_s` était lu comme un cumul et une phase d'écriture pouvait afficher 2 635 s | N2 = `chrono("ecriture")` sans point d'arrêt | **R7** : chaque passe publie **sa** durée ; le cumul et la moyenne sont publiés **à part** (`cumul`) |
+| Les cycles étaient des **clés globales** partagées : inversion « début MZONEX / fin CamtrackPro » | `14:14:09.381 < 14:14:09.432` selon la source | **R8/R18** : les cycles sont **par source** ; une passe en cours publie `fin = null` ; `CYCLES_EN_ECHEC` ne peut naître que d'un cycle comparé à lui-même |
+| La relecture historique repartait de zéro et pouvait monopoliser la base | — | **R10/R11** : progression mémorisée (journée, page, véhicule, dernier identifiant) et cession du temps réel (`laisser_passer_temps_reel`, attente bornée) |
+
+### 9.2 Métriques publiées (`/api/sante`, par source)
+
+`passe_actuelle` (fin = `null`, `issue = "en_cours"`, durée vive, restant de budget) ·
+`derniere_passe` (début, fin, durée, budget, phase, issue, annulée, raison) ·
+`dernier_resultat` (pages, lignes lues, lignes écrites, points écrits, véhicules) ·
+`cumul` (passes, total, **moyenne**, issues, dernière réussie) ·
+`derniere_erreur` (classe, phase, raison, issue) + `historique_erreur` + `derniere_reussite`.
+Attentes mesurées **séparément** : portail (`attente_http_s`), base (`attente_sqlite_s`),
+verrou applicatif (`attente_verrou_s`). Compteurs **non applicables à une source = `null`**
+(et listés dans `non_applicables`), **jamais 0** : `nb_vehicules`/`nb_points_ecrits` pour
+N2, `nb_vehicules` pour MZONEX.
+
+### 9.3 Interface (frontend) — la cause réelle, plus la supposition
+
+- Nouveau module partagé backend `app/messages_collecte.py` (une seule vérité pour
+  `/api/sante` et pour la grille) et module frontend `src/lib/santeMessages.ts`.
+- `/api/suivi` publie désormais `collecte_par_source` (issue, classe, cause, phase,
+  raison, message, action) ; `sources_bloquees_localement` ne contient plus que les
+  **vraies** attentes SQLite (la liste ne sert plus qu'au repli).
+- Le bandeau « collecte MZONEX **bloquée localement — base verrouillée** » n'est plus
+  produit pour `COLLECTE_BUDGET_DEPASSE` / `budget_depasse` / `portail_lent` /
+  `attente_http` / `ecriture` : le message dit « budget dépassé pendant la phase
+  écriture en base », avec l'action attendue.
+- La cause publiée reste distincte de l'issue : quand le budget est consommé **côté
+  portail**, l'issue reste `budget_depasse` et la **cause** est `portail_lent`
+  (le statut de santé affiche alors `COLLECTE_PORTAL_LENT`).
+
+### 9.4 Tests (voir §8 pour les commandes)
+
+| Suite | Résultat |
+|---|---|
+| `test_concurrence_verrous_v154.py` (N1) | **125 OK / 0 KO** (123 avant : deux contrôles ajoutés sur le nouveau contrat) |
+| `test_concurrence_n2_v154.py` (Niveau 2) | **64 OK / 0 KO** |
+| **`test_concurrence_sante_v154.py` (NOUVELLE — R14→R19, sections T1→T13)** | **70 OK / 0 KO** |
+| `npm test` (frontend, `node --test`) | **28 OK / 0 KO** (14 nouveaux sur les messages) |
+| `npx tsc --noEmit` + `npm run build` | **0 erreur**, build produit |
+| Campagne complète (`campagne_tests_v154.py --json …`) | **59 suites : 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante / 0 instable** |
+
+La section T4 de la nouvelle suite rejoue le scénario du 21/09 (MZONEX : **54,9 s pour
+un budget de 30 s**, phase **écriture**) et vérifie : arrêt **avant** la seconde
+écriture, **0** écriture après l'échéance (`commits_apres_echeance = 0`), 5 points
+écrits avant l'échéance **conservés**, phase publiée « écriture », **verrou rendu**.
+La section T5 interrompt la réconciliation N2 entre deux unités et prouve qu'aucune
+unité n'est **partielle**, que la reprise du cycle suivant **complète** le travail et
+qu'aucun **doublon** n'est créé.
+
+### 9.5 Assertions de tests mises à jour (transparence)
+
+Sept contrôles de `test_concurrence_verrous_v154.py` (sections [E], [J], [M1], [M4],
+[interface]) attendaient l'**ancien** contrat confus — `portail_lent` /
+`attente_sqlite` pour un **dépassement de budget**. Ils ont été réécrits, **jamais
+affaiblis** : ils vérifient désormais l'issue (`budget_depasse`) **ET** la phase
+(`pagination`, `ecriture`, `authentification`) **ET** la catégorie (`portail` /
+`locale`), et le test « huit causes » compare le triplet (classe, catégorie, phase),
+donc **plus** d'informations qu'avant. Aucune attente métier (seuil, budget, formule
+de calcul, règle de fusion) n'a été touchée ; aucun test n'a été supprimé.
+
+*Précision d'honnêteté* : ces contrôles portaient sur l'instrumentation écrite la
+veille, pas sur une règle métier. Le contrat qu'ils encodaient est **exactement** le
+défaut que la 2ᵉ passe devait corriger.
+
+### 9.6 Instabilité résiduelle de `test_verrous_sqlite_v150`
+
+Observations du 21/09 : **5 exécutions isolées réussies** (18/0), **1 passage de
+campagne en échec**, **1 passage de campagne réussi**. La suite mesure des durées de
+verrou SQLite : elle reste **sensible à la charge de la machine**, sans verdict
+stable. Elle est donc comptée comme **instable** (§3.6) et **ne vaut pas preuve** —
+elle ne doit pas être présentée comme verte.
+
+### 9.7 Verdict (mis à jour, inchangé)
+
+> ## ❌ NO-GO maintenu.
+
+Ce qui a changé : les défauts **de concurrence, de budget, de métriques et de santé**
+sont corrigés et **prouvés par une suite dédiée** (70 contrôles). Ce qui bloque
+toujours : les **trois suites en échec** (§4 : v113 et v145 = tests périmés, v130 =
+arbitrage métier à rendre), les **deux suites non exécutables ici** (§5), et
+l'**instabilité** de v150 (§9.6). Aucune fusion, aucun déploiement.

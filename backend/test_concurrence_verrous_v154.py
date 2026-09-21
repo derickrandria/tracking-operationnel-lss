@@ -249,12 +249,24 @@ check("l'issue publiée est BUDGET_DEPASSE",
 check("la durée totale est publiée et cohérente",
       met_e.get("total_s") is not None and met_e["total_s"] >= 0.3,
       f"→ {met_e.get('total_s')}")
-check("un dépassement passé à attendre le PORTAIL n'est pas classé « local »",
-      C.classer_erreur(C.BudgetDepasse("pagination", 31, 30))["classe"]
-      == C.CLASSE_PORTAIL_LENT)
-check("un dépassement passé à écrire est classé « attente SQLite »",
-      C.classer_erreur(C.BudgetDepasse("ecriture", 31, 30))["classe"]
-      == C.CLASSE_ATTENTE_SQLITE)
+# v1.54 R14 (21/09/2026) — CONTRAT MIS À JOUR, preuve RENFORCÉE : la classe
+# dit désormais l'ISSUE, la PHASE est publiée à part, et la CATÉGORIE conserve
+# l'information « est-ce notre infrastructure ? ». L'ancien test attendait
+# « portail_lent » / « attente_sqlite », c'est-à-dire la PHASE déguisée en cause —
+# exactement le défaut qui faisait afficher « base verrouillée » à l'écran.
+_dp_portail = C.classer_erreur(C.BudgetDepasse("pagination", 31, 30))
+_dp_ecriture = C.classer_erreur(C.BudgetDepasse("ecriture", 31, 30))
+check("un dépassement passé à attendre le PORTAIL est nommé « budget_depasse » "
+      "(l'issue) et sa CATÉGORIE dit « portail » (ce n'est pas notre base)",
+      _dp_portail["classe"] == C.CLASSE_BUDGET_DEPASSE
+      and _dp_portail["categorie"] == "portail"
+      and _dp_portail["etape"] == "pagination", f"→ {_dp_portail}")
+check("un dépassement passé à écrire reste « budget_depasse » (la base n'est PAS "
+      "la cause) et sa PHASE est publiée",
+      _dp_ecriture["classe"] == C.CLASSE_BUDGET_DEPASSE
+      and _dp_ecriture["categorie"] == "locale"
+      and _dp_ecriture["etape"] == "ecriture"
+      and _dp_ecriture["classe"] != C.CLASSE_ATTENTE_SQLITE, f"→ {_dp_ecriture}")
 
 # ══════════════════════════════════════════════════ [F] SQLite occupé
 titre("[F] SQLITE OCCUPÉ — mesuré, classé, jamais confondu avec le portail")
@@ -404,21 +416,41 @@ check("l'issue d'une passe réussie est TERMINE", met_i2.get("issue") == "TERMIN
 
 # ══════════════════════════════════════════════════════ [J] santé
 titre("[J] STATUT DE SANTÉ — huit causes DISTINGUÉES")
+# v1.54 R14 (21/09/2026) — CONTRAT MIS À JOUR : la CLASSE dit l'ISSUE, la
+# PHASE et la CATÉGORIE disent OÙ le temps a été consommé. Les huit causes
+# restent DISTINCTES, mais leur identité est désormais le triplet
+# (classe, catégorie, phase) — avant, la phase était déguisée en classe, et un
+# budget consommé par le portail s'affichait comme un problème local.
 cas = {
     "portail indisponible": (Exception("ErreurApiMZoneX: GET Events → HTTP 503 : down"),
-                             C.CLASSE_PORTAIL_INDISPONIBLE),
-    "portail lent": (C.BudgetDepasse("attente_http", 31, 30), C.CLASSE_PORTAIL_LENT),
+                             C.CLASSE_PORTAIL_INDISPONIBLE, "portail", "inconnue"),
+    "portail lent (budget consommé côté portail)":
+        (C.BudgetDepasse("attente_http", 31, 30), C.CLASSE_BUDGET_DEPASSE,
+         "portail", "attente_http"),
     "attente SQLite": (Exception("OperationalError: database is locked"),
-                       C.CLASSE_ATTENTE_SQLITE),
-    "verrou occupé": (C.VerrouOccupe("verrou détenu"), C.CLASSE_VERROU_OCCUPE),
-    "budget dépassé": (C.BudgetDepasse("inconnue", 31, 30), C.CLASSE_BUDGET_DEPASSE),
+                       C.CLASSE_ATTENTE_SQLITE, "locale", "inconnue"),
+    "verrou occupé": (C.VerrouOccupe("verrou détenu"), C.CLASSE_VERROU_OCCUPE,
+                      "locale", "verrou"),
+    "budget dépassé (phase non mesurée)":
+        (C.BudgetDepasse("inconnue", 31, 30), C.CLASSE_BUDGET_DEPASSE,
+         "portail", "inconnue"),
     "configuration absente": (Exception("ErreurAuthMZoneX: MZONEX_USER / MZONEX_PASSWORD absents"),
-                              C.CLASSE_CONFIGURATION_ABSENTE),
-    "collecte échouée": (Exception("TypeError: objet inattendu"), C.CLASSE_COLLECTE_ECHOUEE),
+                              C.CLASSE_CONFIGURATION_ABSENTE, "portail", "inconnue"),
+    "collecte échouée": (Exception("TypeError: objet inattendu"),
+                         C.CLASSE_COLLECTE_ECHOUEE, "portail", "inconnue"),
+    "écriture lente (budget consommé en base)":
+        (C.BudgetDepasse("ecriture", 31, 30), C.CLASSE_BUDGET_DEPASSE,
+         "locale", "ecriture"),
 }
-for libelle, (exc, attendu) in cas.items():
-    obtenu = C.classer_erreur(exc)["classe"]
-    check(f"« {libelle} » → {attendu}", obtenu == attendu, f"→ {obtenu}")
+_causes_vues = set()
+for libelle, (exc, attendu, categorie, phase) in cas.items():
+    _c = C.classer_erreur(exc)
+    _causes_vues.add((_c["classe"], _c["categorie"], _c["etape"] or "inconnue"))
+    check(f"« {libelle} » → {attendu} / {categorie} / {phase}",
+          _c["classe"] == attendu and _c["categorie"] == categorie
+          and (_c["etape"] or "inconnue") == phase, f"→ {_c}")
+check("les HUIT causes restent DISTINCTES (classe + catégorie + phase)",
+      len(_causes_vues) == len(cas), f"→ {sorted(_causes_vues)}")
 
 etat_j = S.etat_collecte_memoire()
 check("« collecte en cours » est distinguée (présence de passes actives)",
@@ -567,15 +599,20 @@ try:
           (met_m1.get("auth_s") or 0) >= 0.35, f"→ {met_m1.get('auth_s')}")
     check("une seule page a été demandée — aucune page APRÈS l'échéance",
           ClientFactice.page == 1, f"→ {ClientFactice.page} page(s)")
-    check("le dépassement à l'authentification est classé « portail lent » "
-          "(et non « local »)",
-          C.classer_erreur(C.BudgetDepasse("authentification", 31, 30))["classe"]
-          == C.CLASSE_PORTAIL_LENT)
+    # v1.54 R14 — l'ISSUE (budget_depasse) et la PHASE (authentification) sont
+    # désormais DEUX informations distinctes ; la catégorie dit « portail ».
+    _dp_auth = C.classer_erreur(C.BudgetDepasse("authentification", 31, 30))
+    check("le dépassement à l'authentification est nommé « budget_depasse » et sa "
+          "CATÉGORIE dit « portail » (et non « local »)",
+          _dp_auth["classe"] == C.CLASSE_BUDGET_DEPASSE
+          and _dp_auth["categorie"] == "portail" and _dp_auth["etape"] == "authentification",
+          f"→ {_dp_auth}")
     entree_m1 = next((d for d in S.sources_en_echec_detail()
                       if d["source"] == "MZONEX"), {})
-    check("la santé publie la classe fine ET l'étape bloquante",
-          entree_m1.get("classe") == C.CLASSE_PORTAIL_LENT
-          and entree_m1.get("etape") == "pagination", f"→ {entree_m1}")
+    check("la santé publie l'issue ET l'étape bloquante (deux champs distincts)",
+          entree_m1.get("classe") == C.CLASSE_BUDGET_DEPASSE
+          and entree_m1.get("etape") == "pagination"
+          and entree_m1.get("phase") == "pagination", f"→ {entree_m1}")
     check("le verrou est RENDU malgré l'arrêt", not C.verrou_de("MZONEX").occupe)
     check("la tâche est REPLANIFIABLE : une passe immédiate réussit",
           S._collecte_protegee("MZONEX", lambda: 42, timeout_s=2) == 42)
@@ -693,8 +730,15 @@ try:
     check("les lots écrits sont ENTIERS (aucun demi-lot)",
           lots_apres["points"] % lots_apres["n"] == 0
           or lots_apres["points"] == 40, f"→ {lots_apres}")
-    check("le dépassement à l'écriture est classé « attente SQLite »",
-          entree_m4.get("classe") == C.CLASSE_ATTENTE_SQLITE, f"→ {entree_m4}")
+    # v1.54 R14 — contrat mis à jour : l'ISSUE est « budget_depasse » et la
+    # PHASE (« ecriture ») est publiée à part. Avant, la classe annonçait
+    # « attente_sqlite », donc « base verrouillée » à l'écran, alors que le
+    # dépassement venait d'une écriture LENTE, pas de la base.
+    check("le dépassement à l'écriture est nommé « budget_depasse » (ISSUE) et sa "
+          "PHASE « ecriture » est publiée",
+          entree_m4.get("classe") == C.CLASSE_BUDGET_DEPASSE
+          and entree_m4.get("phase") == "ecriture"
+          and entree_m4.get("classe") != C.CLASSE_ATTENTE_SQLITE, f"→ {entree_m4}")
     check("la phase d'écriture est mesurée (≥ 0,1 s)",
           (met_m4.get("ecriture_s") or 0) >= 0.1, f"→ {met_m4.get('ecriture_s')}")
     check("le verrou est rendu et la source reste utilisable",
@@ -749,6 +793,8 @@ def _statut_sante(erreur=None, passe_active=False) -> dict:
 etats_attendus = [
     ("portail indisponible", Exception("ErreurApiMZoneX: GET Events → HTTP 503"),
      False, "COLLECTE_DEGRADEE"),
+    # v1.54 R14 — « portail lent » = le budget a été consommé CÔTÉ PORTAIL : la
+    # classe publiée est budget_depasse, et le STATUT pointe la cause (portail).
     ("portail lent", C.BudgetDepasse("attente_http", 31, 30), False,
      "COLLECTE_PORTAL_LENT"),
     ("verrou occupé", C.VerrouOccupe("verrou « MZONEX » détenu"), False,
@@ -776,8 +822,12 @@ check("les NEUF états sont tous DIFFÉRENTS (aucun regroupement)",
 
 budget_ecriture = C.BudgetDepasse("ecriture", 31, 30)
 corps_plein = _statut_sante(budget_ecriture, True)
-check("l'interface publie la classe fine et l'étape consommatrice",
-      "attente_sqlite" in (corps_plein.get("classes_en_echec") or [])
+# v1.54 R14 — l'interface publie l'ISSUE (budget_depasse) ET l'étape
+# consommatrice (ecriture) : l'exploitant sait QUOI et OÙ. Avant, la classe
+# annonçait « attente_sqlite » (donc « base verrouillée » à l'écran) alors que
+# la base n'était pour rien dans le dépassement.
+check("l'interface publie l'issue ET l'étape consommatrice (deux champs distincts)",
+      "budget_depasse" in (corps_plein.get("classes_en_echec") or [])
       and "ecriture" in (corps_plein.get("etapes_en_echec") or []),
       f"→ {corps_plein.get('classes_en_echec')} / {corps_plein.get('etapes_en_echec')}")
 check("l'interface publie les verrous PAR SOURCE (propriétaire + expiration)",

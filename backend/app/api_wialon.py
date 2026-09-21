@@ -40,7 +40,8 @@ from datetime import datetime, timedelta, timezone
 import time
 import httpx
 
-from .concurrence import BudgetDepasse, compter, mesurer, verifier_etape
+from .concurrence import (BudgetDepasse, compter, mesurer, restant_budget,
+                          verifier_etape)
 from .config import TZ, plaque_depuis_libelle_portail
 
 log = logging.getLogger("lss.api_wialon")
@@ -369,7 +370,10 @@ class ApiWialon:
                f"{urllib.parse.quote(json.dumps(params))}"
                + (f"&sid={self._sid}" if self._sid else ""))
         try:
-            with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
+            # R3 — même règle que MZoneX : le timeout suit le temps restant.
+            _restant = restant_budget()
+            _timeout = _TIMEOUT if _restant is None else max(1.0, min(_TIMEOUT, _restant))
+            with httpx.Client(timeout=httpx.Timeout(_timeout, connect=min(5.0, _timeout))) as client:
                 resp = client.get(url)
                 if resp.status_code != 200:
                     raise ErreurApiWialon(f"svc={svc} → HTTP {resp.status_code}")
@@ -577,7 +581,7 @@ class ApiWialon:
             # l'unité suivante si son budget est atteint.
             mesurer("vehicule", t_unite)
             t_unite = time.monotonic()
-            verifier_etape("vehicule")
+            verifier_etape("vehicule")   # R16 — AVANT l'unité (véhicule)
             compter("nb_vehicules")
             nom, uid = u.get("nm", ""), u.get("id")
             plaque = plaque_unite(nom)
@@ -662,5 +666,9 @@ class ApiWialon:
                 raise
             except Exception as exc:
                 log.error("CamtrackPro API : échec extraction messages « %s » (id=%s) : %s", nom, uid, exc, exc_info=True)
+            else:
+                # R16 — point d'arrêt APRÈS l'unité (véhicule) : la suivante
+                # n'est ouverte que si l'échéance n'est pas franchie.
+                verifier_etape("vehicule")
 
         return resultats

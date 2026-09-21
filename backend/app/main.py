@@ -782,6 +782,11 @@ for r in (auth.router, referentiels.router, operations.router, surveillance.rout
     app.include_router(r)
 
 
+# R7 — messages de collecte dans un module PARTAGÉ (santé + grille de suivi) :
+# une seule vérité, testable sans FastAPI.
+from .messages_collecte import message_collecte, messages_par_source
+
+
 @app.get("/api/sante")
 def sante(db: Session = Depends(get_db)):
     """Diagnostic de santé complet de l'instance Uvicorn en cours d'exécution."""
@@ -820,9 +825,20 @@ def sante(db: Session = Depends(get_db)):
                                   CLASSE_CONFIGURATION_ABSENTE,
                                   CLASSE_PORTAIL_INDISPONIBLE,
                                   CLASSE_PORTAIL_LENT, CLASSE_VERROU_OCCUPE,
-                                  passes_en_cours)
+                                  ETAPES_PORTAIL, passes_en_cours)
         sources_en_echec = _sources_en_echec()
         detail = _detail()
+        metriques_sources = etat_coll.get("metriques_par_source") or {}
+        # R7 — un message par source, construit sur la cause RÉELLE (issue +
+        # classe + phase), jamais sur une supposition (« base verrouillée »).
+        collecte_messages = messages_par_source(metriques_sources)
+        for _d in detail:                     # les sources en échec SANS métrique
+            collecte_messages.setdefault(
+                _d["source"],
+                message_collecte(_d["source"], classe=_d.get("classe"),
+                                 phase=_d.get("phase") or _d.get("etape"),
+                                 raison=_d.get("raison_annulation"),
+                                 issue=_d.get("issue")))
         # v1.54 — LA CLASSE FINE DÉCIDE (plus la seule catégorie locale/portail) :
         # un dépassement de budget passé à attendre le PORTAIL n'est plus annoncé
         # comme un problème local ; une attente SQLite n'est plus annoncée comme
@@ -835,10 +851,26 @@ def sante(db: Session = Depends(get_db)):
             CLASSE_PORTAIL_INDISPONIBLE, CLASSE_PORTAIL_LENT, CLASSE_CONFIGURATION_ABSENTE)]
         bloquee_localement = bool(locales)
         en_cours = bool(passes_en_cours())
+        # R18 — une inversion de cycle ne se juge QUE sur un même cycle, source
+        # par source (jamais « début MZONEX / fin CamtrackPro »).
+        # R14 — un DÉPASSEMENT dont la PHASE est côté portail EST un « portail
+        # lent » : l'ISSUE reste « budget_depasse » (publiée comme telle, avec
+        # sa phase), mais le STATUT pointe la cause réelle. Sans cette règle, un
+        # budget consommé par le portail serait annoncé « budget dépassé » sans
+        # dire OÙ le temps est passé.
+        _budget_cote_portail = any(
+            d.get("classe") == CLASSE_BUDGET_DEPASSE
+            and d.get("phase") in ETAPES_PORTAIL for d in detail)
+        cycles = etat_coll.get("cycles_par_source") or {}
+        cycles_en_echec = bool(cycles.get("cycles_en_echec"))
         if dernier_ev is None or retard_s is None:
             statut_str = "AUCUNE_COLLECTE"        # aucun point GPS en 24 h
         elif retard_s > 900:
             statut_str = "RETARD_COLLECTE"
+        elif cycles_en_echec:
+            # R18 — une source annonce une fin ANTÉRIEURE à son propre début :
+            # c'est un état explicite, jamais masqué par une cause plus générale.
+            statut_str = "CYCLES_EN_ECHEC"
         elif CLASSE_CONFIGURATION_ABSENTE in classes:
             # la source n'est PAS en panne : elle n'est pas configurée
             # (jeton, identifiants) — l'opérateur doit configurer, pas attendre
@@ -854,7 +886,7 @@ def sante(db: Session = Depends(get_db)):
             # (tâche disparue) — état distinct d'une panne de collecte, l'action
             # n'est pas d'attendre le portail mais de libérer la ressource.
             statut_str = "VERROU_OCCUPE"
-        elif CLASSE_PORTAIL_LENT in classes:
+        elif CLASSE_PORTAIL_LENT in classes or _budget_cote_portail:
             statut_str = "COLLECTE_PORTAL_LENT"   # le portail répond, mais lentement
         elif CLASSE_PORTAIL_INDISPONIBLE in classes:
             statut_str = "COLLECTE_DEGRADEE"      # portail indisponible
@@ -884,6 +916,15 @@ def sante(db: Session = Depends(get_db)):
             "etapes_en_echec": etapes,
             "collecte_en_cours": en_cours,
             "passes_en_cours": passes_en_cours(),
+            "cycles_en_echec": cycles_en_echec,
+            "sources_en_echec_cycle": cycles.get("sources_en_echec_cycle") or [],
+            # R2/R6 — métriques SÉPARÉES par source : passe en cours ≠ dernière
+            # passe publiée ; cumul, moyenne, erreur active, cycle, progression
+            # de la relecture. R7 — message adapté à la cause réelle.
+            "metriques_par_source": etat_coll.get("metriques_par_source") or {},
+            "cycles_par_source": etat_coll.get("cycles_par_source") or {},
+            "progression_relecture": etat_coll.get("progression_relecture") or {},
+            "collecte_messages": collecte_messages,
             # v1.50 — réglages SQLite réellement en vigueur : un journal
             # « delete » ou un busy_timeout retombé à 0 expliquerait les
             # verrous, autant le montrer que le supposer.

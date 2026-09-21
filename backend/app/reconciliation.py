@@ -57,6 +57,12 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import func, select
 
+# R4/R16 (21/09/2026) — gardiens de la passe de collecte : points d'arrêt et
+# refus de commit après échéance. HORS PASSE, ce sont des NO-OP : le
+# comportement des appels directs (tests, outils) reste strictement inchangé.
+from .concurrence import (BudgetDepasse, commit_autorise, compter,
+                          verifier_etape)
+
 from .config import jour_attribution, now_local
 from .engine import (PUBLISH_ENABLED, _verifier_temps, appliquer_badge_et_eco,
                      creer_conducteur_auto, creer_vehicule_auto, ensure_suivi,
@@ -1167,6 +1173,10 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
         _lst.sort()
 
     for it in items:
+        # R16 — POINT D'ARRÊT **AVANT** L'UNITÉ : si la passe a dépassé son
+        # échéance, aucune unité nouvelle ne commence (donc aucune écriture
+        # partielle : l'unité est un trajet entier, committé ou jamais).
+        verifier_etape("ecriture")
         try:
             debut, fin = it["debut"], it.get("fin")
             # GARDE D'INTÉGRITÉ STRICTE : une `fin` antérieure ou égale au `debut` est
@@ -1474,7 +1484,21 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
             _propager(db, suivi, vehicule, maintenant, jour_actif=(jour == jour_actuel))
             _synchroniser_archive(db, suivi)
             suivi_touches.add(suivi.id)
+            commit_autorise()          # R4 — pas de commit après l'échéance
             db.commit()
+            compter("nb_commits")
+            compter("nb_lignes_ecrites")
+            # R16 — POINT D'ARRÊT **APRÈS** L'UNITÉ : l'unité est committée
+            # (idempotente, rejouable) et la passe s'arrête ici si l'échéance
+            # est franchie — la suite repartira au cycle suivant.
+            verifier_etape("ecriture")
+        except BudgetDepasse:
+            # L'ARRÊT DE LA PASSE n'est PAS une erreur d'unité : sans ce garde,
+            # le `except Exception` ci-dessous transformait l'échéance en
+            # « erreur de trajet » et la boucle repartait sur l'unité suivante
+            # (l'échéance perdait tout son sens).
+            db.rollback()
+            raise
         except Exception:
             db.rollback()
             stats["erreurs"] = stats.get("erreurs", 0) + 1
