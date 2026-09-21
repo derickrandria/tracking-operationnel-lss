@@ -66,6 +66,7 @@ CAT_E = "ÉCHOUÉ"
 CAT_C = "CRASH"
 CAT_NX = "NON EXÉCUTÉ"
 CAT_NC = "NON CONCLUANT"
+CAT_F = "INSTABLE"          # plusieurs résultats DIFFÉRENTS : rien de stable
 
 
 def classer(stdout: str, stderr: str, code_retour: int) -> tuple[str, str]:
@@ -209,18 +210,25 @@ def main() -> int:
                 print(f"  · {suite.stem:<38} {categorie:<13} {detail[:60]}")
         cat = etats[-1]
         instable = len(set(etats)) > 1
+        # ⚠ v1.54 (21/09/2026) — CORRECTIF D'ÉTIQUETAGE : une suite instable
+        # était affichée « CRASH (instable) » même quand ses états observés
+        # étaient « RÉUSSI » et « ÉCHOUÉ » (jamais un plantage) : la campagne
+        # annonçait donc un faux crash. Une suite instable a sa PROPRE
+        # catégorie — elle ne prouve rien de stable et ne compte JAMAIS comme
+        # réussie — et ses états observés sont publiés tels quels.
         resultats[suite.stem] = {
-            "categorie": CAT_C + " (instable)" if instable else cat,
+            "categorie": CAT_F if instable else cat,
             "etats_observes": sorted(set(etats)),
             "instable": instable,
-            "detail": last_detail,
+            "detail": (f"états observés : {' / '.join(sorted(set(etats)))} — rien de stable"
+                       if instable else last_detail),
             "duree_s": round(duree, 1),
         }
 
     print("\n" + "=" * 78)
-    print("TABLEAU FINAL — cinq catégories distinctes")
+    print("TABLEAU FINAL — cinq catégories distinctes + les suites INSTABLES")
     print("=" * 78)
-    ordre = [CAT_R, CAT_E, CAT_C, CAT_NX, CAT_NC]
+    ordre = [CAT_R, CAT_E, CAT_C, CAT_NX, CAT_NC, CAT_F]
     def cle(r):
         c = r["categorie"]
         base = CAT_C if c.startswith(CAT_C) else c
@@ -240,7 +248,7 @@ def main() -> int:
         print(f"  {c:<15} : {compte[c]}")
     print(f"  {'TOTAL':<15} : {total}  "
           f"({compte[CAT_R]} + {compte[CAT_E]} + {compte[CAT_C]} + "
-          f"{compte[CAT_NX]} + {compte[CAT_NC]} = "
+          f"{compte[CAT_NX]} + {compte[CAT_NC]} + {compte[CAT_F]} = "
           f"{sum(compte.values())})")
     if flaky:
         print(f"\n  ⚠ FLAKY ({len(flaky)}) : {', '.join(flaky)}")
