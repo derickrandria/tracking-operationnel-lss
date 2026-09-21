@@ -43,9 +43,29 @@ _TIMEOUT = float(os.getenv("MZONEX_API_TIMEOUT_S", "30.0"))
 # Fenêtre de relecture Niveau 1 : 3 min de chevauchement (l'anti-rejeu existant
 # dédoublonne) ; 1ʳᵉ passe calibrée sur 15 min pour un payload léger et rapide.
 CHEVAUCHEMENT_S = int(os.getenv("MZONEX_API_CHEVAUCHEMENT_S", "180"))
-# Payload optimisé : fenêtre max temps réel calibrée à 15 minutes (900 s)
-# pour éviter tout timeout réseau sur l'API OData distante.
-FENETRE_MAX_S = int(os.getenv("MZONEX_API_FENETRE_MAX_S", "900"))
+# §0nonies decies M3 (arbitrage LSS du 29/08/2026) — PROFONDEUR de la fenêtre
+# de relecture N1 : un boîtier « muet » (zone sans couverture GSM) qui renvoie
+# son tampon avec moins de 3 h de retard enrichit la journée EN COURS (volume
+# mesuré en direct le 29/08 : ~600 événements/15 min, très loin du plafond
+# technique) ; au-delà de 3 h, la relecture des jours passés (M1) fait foi.
+# ⚠️ NE PAS confondre avec la TAILLE DES TRANCHES ci-dessous : la profondeur
+# historique (3 h) et le découpage du payload (15 min) sont DEUX réglages
+# INDÉPENDANTS. Une collecte toutes les 15 minutes ne limite jamais à 15
+# minutes l'historique relu (régression du 12/09 corrigée le 18/09).
+FENETRE_MAX_S = int(os.getenv("MZONEX_API_FENETRE_MAX_S", "10800"))
+# Découpage du payload en tranches de 15 min (une requête OData par tranche) :
+# c'est CE réglage qui garde les réponses légères et rapides. Une fenêtre de
+# 3 h est servie en 12 tranches de 15 min — jamais tronquée.
+TRANCHE_S = int(os.getenv("MZONEX_API_TRANCHE_S", "900"))
+# Garde-fou anti-régression (18/09/2026) : une profondeur PLUS PETITE que la
+# tranche signifie que le réglage a été confondu avec la taille du payload —
+# c'est exactement la régression du 12/09. Signalé fort, jamais silencieux.
+if FENETRE_MAX_S <= max(60, TRANCHE_S):
+    logging.getLogger("lss.api_mzonex").warning(
+        "MZONEX_API_FENETRE_MAX_S=%s s est INFÉRIEUR à la tranche de payload "
+        "(%s s) : la profondeur de rattrapage des boîtiers muets est "
+        "anormalement faible (attendu : 10800 s = 3 h).",
+        FENETRE_MAX_S, TRANCHE_S)
 DECALAGE_PUBLICATION_S = int(os.getenv("MZONEX_API_DECALAGE_S", "20"))
 MAX_PAGES = int(os.getenv("MZONEX_API_MAX_PAGES", "10"))
 TAILLE_PAGE = int(os.getenv("MZONEX_API_TAILLE_PAGE", "200"))
@@ -318,8 +338,10 @@ class ApiMZoneX:
         """Fil d'événements de la flotte sur [debut_utc ; fin_utc] (UTC naïves).
 
         Optimisation Payload v2026 : la fenêtre est découpée en tranches
-        de 15 minutes pour éviter tout engorgement et garantir des temps de réponse < 2s."""
-        pas = timedelta(minutes=15)
+        (`TRANCHE_S`, 15 min par défaut) pour éviter tout engorgement et garantir
+        des temps de réponse < 2 s — la PROFONDEUR relue, elle, n'est jamais
+        limitée par la tranche (une fenêtre de 3 h = 12 tranches)."""
+        pas = timedelta(seconds=max(60, TRANCHE_S))
         evs: list[dict] = []
         borne = debut_utc
         while borne < fin_utc:

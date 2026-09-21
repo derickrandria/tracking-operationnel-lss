@@ -70,7 +70,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
-from .config import (normaliser_ident, now_local,
+from .config import (TZ, normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
 from .engine import (cle_idempotence_evenement, creer_conducteur_auto,
@@ -78,7 +78,8 @@ from .engine import (cle_idempotence_evenement, creer_conducteur_auto,
 from .geozones import charger_zones, en_geozone
 from .models import (CollecteCheckpoint, EvenementGPS, SourceEvenement,
                       TypeEvenement, Vehicule)
-from .api_mzonex import (ApiMZoneX, point_depuis_evenement_api,
+from .api_mzonex import (FENETRE_MAX_S, TRANCHE_S, ApiMZoneX,
+                         depuis_utc, point_depuis_evenement_api,
                          trajet_depuis_api)
 from .api_wialon import (ApiWialon, jeton_configure,
                          point_depuis_position_wialon)
@@ -403,6 +404,40 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
         return 0
     finally:
         _liberer_verrou_n1()
+
+
+def _libelle_local(dt_utc_naif: datetime) -> str:
+    """UTC naïf → libellé LOCAL lisible (heure d'Antananarivo) pour l'audit."""
+    from datetime import timezone as _tz
+    try:
+        return dt_utc_naif.replace(tzinfo=_tz.utc).astimezone(TZ).isoformat()
+    except Exception:
+        return str(dt_utc_naif)
+
+
+def _audit_collecte(action: str, details: dict) -> None:
+    """v1.54 (18/09/2026) — règle 8 : la SOURCE et la PÉRIODE relue sont
+    consignées dans la table d'audit, avec l'issue et le volume.
+
+    Volontairement NON BLOQUANT (même philosophie que les checkpoints v1.50) :
+    un verrou d'écriture ne doit jamais faire tomber la collecte. Réservé aux
+    faits notables (rattrapage, échec) pour ne pas noyer la table d'audit.
+    """
+    try:
+        from .database import SessionLocal
+        from .models import AuditLog
+        db = SessionLocal()
+        try:
+            db.add(AuditLog(username="collecte",
+                            action=action,
+                            entite="source",
+                            entite_id=details.get("source"),
+                            details=details))
+            db.commit()
+        finally:
+            db.close()
+    except Exception:
+        log.exception("Traçage d'audit de collecte en échec (collecte non bloquée)")
 
 
 def _checkpoint_ouvre(source: str, debut: datetime, fin: datetime) -> str | None:
@@ -1986,8 +2021,25 @@ class MZoneXApiCollector(CollectorBase):
             lignes = self.api.evenements(debut_utc, fin_utc)
         except Exception as exc:
             _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+            _audit_collecte("collecte.echec_n1", {
+                "source": "MZONEX", "niveau": "N1_EVENEMENTS",
+                "periode_utc": [debut_utc.isoformat(), fin_utc.isoformat()],
+                "periode_locale": [_libelle_local(debut_utc), _libelle_local(fin_utc)],
+                "profondeur_s": FENETRE_MAX_S, "tranche_s": TRANCHE_S,
+                "erreur": f"{type(exc).__name__}: {exc}"[:300],
+                "issue": "ECHEC", "donnees_ingerees": 0})
             raise
         _checkpoint_ferme(checkpoint_id, "TERMINE")
+        if lignes:
+            # Règle 8 — source + PÉRIODE relue inscrites dans l'audit (les
+            # boîtiers muets renvoient ici leurs tampons tardifs).
+            _audit_collecte("collecte.fenetre_n1", {
+                "source": "MZONEX", "niveau": "N1_EVENEMENTS",
+                "periode_utc": [debut_utc.isoformat(), fin_utc.isoformat()],
+                "periode_locale": [_libelle_local(debut_utc), _libelle_local(fin_utc)],
+                "profondeur_s": FENETRE_MAX_S, "tranche_s": TRANCHE_S,
+                "evenements": len(lignes), "issue": "LU",
+                "donnees_ingerees": len(lignes)})
         log.info("MZoneX API (Événements) : %d événement(s), fenêtre %s → %s UTC",
                  len(lignes), debut_utc.strftime("%H:%M:%S"),
                  fin_utc.strftime("%H:%M:%S"))
@@ -2754,6 +2806,7 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
     # cascade du 18/09. La collecte reste REPRENABLE : les fenêtres sont
     # recalculées à chaque cycle à partir de ce qui manque réellement en base,
     # donc les points non traités le sont au cycle suivant (idempotent).
+    tracees: list[dict] = []           # v1.54 — périodes réellement relues
     budget = max(0, RELECTURE_N1_MAX_POINTS)
     # Traitement par petits lots de 2 fenêtres max pour garantir une exécution rapide (< 5s)
     fenetres_a_traiter = fenetres[:2]
@@ -2771,6 +2824,12 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
                 brut = coll.api.evenements(debut_utc, fin_utc)
             except Exception as exc:
                 _checkpoint_ferme(checkpoint_id, "ECHEC", str(exc)[:500])
+                _audit_collecte("collecte.relecture_n1_echec", {
+                    "source": "MZONEX", "niveau": "N1_RELECTURE_TROUS",
+                    "periode_locale": [debut_local.isoformat(),
+                                       fin_local.isoformat()],
+                    "jours": jours, "erreur": f"{type(exc).__name__}: {exc}"[:300],
+                    "issue": "ECHEC", "donnees_ingerees": 0})
                 raise
             points = coll.normaliser(brut)
             restant = max(0, budget - total)
@@ -2789,6 +2848,9 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
                 n = coll.inserer(points, historique=True)
                 total += n
             _checkpoint_ferme(checkpoint_id, "TERMINE")
+            tracees.append({"debut": debut_local.isoformat(),
+                            "fin": fin_local.isoformat(),
+                            "lus": len(brut), "points": n})
             log.info("Relecture N1 MZoneX %s → %s : %d événement(s) lu(s), "
                      "%d point(s) inséré(s)", debut_local.strftime("%m-%d %H:%M"),
                      fin_local.strftime("%H:%M"), len(brut), n)
@@ -2796,6 +2858,15 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
     except Exception:
         log.exception("Relecture N1 MZoneX en échec (retraitée au prochain "
                       "passage)")
+    if total:
+        # Règle 8 — le rattrapage (données arrivées tardivement) est AUDITÉ avec
+        # sa source et les PÉRIODES réellement relues.
+        _audit_collecte("collecte.relecture_n1", {
+            "source": "MZONEX", "niveau": "N1_RELECTURE_TROUS",
+            "jours": jours, "points_inseres": total,
+            "fenetres_relues": tracees[:20],
+            "fenetres_total": len(tracees), "issue": "RATTRAPAGE",
+            "donnees_ingerees": total})
     return total
 
 

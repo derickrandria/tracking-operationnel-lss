@@ -404,6 +404,11 @@ def _rejeter_conserve(db, trajet, motif: str, *, cause: str, jour, vehicule,
         "jour": jour.isoformat() if hasattr(jour, "isoformat") else str(jour),
         "motif_rejet": motif,
         "cause": cause,
+        # v1.54 — compatibilité des audits MÉTIER : les correcteurs historiques
+        # (`trajet.structure_corrige`) publiaient la cause dans `details.action`
+        # (« purge_recouvrement », « purge_residu »). Ce champ est CONSERVÉ :
+        # un correctif de conservation ne doit pas appauvrir la traçabilité.
+        "action": cause,
         "gardien": _snap_trajet(gardien) if gardien is not None else None,
         "avant": avant, "apres": apres,
         "suppression": "AUCUNE — ligne conservée en base, masquée à l'écran",
@@ -688,7 +693,16 @@ def _rejeter_geants_recouverts(db, suivi, vehicule, intervalles, ids_conserves,
     for t in trajets:
         if t.id in ids_conserves:
             continue                          # ligne officielle de ce cycle
-        if t.statut_validation == StatutValidationTrajet.REJETE:
+        deja_ecartee = (t.statut_validation == StatutValidationTrajet.REJETE)
+        if deja_ecartee and t.motif_rejet == "GEANT_RECOUVERT":
+            continue                          # déjà qualifiée (idempotent)
+        # v1.54 (18/09/2026) — une ligne peut avoir été écartée JUSTE AVANT par le
+        # chemin P1 (`fantome_non_officiel` → ORPHELIN_NON_CONFIRME). Le cas M2
+        # (« géant provisoire recouvert par la série officielle ») est PLUS
+        # SPÉCIFIQUE : on RE-QUALIFIE la ligne (motif métier + audit AVANT/APRÈS)
+        # au lieu de la sauter — la conservation ne doit pas effacer la trace
+        # ni le compteur d'exploitation.
+        if deja_ecartee and t.motif_rejet != "ORPHELIN_NON_CONFIRME":
             continue
         if t.statut_source != StatutSourceTrajet.PROVISOIRE:
             continue
@@ -725,11 +739,19 @@ def _rejeter_geants_recouverts(db, suivi, vehicule, intervalles, ids_conserves,
             continue
         avant = {"debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
                  "distance_km": t.distance_km}
+        motif_avant = t.motif_rejet if deja_ecartee else None
         t.statut_validation = StatutValidationTrajet.REJETE
+        t.motif_rejet = "GEANT_RECOUVERT"
         rejetes += 1
         _audit(db, "trajet.geant_rejete", t.id, {
             "plaque": vehicule.plaque, "jour": jour.isoformat(),
             "avant": avant,
+            "apres": {"debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
+                      "distance_km": t.distance_km,
+                      "statut_validation": t.statut_validation.value,
+                      "motif_rejet": "GEANT_RECOUVERT"},
+            "suppression": "AUCUNE — ligne conservée en base, masquée à l'écran",
+            "requalification": (motif_avant if motif_avant else "NOUVELLE"),
             "regle": "§0nonies decies M2 (29/08/2026) : géant provisoire "
                      "« boîtier muet » recouvert par les trajets officiels "
                      "publiés → REJETÉ (la série officielle découpe ; flag "
