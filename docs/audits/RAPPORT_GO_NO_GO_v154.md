@@ -309,7 +309,7 @@ que ce n'est pas fait, elles restent des trous de preuve.
 | 3 | Les 3 échecs sont **corrigés** | ❌ **NON** — 2 corrections de test **en attente d'accord**, 1 arbitrage métier requis |
 | 4 | Les 2 suites non exécutées sont **traitées** | ⚠️ **PARTIEL** — analysées et protocole fourni (§5) ; verdicts **non obtenus** (réseau / base bac à sable indisponibles ici) |
 | 5 | Le test non concluant est résolu | ✅ **FAIT** — `test_runner_complet` : 8/8, bilan lisible, exécutable de tout répertoire |
-| 6 | Aucun crash, aucune instabilité non expliquée | ⚠️ **0 crash** ; 1 suite instable (`test_verrous_sqlite_v150`, minutage préexistant, 7 exécutions isolées vertes) |
+| 6 | Aucun crash, aucune instabilité non expliquée | ⚠️ **0 crash** ; 1 suite instable (`test_verrous_sqlite_v150`, minutage préexistant, 7 exécutions isolées vertes) — **levé au §10.1** |
 
 **Tant que 3, 4 (verdicts) et 6 (stabilité) ne sont pas levés : NO-GO.**
 
@@ -366,7 +366,7 @@ cd /home/user/tracking-operationnel-lss
 /tmp/lssvenv/bin/python backend/campagne_tests_v154.py --json \
     docs/audits/campagne_v154_resultats.json
 #   → 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante
-#     (v150 : instable — voir §9.6)
+#     (v150 : instable — voir §9.6, **levé au §10.1** ; 3ᵉ passe : 54 / 3 / 0 / 2 — voir §10.7)
 ```
 
 - Environnement : sandbox sans accès réseau, Python 3.11, SQLite (WAL), bases de
@@ -466,12 +466,231 @@ verrou SQLite : elle reste **sensible à la charge de la machine**, sans verdict
 stable. Elle est donc comptée comme **instable** (§3.6) et **ne vaut pas preuve** —
 elle ne doit pas être présentée comme verte.
 
+> **Mise à jour (3ᵉ passe, le même jour)** : cette instabilité est **levée** —
+> l'instrument est réécrit en synchronisation par événements, la suite passe
+> **13 exécutions sur 13** (19 contrôles, 0 échec), y compris sous charge. Voir **§10.1**.
+
 ### 9.7 Verdict (mis à jour, inchangé)
 
 > ## ❌ NO-GO maintenu.
+
+*(État des six points de la 3ᵉ passe au **§10**.)*
 
 Ce qui a changé : les défauts **de concurrence, de budget, de métriques et de santé**
 sont corrigés et **prouvés par une suite dédiée** (70 contrôles). Ce qui bloque
 toujours : les **trois suites en échec** (§4 : v113 et v145 = tests périmés, v130 =
 arbitrage métier à rendre), les **deux suites non exécutables ici** (§5), et
 l'**instabilité** de v150 (§9.6). Aucune fusion, aucun déploiement.
+
+---
+
+## 10. Levée du NO-GO — 3ᵉ passe (21/09/2026)
+
+Le responsable backend a fixé l'ordre des six points à traiter. État exact, point par
+point. Ce chapitre **remplace l'état du §6** et **lève l'instabilité décrite au §9.6**.
+
+| # | Point demandé | État | Preuve |
+|---|---|---|---|
+| 1 | `test_verrous_sqlite_v150` totalement déterministe, ≥ 10 exécutions vertes | ✅ **FAIT** | §10.1 — 13 exécutions, 19 contrôles, 0 KO |
+| 2 | D4-2 analysé **sans aucune modification** de code ni d'assertion | ✅ **ANALYSÉ** — arbitrage attendu | §10.2 |
+| 3 | v113 : ancienne assertion montrée + proposition d'assertion | ✅ **PROPOSÉ** — non appliqué | §10.3 |
+| 4 | v145 : fixture temporelle indépendante de la date réelle | ✅ **FAIT** | §10.4 |
+| 4bis | *Découvert en 3ᵉ passe* : `test_validite_v15`, même défaut de fixture | ✅ **PROPOSÉ** — non appliqué | §10.5 |
+| 5 | Recette de préproduction, lecture seule, logs vérifiables | ✅ **OUTIL + PROCÉDURE LIVRÉS** — exécution réelle à faire | §10.6 |
+| 6 | Mise à jour de ce rapport | ✅ **FAIT** | ce chapitre |
+
+### 10.1 Point 1 — `test_verrous_sqlite_v150` : instrument rendu déterministe ✅
+
+**Ce qui n'allait pas** : la suite mesurait des *durées* (moniteur de verrou toutes les
+10 ms, seuil « attente maximale < 5 s », `sleep(0.05)`). Sur une machine chargée, ces
+mesures ratent des fenêtres et le verdict change d'une exécution à l'autre (§9.6 :
+5 succès, 1 échec, 1 succès).
+
+**Ce qui a été fait** : l'instrument ne mesure plus le temps, il **synchronise par
+événements** (« lock-step ») : chaque lot est signalé au moniteur, qui constate le
+verrou *pendant qu'il est tenu* ; la fenêtre finale est fermée par un drapeau d'arrêt ;
+le nombre de commits attendu est celui des lots **+ 1** (commit de clôture). Aucun seuil
+temporel, aucun aléa, aucun `sleep` de synchronisation.
+
+**Preuve — 13 exécutions, 19 contrôles :**
+
+| Exécutions | Conditions | Résultat |
+|---|---|---|
+| 1 à 10 | nominales | **19 OK / 0 KO** chacune |
+| 11 à 13 | sous charge CPU (insertions de 17,20 s / 16,99 s / 18,04 s) | **19 OK / 0 KO** chacune |
+
+Contrôles couverts : WAL actif, `busy_timeout` ≥ 30 000 ms, 6 000 points insérés,
+0 échec concurrent, `offres == servies == lots − 1`, verrou constaté tenu à chaque lot,
+`commits == lots + 1`, lots conservés avant panne, comportement des checkpoints, les
+3 cas « locale » + les 3 cas « portail », budget transformé en exception
+`BudgetDepasse`, `sources_en_echec_detail`.
+
+→ **Condition 6 (aucune instabilité non expliquée) : LEVÉE** pour v150.
+
+### 10.2 Point 2 — `test_reparation_v130` / D4-2 : analyse terminée, arbitrage attendu
+
+**Aucune ligne de code ni d'assertion n'a été touchée.** Le scénario a été rejoué en
+copie, avec sondes.
+
+| Élément | Valeur constatée |
+|---|---|
+| Jour | 22/08/2026 |
+| Véhicule | `0926TBV` |
+| Début du trajet | 10:00 |
+| Fin **portail** (fin réelle mesurée) | 11:15 |
+| Fin **LSS** (telle qu'affichée) | 23:59:59 |
+| Durée attendue | 1 h 15 |
+| Durée obtenue | 13 h 59 min 59 s |
+| Écart | **12 h 45** |
+
+**Cause identifiée** : la fixture du test crée le véhicule `0926TBV` avec le statut
+`MAINTENANCE`. À la réconciliation de minuit, l'item portail est **ignoré** :
+`backend/app/reconciliation.py` ~l.1214 — `vehicule.statut != "ACTIF"` →
+`stats["ignores"]`, avec la trace « Trajet validé pour véhicule non actif 0926TBV —
+ignoré ». La fin 11:15 n'est donc jamais appliquée et la ligne est refermée par le
+**repli de pré-consolidation** à `HEURE_PRE_CONSOLIDATION = 86399` (23:59:59,
+`backend/app/engine.py`) → 12 h 45 d'écart.
+
+**Preuve par l'inverse** (copie uniquement) : en forçant `v0926.statut = "ACTIF"` puis
+en relançant le cycle, **D4-1 ✅ / D4-2 ✅ / D4-3 ✅**. Le produit applique donc bien la
+règle ; c'est le scénario du test qui place le véhicule dans un état où cette règle
+s'applique.
+
+**Question posée à l'arbitrage** (deux chemins, aucun choisi) :
+
+1. **fixture** : le contrôle D4 décrit un véhicule *actif* ; le passer en `ACTIF` rend
+   le test conforme à son intention ;
+2. **règle produit** : si un trajet validé pour un véhicule non actif doit être
+   appliqué, c'est `reconciliation.py` qu'il faut changer (politique « pas de trajets
+   officiels pour véhicule non ACTIF »).
+
+Tant que l'arbitrage n'est pas rendu, **rien n'est modifié**.
+
+### 10.3 Point 3 — `test_chaines_v113` : ancienne assertion, proposition prête
+
+**Ancienne assertion** (`backend/test_chaines_v113.py` l.261-262) : `len(restants_b) == 4`
+— elle compte les lignes restantes en base après rejeu.
+
+**Pourquoi elle échoue** : elle encode la **purge physique** de l'ère v1.31. Depuis P1
+(v1.54), la réconciliation **ne supprime jamais** : le jumeau écarté est conservé en
+base, marqué `REJETE`, avec son motif et une trace d'audit. Le compte réel est donc
+**5** (4 fragments officiels + le jumeau conservé), et non 4.
+
+**Proposition (testée en copie, non appliquée)** — remplacer le comptage nu par six
+contrôles qui décrivent la règle réellement en vigueur :
+
+| Ref | Contrôle |
+|---|---|
+| P1a | le jumeau périmé est **conservé en base**, statut `REJETE`, motif `DOUBLON_JUMEAU` |
+| P1b | les **4 fragments officiels** sont conservés |
+| P1c | **une seule** ligne non écartée, à 06:05:34 |
+| P1d | le masquage est **audité** (`AuditLog`, motif) |
+| P1e | TCJ = **4 fragments seulement** (le jumeau écarté est exclu des compteurs) |
+| P1f | TTJ = 06:05:34 → 09:48:14 |
+
+Résultat de la version proposée en copie : **46 OK / 0 KO** (version actuelle : 41/1).
+Un import `AuditLog` doit être ajouté (l.77). **Aucune assertion n'est affaiblie** : la
+présence du jumeau est désormais *prouvée* au lieu d'être supposée absente.
+
+### 10.4 Point 4 — `test_positions_portails_v145` : fixture temporelle ✅
+
+**Ce qui n'allait pas** : le bouchon MZoneX fabriquait des trajets aux dates figées
+**31/08/2026**, comparés au jour réellement sondé. Dès que la machine a dépassé le
+01/09, la suite est passée au rouge — sans qu'aucune règle métier n'ait changé.
+
+**Correction appliquée** : un helper `utc_iso_jour(jour, hh, mm, ss)` construit les
+horodatages à partir du **jour sondé** ; les événements du bouchon (17:30, 19:45, 21:00,
+18:00:01 locales) et les deux bornes testées en dérivent. **Zéro date en dur**, **valeurs
+attendues inchangées**.
+
+**Preuve** : 3 exécutions → **48 OK / 0 KO** chacune ; la suite passe de ÉCHOUÉ à RÉUSSI
+dans la campagne (§10.7).
+
+### 10.5 Point 4bis (découvert en 3ᵉ passe) — `test_validite_v15` : instabilité par l'heure réelle
+
+En rejouant la campagne, une **quatrième** suite est apparue en échec
+(`test_validite_v15`, 32/33). Même famille de défaut que v145, mais côté *heure* et non
+côté *date* : le test crée un « trajet en cours » à `maintenant − 30 min`
+(`maintenant = now_local()`, l.49 et l.287) et lui envoie un trajet officiel **figé de
+15:00 à 15:40** (l.289-292). Selon l'heure réelle, les deux fenêtres se recouvrent ou non.
+
+**Preuve par horloge simulée** (même code, même base, seule l'heure change) :
+
+| Heure imposée | Résultat | Contrôle en échec |
+|---|---|---|
+| 09:00 | 33 OK / 0 KO | — |
+| 11:00 | 33 OK / 0 KO | — |
+| 15:29 | 32 OK / 1 KO | `statut_source` du trajet en cours modifié |
+| 15:31 | 32 OK / 1 KO | idem |
+| **15:59** (heure réelle de la campagne) | **32 OK / 1 KO** | `statut_validation = REJETE` |
+| 16:01 (heure réelle, fichier du dépôt) | 32 OK / 1 KO | idem |
+| 16:11 / 16:12 | 33 OK / 0 KO | — |
+
+Fenêtre d'échec : `maintenant − 30 min` tombe dans `[15:00 ; 15:40]`, soit
+`maintenant ∈ [15:30 ; 16:10]`.
+
+**Mécanisme produit (normal, voulu, documenté)** : si un trajet officiel N2 recouvre une
+ligne ouverte provisoire, `backend/app/reconciliation.py` l'écarte de l'affichage en la
+**conservant** en base avec son motif — règle `OUVERT_RECOUVERT`, `_rejeter_conserve()`
+~l.521-531 (P1). Le produit **ne valide rien prématurément** : l'officiel fait foi.
+C'est donc bien **la fixture**, pas le produit, qui crée la collision.
+
+**Proposition (testée en copie à six horloges, non appliquée)** : dériver *les deux*
+bornes de `maintenant` avec un écart **prouvé** — trajet officiel de `maintenant −150 min`
+à `maintenant −110 min`, trajet en cours à `maintenant −30 min` → écart 80 min > seuil
+de 30 min : jamais recouvrant, jamais adjacent, quelle que soit l'heure. Valeur attendue
+inchangée (`PROVISOIRE` + `EN_ATTENTE`). Résultat de la copie : **33 OK / 0 KO à 00:30,
+02:00, 09:00, 15:31, 15:59 et 23:59**.
+
+### 10.6 Point 5 — Recette de préproduction : outil et procédure livrés
+
+Deux suites ne peuvent rien prouver ici (§5). Un pilote de recette **lecture seule** a été
+écrit : `backend/recette_preprod_v154.py`, avec son mode d'emploi
+`docs/audits/RECETTE_PREPROD_v154.md`.
+
+| Garantie | Comment elle est obtenue |
+|---|---|
+| Jamais la production | refus si `APP_ENV=production` ; refus si le fichier ne s'appelle pas `*preprod*` |
+| Lecture seule **démontrée** | empreinte SHA-256 de la base avant **et** après ; toute différence fait basculer le verdict |
+| Aucune écriture dans la base fournie | la suite E2E travaille sur une **copie** (`/tmp/e2e_v113.db`) |
+| Aucun secret | sorties filtrées (`password`, `token=`, `bearer`, …) avant journalisation |
+| Traçabilité | journal JSON horodaté `docs/audits/recette_preprod_<horodatage>.json` + commit Git |
+| Codes de sortie | 0 = conforme · 1 = écart · 2 = refus de sécurité |
+
+**Essai à blanc réel du 21/09/2026** (base de démonstration ; le réseau est
+volontairement absent dans cet environnement) : `ouverture = OK` ·
+`ping_portails = AUCUN_PORTAIL_JOIGNABLE` (0/6 joignable — normal sans réseau) ·
+`e2e_reel_v113 = CONFORME` (**16 OK / 0 KO**) avec **empreintes identiques**
+(`0362ba85edd4aedc` avant et après → base source intacte) ·
+`verdict_final = RECETTE_NON_CONFORME` (par manque de réseau, pas par défaut produit).
+
+**Reste à faire** : exécuter le pilote sur le poste de préproduction, puis **citer le
+journal** ici. Critères d'acceptation : mode d'emploi, §6.
+
+### 10.7 Verdict de la 3ᵉ passe — conditions et état
+
+| # | Condition | État au 21/09/2026 (3ᵉ passe) |
+|---|---|---|
+| 1 | Les tests N2 sont ajoutés | ✅ **FAIT** — 64 contrôles |
+| 2 | Les échecs sont **expliqués** | ✅ **FAIT** — v113, v145, v130 (§4) + v15 (§10.5) |
+| 3 | Les échecs sont **corrigés** | ⚠️ **PARTIEL** — v145 corrigé ✅ ; v113 et v15 : corrections **prêtes, non appliquées** (accord requis) ; v130 : arbitrage métier attendu |
+| 4 | Les suites non exécutées sont **traitées** | ⚠️ **PARTIEL** — outil + procédure livrés (§10.6) ; verdicts de préproduction **non obtenus** à ce jour |
+| 5 | Le test non concluant est résolu | ✅ **FAIT** — runner 8/8 |
+| 6 | Aucun crash, aucune instabilité non expliquée | ✅ **0 crash** ; **v150 déterministe 13/13** (§10.1) ; v15 : instabilité **expliquée**, correction prête (§10.5) |
+
+> ## ❌ NO-GO maintenu.
+
+**Ce qui bloque encore, exactement** :
+
+- (a) trois corrections de test **prêtes mais non appliquées** — accord requis pour v113
+  et v15, arbitrage métier pour v130 / D4-2 ;
+- (b) les **deux verdicts de préproduction** non obtenus (aucun accès réseau ici) ;
+- (c) la campagne ne peut pas être déclarée verte : **54 réussies / 3 échouées /
+  0 plantée / 2 non exécutées** — dont, à ce jour, **1 instabilité expliquée** (v15) et
+  **2 échecs de tests périmés** (v113, v130).
+
+**Ce qui est levé** : l'instabilité de `test_verrous_sqlite_v150` (13/13, §10.1) et le
+défaut de fixture de `test_positions_portails_v145` (§10.4).
+
+Rappels : aucune fusion, aucun déploiement ; `main` inchangée ; `SPEC_RULES_v3.md`
+inchangée ; aucune donnée de production touchée.
