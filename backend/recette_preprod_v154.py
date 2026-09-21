@@ -128,7 +128,7 @@ def etape_ping(journal: list) -> dict:
         if ligne.strip().startswith(("✅", "❌")) and "[" in ligne:
             nom = ligne.split("[", 1)[1].rstrip("]").strip()
             (joignables if ligne.strip().startswith("✅") else injoignables).append(nom)
-    verdict = ("PORTails_JOIGNABLES" if joignables and not injoignables
+    verdict = ("PORTAILS_JOIGNABLES" if joignables and not injoignables
                else ("PARTIEL" if joignables else "AUCUN_PORTAIL_JOIGNABLE"))
     journaliser(journal, "ping_portails", verdict=verdict, code=proc.returncode,
                 duree_s=round(time.monotonic() - t0, 2),
@@ -218,7 +218,7 @@ def main() -> int:
     # ── 3) verdict de recette
     p = resultats.get("ping", {}).get("verdict", "SAUTÉ")
     e = resultats.get("e2e", {}).get("verdict", "NON_EXÉCUTÉ")
-    conforme = e == "CONFORME" and p in ("PORTails_JOIGNABLES", "SAUTÉ")
+    conforme = e == "CONFORME" and p in ("PORTAILS_JOIGNABLES", "SAUTÉ")
     verdict = "RECETTE_CONFORME" if conforme else "RECETTE_NON_CONFORME"
     journaliser(journal, "verdict_final", verdict=verdict,
                 resume=f"ping={p} · e2e={e} · base intacte="

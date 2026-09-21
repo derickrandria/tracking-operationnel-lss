@@ -87,7 +87,7 @@ Essai exécuté dans le bac à sable avec une base de démonstration
 
 Interprétation : le **mécanisme** de recette est prouvé (E2E conforme 16 OK/0 KO,
 base source inchangée — empreintes identiques) ; seul le **réseau manque ici**.
-En préproduction, `ping_portails` doit rendre `PORTails_JOIGNABLES` pour que le
+En préproduction, `ping_portails` doit rendre `PORTAILS_JOIGNABLES` pour que le
 verdict global passe à `RECETTE_CONFORME`.
 
 ## 6. Critères d'acceptation (à joindre au GO/NO-GO)
