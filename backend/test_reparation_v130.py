@@ -30,8 +30,8 @@ from app import daily, engine, reparation
 from app.engine import get_seuils
 from app.models import (Alerte, AuditLog, EvenementGPS, HistoriqueJournalier,
                         Infraction, Mission, StatutSourceTrajet,
-                        StatutValidationTrajet, SuiviJournalier, Trajet,
-                        TypeAlerte, Vehicule)
+                        StatutValidationTrajet, StatutVehicule, SuiviJournalier,
+                        Trajet, TypeAlerte, Vehicule)
 from app.seed import seed_si_vide
 from app.main import migrer_schema
 
@@ -188,6 +188,15 @@ def relire(jour):
 # ------------------------------------------------------------------ D4 d'abord
 print("\n== D4 — le cycle de minuit relit les portails AVANT de figer la veille ==\n")
 daily._trajets_reels_du_jour = relire
+# v1.54 (arbitrage du 21/09) : le contrôle D4 décrit un trajet TERMINÉ AU PORTAIL
+# pour un véhicule EN SERVICE. Le jeu de démonstration place 0926TBV en MAINTENANCE ;
+# or la réconciliation de minuit n'applique pas les items portail des véhicules non
+# ACTIF (« Trajet validé pour véhicule non actif 0926TBV — ignoré », reconciliation.py).
+# La fixture rend donc le véhicule actif pour ce contrôle : sans cela, la ligne est
+# refermée par le repli de pré-consolidation à 23:59:59 (durée affichée 13 h 59 min 59 s
+# au lieu de 1 h 15) et le contrôle mesure le décor, pas la règle.
+v0926.statut = StatutVehicule.ACTIF
+db.commit()
 # véhicule 0926TBV : ligne « en cours » résiduelle ouverte à 10:00
 poser_ligne(v0926, J3, dt(J3, 10, 0), None, None,
             validation=StatutValidationTrajet.EN_ATTENTE,

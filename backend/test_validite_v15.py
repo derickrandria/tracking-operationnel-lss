@@ -288,9 +288,17 @@ try:
                     statut_source=StatutSourceTrajet.PROVISOIRE,
                     source_plateforme="MZONEX")
     db.add(ouvert); db.commit(); nettoie_trajets.append(ouvert.id)
+    # v1.54 : les DEUX fenêtres dérivent de `maintenant` et sont disjointes par
+    # construction (fin officielle 110 min avant maintenant, trajet en cours 30 min
+    # avant maintenant → écart 80 min > seuil de 30 min). Le décor ne peut donc plus
+    # recouvrir — ni jouxter — la ligne ouverte quelle que soit l'heure réelle
+    # d'exécution : avant, la fenêtre officielle figée (15:00→15:40) absorbait le
+    # trajet en cours créé à `maintenant − 30 min` (KO entre 15:30 et 16:10).
+    # Valeurs attendues INCHANGÉES (PROVISOIRE + EN_ATTENTE) : c'est le décor qui
+    # mesurait l'horloge, pas la règle.
     stats = reconcilier_trajets_valides(db, [{
-        "plaque": veh_ct.plaque, "debut": base.replace(hour=15),
-        "fin": base.replace(hour=15, minute=40), "distance_km": 12.0,
+        "plaque": veh_ct.plaque, "debut": maintenant - timedelta(minutes=150),
+        "fin": maintenant - timedelta(minutes=110), "distance_km": 12.0,
         "source": "CAMTRACKPRO"}], username="test-v15", maintenant=fin_journee)
     db.expire_all()
     o2 = db.get(Trajet, ouvert.id)
