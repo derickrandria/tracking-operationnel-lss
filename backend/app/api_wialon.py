@@ -570,6 +570,11 @@ class ApiWialon:
         log.info("CamtrackPro API : %d unités détectées pour messages_du_jour (%s, timestamps UTC: %d -> %d)",
                  len(unites_list), jour, debut_epoch, fin_epoch)
         for u in unites_list:
+            # v1.54 — MÉTRIQUES PAR VÉHICULE + POINT D'ARRÊT CONTRÔLÉ : le coût
+            # par unité est mesuré et publié, et la passe s'arrête AVANT l'unité
+            # suivante si son budget est atteint (elle n'écrit plus après).
+            verifier_etape("vehicule")
+            compter("nb_vehicules")
             nom, uid = u.get("nm", ""), u.get("id")
             plaque = plaque_unite(nom)
             if not plaque or uid is None:

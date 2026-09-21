@@ -70,6 +70,12 @@ from datetime import datetime, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, OperationalError
 
+from .concurrence import (BudgetDepasse, PasseCourante, Possession,
+                          VerrouOccupe, activer_passe, chrono, classer_erreur,
+                          compter, enregistrer_passe, etat_famille,
+                          forcer_famille, metriques_publiees, passe_courante, passe_de,
+                          passes_en_cours, publier_metriques, retirer_passe,
+                          verifier_etape, verrou_de)
 from .config import (TZ, normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
@@ -95,21 +101,34 @@ _COLLECTE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lss-c
 # L'ingestion temps réel N1 ne doit JAMAIS être bloquée par un calcul / réconciliation N2.
 # ==============================================================================
 
-# Verrou N1 : Aspiration GPS temps réel (MZoneX / Wialon / Simulateur)
-VERROU_COLLECTE_N1 = threading.Lock()
-_VERROU_N1_INTERNAL_LOCK = threading.Lock()
-_VERROU_N1_ACQUIS_TS: float | None = None
-_VERROU_N1_ACQUIS_PAR: str | None = None
+# ══════════════════════════════════════════════════════════════════════════
+# v1.54 (21/09/2026) — VERROUS À JETON DE POSSESSION, UN PAR SOURCE.
+#
+# Avant : UN verrou global réassignable. Une passe périmée continuait de tenir
+# « son » objet et, à sa sortie, libérait le verrou de la passe SUIVANTE
+# (défaut reproduit le 21/09 : exclusion mutuelle perdue, deux écritures en
+# même temps). Désormais : `concurrence.VerrouPossede` par ressource —
+# l'acquisition rend un JETON, la libération le vérifie, l'expiration est
+# explicite et nominative.
+#
+# MZONEX (temps réel), CAMTRACKPRO et MZONEX_RELECTURE ont chacun LEUR verrou :
+# la relecture historique (7 jours) ne peut plus affamer le temps réel.
+# ══════════════════════════════════════════════════════════════════════════
 LOCK_N1_TIMEOUT_S = float(os.getenv("COLLECTE_N1_LOCK_TIMEOUT_S", "30.0"))
-
-# Verrou N2 : Rapprochement, réconciliation et recalculs métier (Trajets)
-VERROU_TRAITEMENT_N2 = threading.Lock()
-_VERROU_N2_INTERNAL_LOCK = threading.Lock()
-_VERROU_N2_ACQUIS_TS: float | None = None
-_VERROU_N2_ACQUIS_PAR: str | None = None
 LOCK_N2_TIMEOUT_S = float(os.getenv("TRAITEMENT_N2_LOCK_TIMEOUT_S", "120.0"))
 
-# Rétrocompatibilité
+
+class _VerrouCompatN1:
+    """Rétrocompatibilité de LECTURE : `VERROU_COLLECTE_N1.locked()` répond
+    « au moins un verrou de la famille est détenu ». Aucune acquisition ne
+    passe par cet objet (elles passent toutes par un jeton)."""
+
+    def locked(self) -> bool:
+        return etat_famille(n2=False)["occupe"]
+
+
+VERROU_COLLECTE_N1 = _VerrouCompatN1()
+VERROU_TRAITEMENT_N2 = _VerrouCompatN1()
 COLLECTE_LOCK = VERROU_COLLECTE_N1
 LOCK_TIMEOUT_S = LOCK_N1_TIMEOUT_S
 
@@ -125,30 +144,20 @@ _ETAT_COLLECTE = {
 
 
 def forcer_deverrouillage_n1(raison: str = "manuel") -> bool:
-    """Force la libération immédiate du verrou N1 (ingestion GPS temps réel)."""
-    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
-    with _VERROU_N1_INTERNAL_LOCK:
-        was_locked = VERROU_COLLECTE_N1.locked()
-        VERROU_COLLECTE_N1 = threading.Lock()
-        COLLECTE_LOCK = VERROU_COLLECTE_N1
-        _VERROU_N1_ACQUIS_TS = None
-        _VERROU_N1_ACQUIS_PAR = None
-        if was_locked:
-            log.warning("VERROU_COLLECTE_N1 réinitialisé de force (raison: %s)", raison)
-        return was_locked
+    """Expire EXPLICITEMENT les verrous N1 (jeton invalidé — jamais remplacé en
+    silence). Utilisé au démarrage et par l'API de secours."""
+    touche = forcer_famille(n2=False, raison=raison)
+    if touche:
+        log.warning("Verrous N1 expirés de force (raison: %s)", raison)
+    return touche
 
 
 def forcer_deverrouillage_n2(raison: str = "manuel") -> bool:
-    """Force la libération immédiate du verrou N2 (recalculs / réconciliation métier)."""
-    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
-    with _VERROU_N2_INTERNAL_LOCK:
-        was_locked = VERROU_TRAITEMENT_N2.locked()
-        VERROU_TRAITEMENT_N2 = threading.Lock()
-        _VERROU_N2_ACQUIS_TS = None
-        _VERROU_N2_ACQUIS_PAR = None
-        if was_locked:
-            log.warning("VERROU_TRAITEMENT_N2 réinitialisé de force (raison: %s)", raison)
-        return was_locked
+    """Expire EXPLICITEMENT les verrous N2 (recalculs / réconciliation)."""
+    touche = forcer_famille(n2=True, raison=raison)
+    if touche:
+        log.warning("Verrous N2 expirés de force (raison: %s)", raison)
+    return touche
 
 
 def forcer_deverrouillage_collecte(raison: str = "manuel") -> bool:
@@ -158,78 +167,47 @@ def forcer_deverrouillage_collecte(raison: str = "manuel") -> bool:
     return b1 or b2
 
 
-def _acquerir_verrou_n1(source: str, timeout_max: float = LOCK_N1_TIMEOUT_S) -> bool:
-    """Tente d'acquérir le verrou N1. Si le verrou est détenu depuis plus de `timeout_max` secondes,
-    il est auto-libéré pour éviter tout blocage permanent de l'ingestion."""
-    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
-    with _VERROU_N1_INTERNAL_LOCK:
-        now = time.monotonic()
-        if VERROU_COLLECTE_N1.locked():
-            if _VERROU_N1_ACQUIS_TS is not None and (now - _VERROU_N1_ACQUIS_TS) > timeout_max:
-                log.warning("VERROU_COLLECTE_N1 détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION",
-                            now - _VERROU_N1_ACQUIS_TS, timeout_max, _VERROU_N1_ACQUIS_PAR)
-                VERROU_COLLECTE_N1 = threading.Lock()
-                COLLECTE_LOCK = VERROU_COLLECTE_N1
-                _VERROU_N1_ACQUIS_TS = None
-                _VERROU_N1_ACQUIS_PAR = None
+def _acquerir_verrou_n1(source: str, duree_s: float | None = None) -> Possession | None:
+    """Acquiert le verrou DE CETTE SOURCE. Renvoie le JETON de possession
+    (à conserver pour libérer) ou None si la ressource est déjà détenue.
 
-        if VERROU_COLLECTE_N1.acquire(blocking=False):
-            _VERROU_N1_ACQUIS_TS = time.monotonic()
-            _VERROU_N1_ACQUIS_PAR = source
-            return True
+    Aucune acquisition ne peut écraser la possession d'une autre tâche : si la
+    possession est expirée, `VerrouPossede` la déclare EXPIRÉE (journal
+    nominatif + compteur) et délivre un jeton d'une génération supérieure — le
+    jeton de la tâche sortante ne pourra plus rien libérer.
+    """
+    duree = float(duree_s if duree_s is not None
+                  else max(LOCK_N1_TIMEOUT_S, ATTENTE_SORTIE_PASSE_S + 10))
+    return verrou_de(source, duree_defaut_s=duree).acquerir(source, duree_s=duree)
+
+
+def _liberer_verrou_n1(possession: Possession | None) -> bool:
+    """Libère le verrou N1 **de la possession fournie** — un jeton étranger est
+    refusé (jamais la libération du verrou d'une autre tâche). À appeler dans un
+    `finally`."""
+    if possession is None:
         return False
+    return verrou_de(possession.ressource).liberer(possession)
 
 
-def _liberer_verrou_n1():
-    """Libère le verrou N1 et réinitialise les métadonnées temporelles."""
-    global VERROU_COLLECTE_N1, _VERROU_N1_ACQUIS_TS, _VERROU_N1_ACQUIS_PAR, COLLECTE_LOCK
-    with _VERROU_N1_INTERNAL_LOCK:
-        _VERROU_N1_ACQUIS_TS = None
-        _VERROU_N1_ACQUIS_PAR = None
-        try:
-            if VERROU_COLLECTE_N1.locked():
-                VERROU_COLLECTE_N1.release()
-        except RuntimeError:
-            VERROU_COLLECTE_N1 = threading.Lock()
-            COLLECTE_LOCK = VERROU_COLLECTE_N1
+def _acquerir_verrou_n2(source: str, duree_s: float | None = None) -> Possession | None:
+    """Acquiert le verrou N2 de cette source (mêmes garanties que N1)."""
+    ressource = source if source.startswith("N2_") else f"N2_{source}"
+    duree = float(duree_s if duree_s is not None else LOCK_N2_TIMEOUT_S)
+    return verrou_de(ressource, duree_defaut_s=duree).acquerir(ressource, duree_s=duree)
 
 
-def _acquerir_verrou_n2(source: str, timeout_max: float = LOCK_N2_TIMEOUT_S) -> bool:
-    """Tente d'acquérir le verrou N2 pour les traitements lourds / réconciliation."""
-    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
-    with _VERROU_N2_INTERNAL_LOCK:
-        now = time.monotonic()
-        if VERROU_TRAITEMENT_N2.locked():
-            if _VERROU_N2_ACQUIS_TS is not None and (now - _VERROU_N2_ACQUIS_TS) > timeout_max:
-                log.warning("VERROU_TRAITEMENT_N2 détenu depuis %.1fs (> %.1fs) par « %s » — AUTO-LIBÉRATION",
-                            now - _VERROU_N2_ACQUIS_TS, timeout_max, _VERROU_N2_ACQUIS_PAR)
-                VERROU_TRAITEMENT_N2 = threading.Lock()
-                _VERROU_N2_ACQUIS_TS = None
-                _VERROU_N2_ACQUIS_PAR = None
-
-        if VERROU_TRAITEMENT_N2.acquire(blocking=False):
-            _VERROU_N2_ACQUIS_TS = time.monotonic()
-            _VERROU_N2_ACQUIS_PAR = source
-            return True
+def _liberer_verrou_n2(possession: Possession | None) -> bool:
+    """Libère le verrou N2 **de la possession fournie** (jeton vérifié)."""
+    if possession is None:
         return False
-
-
-def _liberer_verrou_n2():
-    """Libère le verrou N2."""
-    global VERROU_TRAITEMENT_N2, _VERROU_N2_ACQUIS_TS, _VERROU_N2_ACQUIS_PAR
-    with _VERROU_N2_INTERNAL_LOCK:
-        _VERROU_N2_ACQUIS_TS = None
-        _VERROU_N2_ACQUIS_PAR = None
-        try:
-            if VERROU_TRAITEMENT_N2.locked():
-                VERROU_TRAITEMENT_N2.release()
-        except RuntimeError:
-            VERROU_TRAITEMENT_N2 = threading.Lock()
+    return verrou_de(possession.ressource).liberer(possession)
 
 
 # Alias de compatibilité
-_acquerir_verrou_collecte = _acquerir_verrou_n1
-_liberer_verrou_collecte = _liberer_verrou_n1
+# v1.54 — les alias `_acquerir_verrou_collecte` / `_liberer_verrou_collecte`
+# ont été SUPPRIMÉS : leur appel sans jeton (héritage d'avant le correctif)
+# libérait un verrou sans preuve de propriété, exactement le défaut corrigé.
 
 
 # ═══════════ v1.50 — VERROUS SQLITE : CAUSE LOCALE, PAS PANNE PORTAIL ═══════
@@ -263,10 +241,23 @@ def _erreur_locale(exc: Exception) -> bool:
     return any(motif in texte for motif in MOTIFS_ERREUR_LOCALE)
 
 
-class DepassementBudgetCollecte(TimeoutError):
+class DepassementBudgetCollecte(BudgetDepasse):
     """v1.50 — la passe a dépassé le budget de temps imparti par NOTRE
     planificateur : cause locale (notre orchestration), jamais une panne du
-    portail. Avant, ce cas était rangé du côté « source en panne »."""
+    portail. Avant, ce cas était rangé du côté « source en panne ».
+
+    v1.54 : la classe conserve sa signature d'origine (« message » en premier
+    argument) mais hérite de `concurrence.BudgetDepasse`, qui porte l'ÉTAPE
+    consommatrice du temps — c'est elle qui permet au statut de distinguer
+    « portail lent » de « attente SQLite » au lieu de tout ranger en « local ».
+    """
+
+    def __init__(self, message: str = "Budget de collecte dépassé",
+                 etape: str = "inconnue", ecoule_s: float = 0.0,
+                 budget_s: float = 0.0, source: str | None = None) -> None:
+        super().__init__(etape=etape, ecoule_s=ecoule_s, budget_s=budget_s,
+                         source=source)
+        self.message_compat = message
 
 
 def categorie_erreur(exc: Exception) -> str:
@@ -274,8 +265,12 @@ def categorie_erreur(exc: Exception) -> str:
     réseau — le leur). Sans cette distinction, un verrou SQLite s'affichait
     comme une panne de la source : le 18/09/2026 l'écran et /api/sante
     annonçaient « MZONEX en panne » alors que MZoneX répondait."""
-    if isinstance(exc, DepassementBudgetCollecte):
-        return "locale"                    # notre planificateur, pas le portail
+    if isinstance(exc, BudgetDepasse):
+        # Compatibilité v1.50 : au niveau « locale / portail » ce dépassement
+        # reste rangé du côté de NOTRE planificateur (il a déclenché l'arrêt).
+        # La distinction fine (portail lent / attente SQLite / verrou) est
+        # portée par `concurrence.classer_erreur()` et publiée par /api/sante.
+        return "locale"
     return "locale" if _erreur_locale(exc) else "portail"
 
 
@@ -296,40 +291,55 @@ def _etat_collecte_fin(source: str, nombre: int):
 
 
 def _etat_collecte_erreur(source: str, exc: Exception):
+    """Enregistre l'échec AVEC sa classe fine (v1.54) : c'est cette classe qui
+    alimente le statut de santé. `categorie` reste la valeur historique
+    (« locale » / « portail ») pour ne rien casser des contrats existants."""
+    classe = classer_erreur(exc)
     with _ETAT_COLLECTE_LOCK:
         erreur = f"{type(exc).__name__}: {exc}"
         _ETAT_COLLECTE["derniere_erreur"] = erreur
         _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
             {"derniere_erreur": erreur,
-             "derniere_erreur_categorie": categorie_erreur(exc)})
+             "derniere_erreur_categorie": categorie_erreur(exc),
+             "derniere_erreur_classe": classe["classe"],
+             "derniere_erreur_etape": classe.get("etape")})
+
+
+def _noter_verrou_refuse(source: str) -> None:
+    """Une passe N1 n'a pas pu démarrer : la ressource est détenue par une
+    autre tâche. Événement INFORMATIF (distingué d'une panne) et compté."""
+    with _ETAT_COLLECTE_LOCK:
+        _ETAT_COLLECTE["sources"].setdefault(source, {}).update(
+            {"dernier_verrou_refuse": now_local().isoformat()})
+        refus = _ETAT_COLLECTE.setdefault("verrous_refuses", {})
+        refus[source] = int(refus.get(source, 0)) + 1
 
 
 def etat_collecte_memoire() -> dict:
+    """État publié à `/api/sante`. v1.54 : chaque verrou est décrit par SA
+    source (propriétaire, prise, dernière activité, expiration, compteurs
+    d'expiration et de libérations refusées) — plus de propriétaire affiché
+    qui ne correspond plus au détenteur réel. Les métriques par étape de la
+    dernière passe de chaque source sont jointes."""
+    verrous_n1 = etat_famille(n2=False)
+    verrous_n2 = etat_famille(n2=True)
     with _ETAT_COLLECTE_LOCK:
-        now = time.monotonic()
-        est_occupe_n1 = VERROU_COLLECTE_N1.locked()
-        duree_n1_s = round(now - _VERROU_N1_ACQUIS_TS, 1) if (_VERROU_N1_ACQUIS_TS and est_occupe_n1) else None
-
-        est_occupe_n2 = VERROU_TRAITEMENT_N2.locked()
-        duree_n2_s = round(now - _VERROU_N2_ACQUIS_TS, 1) if (_VERROU_N2_ACQUIS_TS and est_occupe_n2) else None
-
-        return {
+        etat = {
             **_ETAT_COLLECTE,
             "sources": {k: dict(v) for k, v in _ETAT_COLLECTE["sources"].items()},
-            "verrou_occupe": est_occupe_n1,
-            "verrou_acquis_par": _VERROU_N1_ACQUIS_PAR if est_occupe_n1 else None,
-            "verrou_duree_s": duree_n1_s,
-            "verrou_n1": {
-                "occupe": est_occupe_n1,
-                "acquis_par": _VERROU_N1_ACQUIS_PAR if est_occupe_n1 else None,
-                "duree_s": duree_n1_s,
-            },
-            "verrou_n2": {
-                "occupe": est_occupe_n2,
-                "acquis_par": _VERROU_N2_ACQUIS_PAR if est_occupe_n2 else None,
-                "duree_s": duree_n2_s,
-            },
+            "verrous_refuses": dict(_ETAT_COLLECTE.get("verrous_refuses") or {}),
         }
+    return {
+        **etat,
+        "verrou_occupe": verrous_n1["occupe"],
+        "verrou_acquis_par": verrous_n1["acquis_par"] or None,
+        "verrou_duree_s": verrous_n1["duree_s"],
+        "verrou_n1": verrous_n1,
+        "verrou_n2": verrous_n2,
+        "verrous_par_source": verrous_n1["par_source"],
+        "collecte_en_cours": bool(verrous_n1["acquis_par"]),
+        "metriques_collecte": metriques_publiees(),
+    }
 
 
 def sources_en_echec() -> list[str]:
@@ -352,58 +362,143 @@ def sources_en_echec_detail() -> list[dict]:
     localement — base verrouillée » (nous) au lieu de tout confondre."""
     with _ETAT_COLLECTE_LOCK:
         sources = dict(_ETAT_COLLECTE.get("sources") or {})
-    return sorted(
-        ({"source": nom, "categorie": etat.get("derniere_erreur_categorie")
-          or categorie_erreur(Exception(etat.get("derniere_erreur") or "")),
-          "erreur": str(etat.get("derniere_erreur"))[:300],
-          "dernier_debut": etat.get("dernier_debut")}
-         for nom, etat in sources.items()
-         if isinstance(etat, dict) and etat.get("derniere_erreur")),
-        key=lambda d: d["source"])
+    def _detail(nom: str, etat: dict) -> dict:
+        erreur = str(etat.get("derniere_erreur") or "")
+        classe = etat.get("derniere_erreur_classe")
+        etape = etat.get("derniere_erreur_etape")
+        if not classe:      # état posé hors passe (ex. outil de contrôle)
+            fine = classer_erreur(Exception(erreur))
+            classe, etape = fine["classe"], fine.get("etape")
+        return {"source": nom,
+                "categorie": etat.get("derniere_erreur_categorie")
+                or categorie_erreur(Exception(erreur)),
+                "classe": classe,
+                "etape": etape,
+                "erreur": erreur[:300],
+                "dernier_debut": etat.get("dernier_debut")}
+
+    return sorted((_detail(nom, etat) for nom, etat in sources.items()
+                   if isinstance(etat, dict) and etat.get("derniere_erreur")),
+                  key=lambda d: d["source"])
+
+
+def _executer_avec_passe(action, passe: PasseCourante):
+    """Exécute la passe DANS SON FIL, avec son budget et ses métriques.
+
+    Les métriques vivent dans un espace PAR FIL (`threading.local`) : deux
+    passes concurrentes (temps réel + relecture) ne mélangent jamais leurs
+    compteurs.
+    """
+    with activer_passe(passe):
+        return action()
+
+
+def _finaliser_passe(passe: PasseCourante, issue: str,
+                     exc: Exception | None = None) -> dict:
+    """Clôt la passe : état publié, métriques, clôture du cycle.
+
+    `dernier_cycle_fin` est désormais écrit à CHAQUE fin de cycle (succès ou
+    échec) : l'inversion « fin antérieure au début » qui déroutait l'exploitant
+    ne signale plus qu'une chose : une passe terminée en échec
+    (`derniere_issue_cycle` le dit explicitement). La DERNIÈRE RÉUSSITE reste
+    publiée séparément (`derniere_reussite`).
+    """
+    depouillees = passe.terminer(issue)
+    publier_metriques(depouillees)
+    if exc is not None:
+        _etat_collecte_erreur(passe.source, exc)
+    with _ETAT_COLLECTE_LOCK:
+        _ETAT_COLLECTE["dernier_cycle_fin"] = now_local().isoformat()
+        _ETAT_COLLECTE["derniere_issue_cycle"] = issue
+        _ETAT_COLLECTE["sources"].setdefault(passe.source, {}).update(
+            {"derniere_issue": issue,
+             "etape_bloquante": depouillees.get("etape_bloquante")})
+    if issue != "TERMINE":
+        log.warning("Collecte %s : cycle clôturé en %s — étape « %s », %.1fs "
+                    "(budget %.1fs)", passe.source, issue,
+                    depouillees.get("etape_bloquante"),
+                    depouillees.get("total_s") or 0.0, passe.budget_s)
+    return depouillees
 
 
 def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
-    """Exécute une passe de source N1 sans chevauchement avec timeout dur de 30s."""
-    if not _acquerir_verrou_n1(source):
-        log.warning("Collecte N1 %s ignorée : une autre passe N1 est en cours", source)
+    """Exécute une passe de source N1 sous LE VERROU DE CETTE SOURCE, avec un
+    budget à points d'arrêt contrôlés.
+
+    Garanties (v1.54) :
+      - la possession est matérialisée par un JETON ; la libération le vérifie ;
+      - une passe qui dépasse son budget s'arrête à un point d'arrêt prévu
+        (avant une page, un véhicule, un lot d'écriture) : elle N'ÉCRIT PLUS
+        après son échéance ;
+      - la libération est TOUJOURS exécutée (`finally`), même en cas d'échec ;
+      - chaque source a SON verrou (MZONEX / CAMTRACKPRO / MZONEX_RELECTURE).
+    """
+    t_attente = time.monotonic()
+    possession = _acquerir_verrou_n1(
+        source, duree_s=timeout_s + ATTENTE_SORTIE_PASSE_S + 10)
+    attente_verrou_s = time.monotonic() - t_attente
+    if possession is None:
+        _noter_verrou_refuse(source)
+        etat = verrou_de(source).etat()
+        log.warning("Collecte N1 %s ignorée : verrou « %s » détenu par « %s » "
+                    "depuis %.1fs (jeton %s) — aucune écriture de ma part",
+                    source, source, etat.get("proprietaire"),
+                    etat.get("duree_s") or 0.0, etat.get("jeton"))
         return 0
+
+    passe = PasseCourante(source=source, budget_s=timeout_s)
+    passe.metriques.attente_verrou_s = round(attente_verrou_s, 3)
+    enregistrer_passe(source, passe)
     _etat_collecte_debut(source)
     try:
-        fut = _COLLECTE_EXECUTOR.submit(action)
-        nombre = int(fut.result(timeout=timeout_s) or 0)
-        _etat_collecte_fin(source, nombre)
-        return nombre
-    except (TimeoutError, FutureTimeoutError):
-        msg = (f"Budget de collecte dépassé ({timeout_s}s) — replanifié au "
-               f"prochain cycle")
-        # v1.50 — le « timeout dur » ne tuait RIEN : le thread de la passe
-        # poursuivait son insertion (et tenait le VERROU D'ÉCRITURE de la
-        # base) pendant que le cycle suivant démarrait — un orphelin qui
-        # expliquait la cascade de « database is locked » du 18/09. Les
-        # transactions étant désormais courtes (lots), on laisse la passe
-        # finir — borné — plutôt que de semer un orphelin derrière soi.
+        fut = _COLLECTE_EXECUTOR.submit(_executer_avec_passe, action, passe)
         try:
-            fut.result(timeout=ATTENTE_SORTIE_PASSE_S)
-            log.info("Collecte N1 %s : passe interrompue terminée proprement "
-                     "(verrou d'écriture rendu)", source)
-        except Exception:
-            log.warning("Collecte N1 %s : la passe interrompue n'a pas rendu "
-                        "la main en %ss — elle reste surveillée",
-                        source, ATTENTE_SORTIE_PASSE_S)
-        _etat_collecte_erreur(source, DepassementBudgetCollecte(msg))
-        log.warning("Collecte N1 %s interrompue : %s", source, msg)
-        if source == "MZONEX":
+            nombre = int(fut.result(timeout=timeout_s + ATTENTE_SORTIE_PASSE_S) or 0)
+        except BudgetDepasse as exc:
+            # ARRÊT CONTRÔLÉ : la passe a atteint son échéance à un point
+            # d'arrêt prévu et s'est arrêtée elle-même.
+            _finaliser_passe(passe, "BUDGET_DEPASSE", exc)
+            log.warning("Collecte N1 %s arrêtée proprement : %s", source, exc)
+            if source.startswith("MZONEX") and source != "MZONEX_RELECTURE":
+                try:
+                    _synchroniser_dernier_point_mzonex()
+                except Exception:
+                    pass
+            return 0
+        except FutureTimeoutError:
+            # La passe n'a pas atteint de point d'arrêt (appel réseau bloqué) :
+            # dernier recours, borné et explicite.
+            limite = passe.metriques.etape_dominante()
+            passe.annuler("echeance_sans_point_d_arret")
+            _finaliser_passe(passe, "BUDGET_DEPASSE", BudgetDepasse(
+                etape=limite, ecoule_s=passe.ecoule_s(), budget_s=timeout_s,
+                source=source))
             try:
-                _synchroniser_dernier_point_mzonex()
+                fut.result(timeout=ATTENTE_SORTIE_PASSE_S)
+                log.info("Collecte N1 %s : passe interrompue terminée proprement "
+                         "(verrou rendu)", source)
             except Exception:
-                pass
-        return 0
-    except Exception as exc:
-        _etat_collecte_erreur(source, exc)
-        log.exception("Échec collecte protégée N1 %s", source)
-        return 0
+                log.warning("Collecte N1 %s : la passe interrompue n'a pas rendu "
+                            "la main en %ss — elle reste surveillée (son jeton "
+                            "reste la seule clé de son verrou)",
+                            source, ATTENTE_SORTIE_PASSE_S)
+            return 0
+        except Exception as exc:
+            _finaliser_passe(passe, "ECHEC", exc)
+            log.exception("Échec collecte protégée N1 %s", source)
+            return 0
+        _etat_collecte_fin(source, nombre)
+        passe.metriques.nb_points_ecrits = nombre
+        _finaliser_passe(passe, "TERMINE")
+        return nombre
     finally:
-        _liberer_verrou_n1()
+        retirer_passe(source, passe)
+        # TOUJOURS libéré, et SEULEMENT si le jeton est bien le nôtre.
+        if not _liberer_verrou_n1(possession):
+            log.warning("Collecte N1 %s : verrou « %s » déjà expiré ou repris "
+                        "(jeton %s, génération %d) — libération sans effet",
+                        source, source, possession.jeton[:8],
+                        possession.generation)
 
 
 def _libelle_local(dt_utc_naif: datetime) -> str:
@@ -1413,17 +1508,36 @@ class CollectorBase:
             # perdre la passe entière.
             taille_lot = max(1, LOT_INSERTION)
             for debut_lot in range(0, len(points), taille_lot):
+                # v1.54 — POINT D'ARRÊT CONTRÔLÉ AVANT CHAQUE LOT : une passe
+                # qui a dépassé son budget N'ÉCRIT PLUS RIEN. L'écriture en
+                # cours est terminée (transaction courte et atomique), puis la
+                # passe se retire : plus de demi-lot écrit après l'échéance.
+                verifier_etape("ecriture")
                 tranche = points[debut_lot:debut_lot + taille_lot]
                 for tentative in range(1, COMMIT_ESSAIS + 1):
+                    t_lot = time.monotonic()
+                    avant_tranche = inseres
                     try:
-                        inseres += self._inserer_tranche(
-                            db, tranche, mapping, vus, historique)
-                        db.commit()
+                        with chrono("ecriture"):
+                            inseres += self._inserer_tranche(
+                                db, tranche, mapping, vus, historique)
+                            db.commit()
+                        # métrique EXACTE : on ne compte que ce qui a été écrit
+                        # (un lot entièrement dédoublonné ne « compte » pas).
+                        compter("nb_points_ecrits", inseres - avant_tranche)
                         if SOUFFLE_INTER_LOTS_S > 0:
                             time.sleep(SOUFFLE_INTER_LOTS_S)
                         break
                     except OperationalError as exc:
                         db.rollback()
+                        # v1.54 — ATTENTE SQLITE MESURÉE : le temps perdu à
+                        # attendre le verrou d'écriture de la base est
+                        # désormais publié (il n'est plus confondu avec un
+                        # temps passé chez le portail).
+                        _p = passe_courante()
+                        if _p is not None and _erreur_locale(exc):
+                            _p.metriques.ajouter("attente_sqlite_s",
+                                                 time.monotonic() - t_lot)
                         if not _erreur_locale(exc) or tentative == COMMIT_ESSAIS:
                             raise
                         log.warning(
@@ -2536,13 +2650,16 @@ VALIDATEURS_TRAJETS = {
 
 def synchroniser_trajets_valides(source: str | None = None) -> dict:
     source_nom = source or "MIXTE"
-    if not _acquerir_verrou_n2(f"N2_{source_nom}"):
-        log.warning("Synchronisation Niveau 2 ignorée : un traitement N2 est déjà en cours")
+    possession_n2 = _acquerir_verrou_n2(f"N2_{source_nom}")
+    if possession_n2 is None:
+        log.warning("Synchronisation Niveau 2 ignorée : le verrou « N2_%s » est "
+                    "détenu par « %s » — aucune écriture de ma part",
+                    source_nom, verrou_de(f"N2_{source_nom}").proprietaire)
         return {"occupee": True}
     try:
         return _synchroniser_trajets_valides(source)
     finally:
-        _liberer_verrou_n2()
+        _liberer_verrou_n2(possession_n2)
 
 
 def _synchroniser_trajets_valides(source: str | None = None) -> dict:
@@ -2870,6 +2987,69 @@ def relecture_n1_mzonex(jours: int | None = None) -> int:
     return total
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# v1.54 — WORKER DE RELECTURE HISTORIQUE (priorité inférieure, verrou séparé)
+# ══════════════════════════════════════════════════════════════════════════
+_RELECTURE_WORKER = {"demarre": False, "mono": 0.0}
+
+
+def relecture_due(maintenant_mono: float | None = None) -> bool:
+    """La relecture est-elle due ? (au démarrage, puis toutes les
+    RELECTURE_N1_PERIODE_S). Pur calcul — testable sans réseau."""
+    m = time.monotonic() if maintenant_mono is None else maintenant_mono
+    return (_RELECTURE_WORKER["mono"] == 0.0
+            or (m - _RELECTURE_WORKER["mono"]) >= RELECTURE_N1_PERIODE_S)
+
+
+def relire_si_due() -> int:
+    """Exécute UNE relecture si elle est due, sous son propre verrou. Renvoie
+    le nombre de points rattrapés (0 si rien à faire ou déjà en cours).
+
+    C'est le point d'entrée du worker : il ne touche JAMAIS aux verrous du
+    temps réel (MZONEX / CAMTRACKPRO)."""
+    if not relecture_due():
+        return 0
+    _RELECTURE_WORKER["mono"] = time.monotonic()
+    n = _collecte_protegee("MZONEX_RELECTURE", relecture_n1_mzonex,
+                           timeout_s=RELECTURE_N1_TIMEOUT_S)
+    if n:
+        log.info("Relecture N1 (Événements MZoneX, %d jours) : %d point(s) "
+                 "rattrapé(s) [worker dédié]", RELECTURE_N1_JOURS, n)
+    return n
+
+
+def worker_relecture_n1(arret: threading.Event | None = None,
+                        sommeil_s: float | None = None) -> None:
+    """Boucle du worker de relecture (priorité INFÉRIEURE au temps réel).
+
+    Un seul worker à la fois (`_RELECTURE_WORKER["demarre"]`) ; il ne démarre
+    jamais une relecture si la précédente tourne encore (son verrou le dit)."""
+    pause = float(sommeil_s if sommeil_s is not None
+                  else os.getenv("RELECTURE_N1_SOMMEIL_S", "20"))
+    log.info("Worker de relecture N1 démarré (période %ss, sommeil %ss, verrou "
+             "dédié « MZONEX_RELECTURE ») — priorité inférieure au temps réel",
+             RELECTURE_N1_PERIODE_S, pause)
+    while True:
+        if arret is not None and arret.is_set():
+            return
+        try:
+            relire_si_due()
+        except Exception:
+            log.exception("Worker de relecture N1 — échec (retraité au cycle "
+                          "suivant)")
+        time.sleep(max(1.0, pause))
+
+
+def demarrer_worker_relecture() -> bool:
+    """Démarre le worker UNE SEULE FOIS. Renvoie True s'il vient d'être lancé."""
+    if _RELECTURE_WORKER["demarre"]:
+        return False
+    _RELECTURE_WORKER["demarre"] = True
+    threading.Thread(target=worker_relecture_n1, name="lss-relecture-n1",
+                     daemon=True).start()
+    return True
+
+
 def boucle_collecte():
     """Collecte planifiée Niveau 1 en continu (période COLLECTOR_PERIODE_S, §10).
     `COLLECTOR_SOURCE=MIXTE` → Niveau 1 MZoneX (CamtrackPro = VALIDÉ direct,
@@ -2910,21 +3090,30 @@ def boucle_collecte():
     except Exception:
         log.exception("Chargement initial des géozones en échec — retraité "
                       "par le cache (choix « hors zone » inscrit, loi B4)")
-    while True:
-        # §0bis : Sécurité anti-blocage — libération forcée si un verrou est retenu au-delà de sa limite
-        if VERROU_COLLECTE_N1.locked():
-            now_m = time.monotonic()
-            if _VERROU_N1_ACQUIS_TS is not None and (now_m - _VERROU_N1_ACQUIS_TS) > 30.0:
-                log.warning("Verrou N1 de collecte bloqué depuis %.1fs (> 30s) — réinitialisation forcée",
-                            now_m - _VERROU_N1_ACQUIS_TS)
-                forcer_deverrouillage_n1(raison="abandon_cycle_bloque")
+    # v1.54 — le worker de relecture (priorité inférieure, verrou dédié) est
+    # démarré ICI, une seule fois : le temps réel ne l'attend jamais.
+    demarrer_worker_relecture()
 
-        if VERROU_TRAITEMENT_N2.locked():
-            now_m = time.monotonic()
-            if _VERROU_N2_ACQUIS_TS is not None and (now_m - _VERROU_N2_ACQUIS_TS) > 60.0:
-                log.warning("Verrou N2 de traitement bloqué depuis %.1fs (> 60s) — réinitialisation forcée",
-                            now_m - _VERROU_N2_ACQUIS_TS)
-                forcer_deverrouillage_n2(raison="abandon_cycle_n2_bloque")
+    while True:
+        # §0bis — SURVEILLANCE COOPÉRATIVE des verrous (v1.54).
+        # L'ancienne « réinitialisation forcée » VOLAIT le verrou : la passe
+        # périmée continuait d'écrire pendant qu'une autre démarrait. Ici, on
+        # ANNULE la passe qui dépasse sa limite : elle s'arrête à son prochain
+        # point d'arrêt et libère ELLE-MÊME son jeton. Aucun vol, aucune double
+        # écriture.
+        for _passes in passes_en_cours().items():
+            _ressource, _info = _passes
+            _limite = (LOCK_N2_TIMEOUT_S if _ressource.startswith("N2_")
+                       else LOCK_N1_TIMEOUT_S)
+            if _info["ecoule_s"] > _limite and not _info["annulee"]:
+                _passe = passe_de(_ressource)
+                if _passe is not None:
+                    log.warning("Passe « %s » au-delà de sa limite (%.1fs > %.1fs, "
+                                "étape « %s ») — ANNULATION COOPÉRATIVE (arrêt au "
+                                "prochain point d'arrêt)",
+                                _ressource, _info["ecoule_s"], _limite,
+                                _info["etape"])
+                    _passe.annuler("surveillance_limite_depassee")
 
         try:
             charger_zones()          # rechargement périodique (cache 6 h)
@@ -2945,22 +3134,12 @@ def boucle_collecte():
             if n_ctp:
                 log.info("Collecte CAMTRACKPRO (API) : %d points insérés",
                          n_ctp)
-        # Correctif v1.46 — relecture N1 (Événements MZoneX) : au démarrage puis
-        # toutes les RELECTURE_N1_PERIODE_S (défaut 1 h) — rattrape les trous
-        # > 3 h laissés par une panne de collecte (idempotent, anti-rejeu).
-        mono_n1 = time.monotonic()
-        if (_relecture_n1_memo["mono"] == 0.0
-                or mono_n1 - _relecture_n1_memo["mono"] >= RELECTURE_N1_PERIODE_S):
-            _relecture_n1_memo["mono"] = mono_n1
-            try:
-                n_n1 = _collecte_protegee("MZONEX_RELECTURE",
-                                          relecture_n1_mzonex,
-                                          timeout_s=RELECTURE_N1_TIMEOUT_S)
-                if n_n1:
-                    log.info("Relecture N1 (Événements MZoneX, %d jours) : "
-                             "%d point(s) rattrapé(s)", RELECTURE_N1_JOURS, n_n1)
-            except Exception:
-                log.exception("Relecture N1 MZoneX — échec (retraité)")
+        # v1.54 (21/09/2026) — LA RELECTURE HISTORIQUE N'EST PLUS DANS CETTE
+        # BOUCLE. Elle vit dans un WORKER DÉDIÉ, de priorité inférieure, avec
+        # SON PROPRE VERROU (« MZONEX_RELECTURE ») : une relecture de 7 jours
+        # peut durer, elle n'empêche plus jamais le temps réel d'être collecté.
+        # (Avant : même verrou + 180 s de budget ⇒ MZONEX et CamtrackPro
+        # étaient ignorés pendant toute la relecture.)
         # §0quater R2 (arbitrage 14/08/2026) — jamais un camion en route sans
         # ligne : (ré)ouverture des lignes manquantes d'après le dernier signal
         try:

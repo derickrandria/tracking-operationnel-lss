@@ -815,21 +815,50 @@ def sante(db: Session = Depends(get_db)):
         from .scrapers import (sources_en_echec as _sources_en_echec,
                                sources_en_echec_detail as _detail)
         from .database import pragmas_sqlite
+        from .concurrence import (CLASSE_ATTENTE_SQLITE, CLASSE_BUDGET_DEPASSE,
+                                  CLASSE_COLLECTE_ECHOUEE,
+                                  CLASSE_CONFIGURATION_ABSENTE,
+                                  CLASSE_PORTAIL_INDISPONIBLE,
+                                  CLASSE_PORTAIL_LENT, CLASSE_VERROU_OCCUPE,
+                                  passes_en_cours)
         sources_en_echec = _sources_en_echec()
         detail = _detail()
-        locales = [d["source"] for d in detail if d.get("categorie") == "locale"]
-        portails = [d["source"] for d in detail if d.get("categorie") != "locale"]
+        # v1.54 — LA CLASSE FINE DÉCIDE (plus la seule catégorie locale/portail) :
+        # un dépassement de budget passé à attendre le PORTAIL n'est plus annoncé
+        # comme un problème local ; une attente SQLite n'est plus annoncée comme
+        # une panne de portail ; un verrou détenu est un état, pas une panne.
+        classes = {d.get("classe") for d in detail if d.get("classe")}
+        etapes = sorted({d.get("etape") for d in detail if d.get("etape")})
+        locales = [d["source"] for d in detail
+                   if d.get("classe") == CLASSE_ATTENTE_SQLITE]
+        portails = [d["source"] for d in detail if d.get("classe") in (
+            CLASSE_PORTAIL_INDISPONIBLE, CLASSE_PORTAIL_LENT, CLASSE_CONFIGURATION_ABSENTE)]
         bloquee_localement = bool(locales)
+        en_cours = bool(passes_en_cours())
         if dernier_ev is None or retard_s is None:
             statut_str = "AUCUNE_COLLECTE"        # aucun point GPS en 24 h
         elif retard_s > 900:
             statut_str = "RETARD_COLLECTE"
-        elif bloquee_localement:
-            # la collecte est dégradée, mais PAS par le portail : ce statut
-            # conduit l'opérateur vers la base/le disque, pas vers MZoneX.
+        elif CLASSE_CONFIGURATION_ABSENTE in classes:
+            # la source n'est PAS en panne : elle n'est pas configurée
+            # (jeton, identifiants) — l'opérateur doit configurer, pas attendre
+            statut_str = "CONFIGURATION_ABSENTE"
+        elif CLASSE_ATTENTE_SQLITE in classes:
+            # dégradation par NOTRE base : conduit l'opérateur vers la
+            # base/le disque, jamais vers MZoneX.
             statut_str = "COLLECTE_BLOQUEE_LOCALEMENT"
+        elif CLASSE_VERROU_OCCUPE in classes and en_cours:
+            statut_str = "COLLECTE_EN_COURS"      # un cycle tourne, rien d'anormal
+        elif CLASSE_PORTAIL_LENT in classes:
+            statut_str = "COLLECTE_PORTAL_LENT"   # le portail répond, mais lentement
+        elif CLASSE_PORTAIL_INDISPONIBLE in classes:
+            statut_str = "COLLECTE_DEGRADEE"      # portail indisponible
+        elif CLASSE_BUDGET_DEPASSE in classes:
+            statut_str = "COLLECTE_BUDGET_DEPASSE"
+        elif en_cours:
+            statut_str = "COLLECTE_EN_COURS"
         elif sources_en_echec:
-            statut_str = "COLLECTE_DEGRADEE"
+            statut_str = "COLLECTE_ECHOUEE"
         else:
             statut_str = "COLLECTE_OK"
 
@@ -842,6 +871,14 @@ def sante(db: Session = Depends(get_db)):
             "sources_bloquees_localement": locales,
             "sources_portail_en_panne": portails,
             "collecte_bloquee_localement": bloquee_localement,
+            # v1.54 — classes FINES (portail indisponible / portail lent /
+            # attente SQLite / verrou occupé / budget dépassé / configuration
+            # absente / collecte en cours / collecte échouée) + étapes
+            # consommatrices du temps + passes actuellement en cours.
+            "classes_en_echec": sorted(classes),
+            "etapes_en_echec": etapes,
+            "collecte_en_cours": en_cours,
+            "passes_en_cours": passes_en_cours(),
             # v1.50 — réglages SQLite réellement en vigueur : un journal
             # « delete » ou un busy_timeout retombé à 0 expliquerait les
             # verrous, autant le montrer que le supposer.
@@ -864,6 +901,10 @@ def sante(db: Session = Depends(get_db)):
             "verrou_duree_s": etat_coll.get("verrou_duree_s"),
             "verrou_n1": etat_coll.get("verrou_n1"),
             "verrou_n2": etat_coll.get("verrou_n2"),
+            # v1.54 — un verrou par source (propriétaire, prise, dernière
+            # activité, expiration) et MÉTRIQUES PAR ÉTAPE de la dernière passe.
+            "verrous_par_source": etat_coll.get("verrous_par_source"),
+            "metriques_collecte": etat_coll.get("metriques_collecte"),
         }
     except Exception as e:
         log.exception("Erreur dans /api/sante")

@@ -31,6 +31,7 @@ import httpx
 
 socket.setdefaulttimeout(10.0)
 
+from .concurrence import chrono, compter, verifier_etape
 from .config import TZ, plaque_depuis_libelle_portail
 from .oauth_mzonex import ErreurAuthMZoneX, gestionnaire
 
@@ -234,24 +235,33 @@ class ApiMZoneX:
 
     # ---------------------------------------------------------------- bas
     def _get(self, chemin_requete: str, reessai: bool = True) -> dict:
+        # v1.54 — MÉTRIQUES PAR ÉTAPE : l'authentification (obtention du jeton,
+        # potentiellement un aller-retour OAuth) et l'attente HTTP sont mesurées
+        # séparément. Sans cela, un dépassement de budget ne pouvait pas dire si
+        # le temps était passé à s'authentifier, à attendre le portail, à
+        # paginer ou à écrire en base (trou d'observabilité du 21/09).
+        with chrono("auth"):
+            jeton = self._jetons.jeton()
         url = f"{BASE_API}/{chemin_requete}"
         headers = {
-            "Authorization": "Bearer " + self._jetons.jeton(),
+            "Authorization": "Bearer " + jeton,
             "User-Agent": _UA,
             "Accept": "application/json"
         }
         try:
-            with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
-                resp = client.get(url, headers=headers)
-                if resp.status_code == 401 and reessai:
-                    log.info("MZoneX API : jeton refusé (401) — ré-authentification")
-                    self._jetons.invalider()
-                    return self._get(chemin_requete, reessai=False)
-                if resp.status_code != 200:
-                    corps = resp.text[:160]
-                    raise ErreurApiMZoneX(
-                        f"GET {chemin_requete.split('?')[0]} → HTTP {resp.status_code} : {corps}")
-                return resp.json()
+            with chrono("attente_http"):
+                with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
+                    resp = client.get(url, headers=headers)
+                    if resp.status_code == 401 and reessai:
+                        log.info("MZoneX API : jeton refusé (401) — ré-authentification")
+                        self._jetons.invalider()
+                        return self._get(chemin_requete, reessai=False)
+                    if resp.status_code != 200:
+                        corps = resp.text[:160]
+                        raise ErreurApiMZoneX(
+                            f"GET {chemin_requete.split('?')[0]} → HTTP {resp.status_code} : {corps}")
+                    donnees = resp.json()
+            return donnees
         except httpx.TimeoutException as e:
             raise TimeoutError(f"GET {chemin_requete.split('?')[0]} timeout après {_TIMEOUT}s : {e}") from e
         except Exception as e:
@@ -272,9 +282,15 @@ class ApiMZoneX:
         saute = 0
         sep = "&" if "?" in chemin_requete else "?"
         for _ in range(MAX_PAGES):
+            # v1.54 — POINT D'ARRÊT CONTRÔLÉ : si le budget de la passe est
+            # atteint, on s'arrête ICI (avant l'appel réseau) au lieu de
+            # continuer en tâche de fond après avoir été déclaré en échec.
+            verifier_etape("pagination")
             lot = self._get(
                 f"{chemin_requete}{sep}$top={TAILLE_PAGE}&$skip={saute}")
+            compter("nb_pages")
             vals = lot.get("value", [])
+            compter("nb_lignes", len(vals))
             lignes.extend(vals)
             if len(vals) < TAILLE_PAGE:
                 break
@@ -345,6 +361,7 @@ class ApiMZoneX:
         evs: list[dict] = []
         borne = debut_utc
         while borne < fin_utc:
+            verifier_etape("pagination")     # v1.54 — arrêt contrôlé par tranche
             bout = min(borne + pas, fin_utc)
             chemin = ("Events?" + self._fenetre(borne, bout)
                       + "&$orderby=utcTimestamp")
