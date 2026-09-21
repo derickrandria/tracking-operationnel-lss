@@ -72,6 +72,20 @@ AUJ = date.today()
 HIER = AUJ - timedelta(days=1)
 
 
+def utc_iso_jour(jour: date, hh: int, mm: int, ss: int = 0) -> str:
+    """v1.54 (21/09/2026) — Horodatage UTC d'une heure LOCALE d'un jour donné.
+
+    La fixture ne contient plus AUCUNE date en dur : les portails simulés
+    répondent sur le jour réellement sondé (`HIER`). Avant, les événements
+    étaient figés au 31/08/2026 alors que la sonde portait sur « hier » : dès
+    que la date de la machine dépassait le 01/09/2026, ils tombaient hors du
+    jour sondé et le contrôle B9 échouait (20 jours d'écart mesuré le 21/09) —
+    un test périmé, pas un défaut produit."""
+    from datetime import timezone as _tz
+    local = datetime(jour.year, jour.month, jour.day, hh, mm, ss, tzinfo=TZ)
+    return local.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def zones_test():
     """Géozones synthétiques O3 (aucun appel portail)."""
     gz._zones = [
@@ -219,19 +233,21 @@ class _FauxMZoneX:
                 {"id": "g-2", "description": "4444 TDD (LSS)"}]
 
     def evenements(self, debut_utc, fin_utc):
+        # v1.54 — horodatages DÉRIVÉS du jour sondé (`HIER`) : mêmes heures
+        # locales qu'avant (17h30, 19h45, 21h00, 18h00:01), aucune date en dur.
         return [
             {"vehicle_Id": "g-1", "latitude": -18.60, "longitude": 47.60,
-             "utcTimestamp": "2026-08-31T14:30:00Z"},      # 17h30 locales
+             "utcTimestamp": utc_iso_jour(HIER, 17, 30)},   # 17h30 locales
             {"vehicle_Id": "g-1", "latitude": -18.61, "longitude": 47.61,
-             "utcTimestamp": "2026-08-31T16:45:00Z"},      # 19h45 locales
-            {"vehicle_Id": "g-1",                              # SANS position
-             "utcTimestamp": "2026-08-31T18:00:00Z"},
+             "utcTimestamp": utc_iso_jour(HIER, 19, 45)},   # 19h45 locales
+            {"vehicle_Id": "g-1",                          # SANS position
+             "utcTimestamp": utc_iso_jour(HIER, 21, 0)},
             {"vehicle_Id": "g-2", "latitude": -18.70, "longitude": 47.70,
-             "utcTimestamp": "2026-08-31T15:00:01Z"},      # 18h00:01 locales !
+             "utcTimestamp": utc_iso_jour(HIER, 18, 0, 1)},  # 18h00:01 locales !
         ]
 
 
-_jour_sonde = HIER if HIER.isoformat() != "2026-08-31" else HIER
+_jour_sonde = HIER          # v1.54 — la fixture suit HIER : plus d'accommodement
 pp.ApiMZoneX = lambda *a, **k: _FauxMZoneX()
 
 
@@ -242,7 +258,7 @@ def _ts_attendu(utc_txt):
 
 res_m = pp._positions_mzonex(_jour_sonde)
 # Heures locales des événements simulés (TZ du test) :
-t1730 = _ts_attendu("2026-08-31T14:30:00Z")
+t1730 = _ts_attendu(utc_iso_jour(HIER, 17, 30))   # même source que la fixture
 h1730 = datetime.fromtimestamp(t1730, TZ).hour
 check("B8 MZoneX simulé : mapping guid→plaque + évènements sans position "
       "écartés", "3333TCC" in res_m)
@@ -253,7 +269,7 @@ if "3333TCC" in res_m:
           (res_m["3333TCC"].get(18) == attendu18) or attendu18 is None)
 g2 = res_m.get("4444TDD", {})
 b18 = pp._bornes_local_utc(_jour_sonde)[18]
-t_g2 = _ts_attendu("2026-08-31T15:00:01Z")
+t_g2 = _ts_attendu(utc_iso_jour(HIER, 18, 0, 1))  # même source que la fixture
 check("B10 un événement 1 SECONDE après la borne n'est pas retenu",
       (t_g2 in (b18,) or g2.get(18) is None) if t_g2 > b18 else True)
 
