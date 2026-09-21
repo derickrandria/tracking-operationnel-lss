@@ -366,7 +366,7 @@ cd /home/user/tracking-operationnel-lss
 /tmp/lssvenv/bin/python backend/campagne_tests_v154.py --json \
     docs/audits/campagne_v154_resultats.json
 #   → 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante
-#     (v150 : instable — voir §9.6, **levé au §10.1** ; 3ᵉ passe : 54 / 3 / 0 / 2 — voir §10.7)
+#     (v150 : instable — voir §9.6, **levé au §10.1** ; campagne finale après arbitrages : **56 / 1 / 0 / 2** — voir §10.7)
 ```
 
 - Environnement : sandbox sans accès réseau, Python 3.11, SQLite (WAL), bases de
@@ -492,10 +492,10 @@ point. Ce chapitre **remplace l'état du §6** et **lève l'instabilité décrit
 | # | Point demandé | État | Preuve |
 |---|---|---|---|
 | 1 | `test_verrous_sqlite_v150` totalement déterministe, ≥ 10 exécutions vertes | ✅ **FAIT** | §10.1 — 13 exécutions, 19 contrôles, 0 KO |
-| 2 | D4-2 analysé **sans aucune modification** de code ni d'assertion | ✅ **ANALYSÉ** — arbitrage attendu | §10.2 |
-| 3 | v113 : ancienne assertion montrée + proposition d'assertion | ✅ **PROPOSÉ** — non appliqué | §10.3 |
+| 2 | D4-2 analysé **sans aucune modification** de code ni d'assertion | ✅ **FAIT** — arbitrage rendu : correction de la **fixture** | §10.2 |
+| 3 | v113 : ancienne assertion montrée + proposition d'assertion | ⏳ **DIFF SOUMIS POUR REVUE** — non appliqué | §10.3 |
 | 4 | v145 : fixture temporelle indépendante de la date réelle | ✅ **FAIT** | §10.4 |
-| 4bis | *Découvert en 3ᵉ passe* : `test_validite_v15`, même défaut de fixture | ✅ **PROPOSÉ** — non appliqué | §10.5 |
+| 4bis | *Découvert en 3ᵉ passe* : `test_validite_v15`, même défaut de fixture | ✅ **FAIT** — appliqué le 21/09 | §10.5 |
 | 5 | Recette de préproduction, lecture seule, logs vérifiables | ✅ **OUTIL + PROCÉDURE LIVRÉS** — exécution réelle à faire | §10.6 |
 | 6 | Mise à jour de ce rapport | ✅ **FAIT** | ce chapitre |
 
@@ -527,7 +527,7 @@ Contrôles couverts : WAL actif, `busy_timeout` ≥ 30 000 ms, 6 000 points ins�
 
 → **Condition 6 (aucune instabilité non expliquée) : LEVÉE** pour v150.
 
-### 10.2 Point 2 — `test_reparation_v130` / D4-2 : analyse terminée, arbitrage attendu
+### 10.2 Point 2 — `test_reparation_v130` / D4-2 : arbitrage rendu, **fixture corrigée** ✅
 
 **Aucune ligne de code ni d'assertion n'a été touchée.** Le scénario a été rejoué en
 copie, avec sondes.
@@ -564,9 +564,19 @@ s'applique.
    appliqué, c'est `reconciliation.py` qu'il faut changer (politique « pas de trajets
    officiels pour véhicule non ACTIF »).
 
-Tant que l'arbitrage n'est pas rendu, **rien n'est modifié**.
+**Arbitrage rendu le 21/09/2026 : chemin 1 (la fixture).** Le contrôle D4 décrit un
+trajet terminé au portail pour un véhicule **en service** : c'est le décor qui doit s'y
+conformer, pas la règle produit.
 
-### 10.3 Point 3 — `test_chaines_v113` : ancienne assertion, proposition prête
+**Ce qui a été appliqué** (`backend/test_reparation_v130.py`) : le véhicule `0926TBV` est
+rendu **ACTIF** juste avant le scénario D4, avec un commentaire du pourquoi ; l'import
+`StatutVehicule` a été ajouté. **Aucune assertion n'a changé**, aucun code produit n'a
+été touché.
+
+**Preuve** : 3 exécutions → **28 OK / 0 KO** chacune (avant : 27 OK / 1 KO). Dans la
+campagne rejouée, la suite passe de ÉCHOUÉ à **RÉUSSI**.
+
+### 10.3 Point 3 — `test_chaines_v113` : ancienne assertion, proposition (diff soumis)
 
 **Ancienne assertion** (`backend/test_chaines_v113.py` l.261-262) : `len(restants_b) == 4`
 — elle compte les lignes restantes en base après rejeu.
@@ -591,6 +601,9 @@ contrôles qui décrivent la règle réellement en vigueur :
 Résultat de la version proposée en copie : **46 OK / 0 KO** (version actuelle : 41/1).
 Un import `AuditLog` doit être ajouté (l.77). **Aucune assertion n'est affaiblie** : la
 présence du jumeau est désormais *prouvée* au lieu d'être supposée absente.
+
+**Diff exact soumis à revue** : `docs/audits/PROPOSITION_v113_p1a_p1f.diff` — **non
+appliqué**. Vérifié deux fois en copie : **46 OK / 0 KO**.
 
 ### 10.4 Point 4 — `test_positions_portails_v145` : fixture temporelle ✅
 
@@ -642,6 +655,11 @@ de 30 min : jamais recouvrant, jamais adjacent, quelle que soit l'heure. Valeur 
 inchangée (`PROVISOIRE` + `EN_ATTENTE`). Résultat de la copie : **33 OK / 0 KO à 00:30,
 02:00, 09:00, 15:31, 15:59 et 23:59**.
 
+**Appliqué le 21/09/2026 sur décision.** Vérifications après application, sur le fichier
+du dépôt : **33 OK / 0 KO** en heure réelle (3 exécutions) et **33 OK / 0 KO** aux quatre
+horloges qui échouaient (15:29, 15:31, 15:59, 16:01). Dans la campagne rejouée, la suite
+passe de ÉCHOUÉ à **RÉUSSI**.
+
 ### 10.6 Point 5 — Recette de préproduction : outil et procédure livrés
 
 Deux suites ne peuvent rien prouver ici (§5). Un pilote de recette **lecture seule** a été
@@ -667,30 +685,30 @@ volontairement absent dans cet environnement) : `ouverture = OK` ·
 **Reste à faire** : exécuter le pilote sur le poste de préproduction, puis **citer le
 journal** ici. Critères d'acceptation : mode d'emploi, §6.
 
-### 10.7 Verdict de la 3ᵉ passe — conditions et état
+### 10.7 Verdict de la 3ᵉ passe — conditions et état *(mis à jour après arbitrages)*
 
 | # | Condition | État au 21/09/2026 (3ᵉ passe) |
 |---|---|---|
 | 1 | Les tests N2 sont ajoutés | ✅ **FAIT** — 64 contrôles |
 | 2 | Les échecs sont **expliqués** | ✅ **FAIT** — v113, v145, v130 (§4) + v15 (§10.5) |
-| 3 | Les échecs sont **corrigés** | ⚠️ **PARTIEL** — v145 corrigé ✅ ; v113 et v15 : corrections **prêtes, non appliquées** (accord requis) ; v130 : arbitrage métier attendu |
+| 3 | Les échecs sont **corrigés** | ⚠️ **PARTIEL** — v145, v15 et v130 corrigés et verts ✅ ; **v113 : diff soumis pour revue** (seule suite encore en échec) |
 | 4 | Les suites non exécutées sont **traitées** | ⚠️ **PARTIEL** — outil + procédure livrés (§10.6) ; verdicts de préproduction **non obtenus** à ce jour |
 | 5 | Le test non concluant est résolu | ✅ **FAIT** — runner 8/8 |
-| 6 | Aucun crash, aucune instabilité non expliquée | ✅ **0 crash** ; **v150 déterministe 13/13** (§10.1) ; v15 : instabilité **expliquée**, correction prête (§10.5) |
+| 6 | Aucun crash, aucune instabilité non expliquée | ✅ **0 crash**, **0 suite instable** ; v150 déterministe 13/13 (§10.1) ; v15 corrigée (§10.5) |
 
 > ## ❌ NO-GO maintenu.
 
 **Ce qui bloque encore, exactement** :
 
-- (a) trois corrections de test **prêtes mais non appliquées** — accord requis pour v113
-  et v15, arbitrage métier pour v130 / D4-2 ;
+- (a) **une** correction de test encore non appliquée — **v113** : diff soumis pour
+  revue (`docs/audits/PROPOSITION_v113_p1a_p1f.diff`), validé en copie (46 OK / 0 KO) ;
 - (b) les **deux verdicts de préproduction** non obtenus (aucun accès réseau ici) ;
-- (c) la campagne ne peut pas être déclarée verte : **54 réussies / 3 échouées /
-  0 plantée / 2 non exécutées** — dont, à ce jour, **1 instabilité expliquée** (v15) et
-  **2 échecs de tests périmés** (v113, v130).
+- (c) la campagne n'est pas verte : **56 réussies / 1 échouée / 0 plantée /
+  2 non exécutées** — l'unique échec est v113 (test périmé, correction validée en copie).
 
-**Ce qui est levé** : l'instabilité de `test_verrous_sqlite_v150` (13/13, §10.1) et le
-défaut de fixture de `test_positions_portails_v145` (§10.4).
+**Ce qui est levé** : l'instabilité de `test_verrous_sqlite_v150` (13/13, §10.1), les
+défauts de fixture de `test_positions_portails_v145` (§10.4) et de `test_validite_v15`
+(§10.5), et l'écart D4-2 de `test_reparation_v130` (§10.2).
 
 Rappels : aucune fusion, aucun déploiement ; `main` inchangée ; `SPEC_RULES_v3.md`
 inchangée ; aucune donnée de production touchée.
