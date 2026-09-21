@@ -433,7 +433,7 @@ N2, `nb_vehicules` pour MZONEX.
 | **`test_concurrence_sante_v154.py` (NOUVELLE — R14→R19, sections T1→T13)** | **70 OK / 0 KO** |
 | `npm test` (frontend, `node --test`) | **28 OK / 0 KO** (14 nouveaux sur les messages) |
 | `npx tsc --noEmit` + `npm run build` | **0 erreur**, build produit |
-| Campagne complète (`campagne_tests_v154.py --json …`) | **59 suites : 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante / 0 instable** |
+| Campagne complète (`campagne_tests_v154.py --json …`) | **59 suites : 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante / 0 instable** *(2ᵉ passe — remplacée depuis : **57 / 0 / 0 / 2**, voir §10.7)* |
 
 La section T4 de la nouvelle suite rejoue le scénario du 21/09 (MZONEX : **54,9 s pour
 un budget de 30 s**, phase **écriture**) et vérifie : arrêt **avant** la seconde
