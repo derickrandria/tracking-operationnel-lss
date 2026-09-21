@@ -440,6 +440,18 @@ _DERNIERES_METRIQUES: dict[str, dict] = {}
 _METRIQUES_MUTEX = threading.Lock()
 
 
+def mesurer(champ: str, depuis_mono: float | None) -> None:
+    """Ajoute au compteur `champ` le temps écoulé depuis `depuis_mono`.
+
+    Utile quand l'entourage d'un bloc par `with chrono(...)` n'est pas possible
+    sans réindenter un long corps de boucle (ex. : traitement par véhicule)."""
+    if depuis_mono is None:
+        return
+    passe = passe_courante()
+    if passe is not None:
+        passe.metriques.ajouter(champ, time.monotonic() - depuis_mono)
+
+
 def passe_courante() -> PasseCourante | None:
     return getattr(_COURANT, "passe", None)
 

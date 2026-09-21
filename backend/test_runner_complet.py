@@ -9,6 +9,14 @@ import sys
 import time
 import tempfile
 import subprocess
+from pathlib import Path
+
+# v1.54 — exécutable DE TOUT RÉPERTOIRE : les chemins se déduisent de
+# l'emplacement du fichier, jamais du répertoire courant (l'ancienne version
+# construisait « backend/backend/test_...py » dès qu'on la lançait depuis
+# backend/ : sortie « code de retour 1, aucun bilan lisible »).
+RACINE_DEPOT = Path(__file__).resolve().parents[1]
+DOSSIER_BACKEND = RACINE_DEPOT / "backend"
 
 # Configuration universelle de l'encodage UTF-8
 if hasattr(sys.stdout, "reconfigure"):
@@ -37,9 +45,9 @@ def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     # Préservation de sys.path (site-packages, venv, user base) + ajout de backend et pylib
     cur_pypath = env.get("PYTHONPATH", "")
     pypaths = [
-        os.path.abspath("backend"),
-        os.path.abspath("."),
-        os.path.abspath("pylib"),
+        str(DOSSIER_BACKEND),
+        str(RACINE_DEPOT),
+        str(RACINE_DEPOT / "pylib"),
         site.getusersitepackages(),
         "/tmp/pylib"
     ]
@@ -66,9 +74,11 @@ def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     db_file = os.path.join(tempfile.gettempdir(), f"test_runner_{int(time.time()*1000)}.db").replace("\\", "/")
     env["DATABASE_URL"] = f"sqlite:///{db_file}"
     
-    cmd = [sys.executable, fichier]
+    chemin_suite = DOSSIER_BACKEND / Path(str(fichier)).name
+    cmd = [sys.executable, str(chemin_suite)]
     proc = subprocess.run(
         cmd,
+        cwd=str(DOSSIER_BACKEND),
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -78,12 +88,13 @@ def executer_suite(nom: str, fichier: str) -> tuple[bool, float, str]:
     )
     duree = time.perf_counter() - t0
     
-    # Nettoyage DB temporaire
-    try:
-        if os.path.exists(db_file):
-            os.remove(db_file)
-    except Exception:
-        pass
+    # Nettoyage DB temporaire (fichier + journal WAL)
+    for suffixe in ("", "-wal", "-shm"):
+        try:
+            if os.path.exists(db_file + suffixe):
+                os.remove(db_file + suffixe)
+        except Exception:
+            pass
         
     succes = (proc.returncode == 0)
     output = proc.stdout + "\n" + proc.stderr
@@ -112,6 +123,8 @@ def main():
             
     print("\n" + "-" * 70)
     print(f"RÉSULTAT GLOBAL : {succes_total}/{total} suites réussies avec succès.")
+    print(f"RÉSULTAT GLOBAL : {succes_total} OK / {total - succes_total} KO "
+          f"(suites exécutées : {total})")
     print("-" * 70)
     
     if echecs:
@@ -121,7 +134,8 @@ def main():
             print(sortie[-500:])
         sys.exit(1)
     else:
-        print("\n🎉 INTÉGRITÉ OPÉRATIONNELLE PARFAITE : 100% DES TESTS PASSENT SANS ERREUR.")
+        print("\n🎉 TOUS LES TESTS PASSENT — intégrité opérationnelle validée "
+              f"({succes_total}/{total} suites, 100 % SUCCÈS).")
         sys.exit(0)
 
 if __name__ == "__main__":

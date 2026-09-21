@@ -489,6 +489,311 @@ check("l'échec est enregistré avec sa classe fine",
 check("l'issue publiée est ECHEC",
       C.metriques_publiees()["MZONEX_RELECTURE"].get("issue") == "ECHEC")
 
+# ══════════════════ [M] budget par phase (authentification, pagination, véhicule)
+titre("[M] BUDGET PAR PHASE — l'étape consommatrice est nommée, pas devinée")
+from types import SimpleNamespace                              # noqa: E402
+import httpx as _httpx_reel                                    # noqa: E402
+from app.config import now_local                               # noqa: E402
+import app.api_mzonex as apim                                  # noqa: E402
+import app.api_wialon as apw                                   # noqa: E402
+
+_httpx_origine = apim.httpx
+_tailles = (apim.MAX_PAGES, apim.TAILLE_PAGE)
+
+
+class JetonLent:
+    """Gestionnaire de jeton SIMULÉ : l'authentification coûte `delai` s."""
+
+    def __init__(self, delai=0.0):
+        self.delai = delai
+
+    def jeton(self):
+        time.sleep(self.delai)
+        return "jeton-de-test"
+
+    def invalider(self):
+        pass
+
+
+class ReponseFactice:
+    def __init__(self, donnees):
+        self.status_code = 200
+        self._donnees = donnees
+
+    def json(self):
+        return self._donnees
+
+    @property
+    def text(self):
+        return "{}"
+
+
+class ClientFactice:
+    """`httpx.Client` simulé : chaque page coûte `delai_page` s et renvoie une
+    page PLEINE (donc la pagination continue tant que le budget le permet)."""
+
+    page = 0
+    delai_page = 0.0
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, url, headers=None):
+        ClientFactice.page += 1
+        time.sleep(ClientFactice.delai_page)
+        return ReponseFactice({"value": [{"id": i} for i in range(_tailles[1])]})
+
+
+apim.httpx = SimpleNamespace(Client=ClientFactice, Timeout=_httpx_reel.Timeout,
+                             TimeoutException=_httpx_reel.TimeoutException)
+try:
+    # ── M1 : le temps se consume à l'AUTHENTIFICATION ───────────────────────
+    ClientFactice.page = 0
+    ClientFactice.delai_page = 0.0
+    api_lent = apim.ApiMZoneX(jetons=JetonLent(0.40))
+    n_m1 = S._collecte_protegee("MZONEX", lambda: len(api_lent._pages("Events")),
+                                timeout_s=0.15)
+    met_m1 = C.metriques_publiees().get("MZONEX", {})
+    check("authentification lente : la passe est ARRÊTÉE (budget dépassé)",
+          n_m1 == 0 and met_m1.get("issue") == "BUDGET_DEPASSE",
+          f"→ n={n_m1}, issue={met_m1.get('issue')}")
+    check("la phase consomatrice est MESURÉE : auth_s ≈ 0,4 s ≥ budget 0,15 s",
+          (met_m1.get("auth_s") or 0) >= 0.35, f"→ {met_m1.get('auth_s')}")
+    check("une seule page a été demandée — aucune page APRÈS l'échéance",
+          ClientFactice.page == 1, f"→ {ClientFactice.page} page(s)")
+    check("le dépassement à l'authentification est classé « portail lent » "
+          "(et non « local »)",
+          C.classer_erreur(C.BudgetDepasse("authentification", 31, 30))["classe"]
+          == C.CLASSE_PORTAIL_LENT)
+    entree_m1 = next((d for d in S.sources_en_echec_detail()
+                      if d["source"] == "MZONEX"), {})
+    check("la santé publie la classe fine ET l'étape bloquante",
+          entree_m1.get("classe") == C.CLASSE_PORTAIL_LENT
+          and entree_m1.get("etape") == "pagination", f"→ {entree_m1}")
+    check("le verrou est RENDU malgré l'arrêt", not C.verrou_de("MZONEX").occupe)
+    check("la tâche est REPLANIFIABLE : une passe immédiate réussit",
+          S._collecte_protegee("MZONEX", lambda: 42, timeout_s=2) == 42)
+    check("les AUTRES sources ne sont pas impactées",
+          S._collecte_protegee("CAMTRACKPRO", lambda: 7, timeout_s=2) == 7)
+
+    # ── M2 : le temps se consume en PAGINATION ──────────────────────────────
+    ClientFactice.page = 0
+    ClientFactice.delai_page = 0.12
+    api_rapide = apim.ApiMZoneX(jetons=JetonLent(0.0))
+    n_m2 = S._collecte_protegee("MZONEX",
+                                lambda: len(api_rapide._pages("Events")),
+                                timeout_s=0.30)
+    pages_apres_appel = ClientFactice.page
+    time.sleep(0.3)
+    met_m2 = C.metriques_publiees().get("MZONEX", {})
+    check("pagination lente : la passe s'arrête (résultat 0)",
+          n_m2 == 0 and met_m2.get("issue") == "BUDGET_DEPASSE")
+    check("le point d'arrêt est nommé « pagination »",
+          met_m2.get("etape_bloquante") == "pagination",
+          f"→ {met_m2.get('etape_bloquante')}")
+    check("le nombre de pages est BORNÉ (ni 10 = MAX_PAGES, ni 0)",
+          0 < pages_apres_appel < _tailles[0], f"→ {pages_apres_appel}")
+    check("AUCUNE page n'est demandée après l'échéance",
+          ClientFactice.page == pages_apres_appel, f"→ {ClientFactice.page}")
+    check("le temps d'attente HTTP est mesuré (≥ 0,2 s)",
+          (met_m2.get("attente_http_s") or 0) >= 0.2,
+          f"→ {met_m2.get('attente_http_s')}")
+    check("le verrou est rendu", not C.verrou_de("MZONEX").occupe)
+
+    # ── M3 : le temps se consume au TRAITEMENT PAR VÉHICULE ─────────────────
+    class ApiWialonFactice(apw.ApiWialon):
+        """Boucle par unité RÉELLE (api_wialon.messages_du_jour), sans réseau."""
+
+        def __init__(self, nb_unites=6, delai_unite=0.12):
+            self._nb, self._delai = nb_unites, delai_unite
+            self._sid = "sid-de-test"
+
+        def _exiger_session(self):
+            return None
+
+        def unites(self):
+            # Les libellés doivent PORTER un identifiant de plaque valide
+            # (^\d{3,4}[A-Z]{2,3}$), sinon la boucle saute l'unité avant
+            # l'appel réseau et le budget ne peut pas être atteint.
+            return [{"nm": f"{1000 + i} TST", "id": 100 + i}
+                    for i in range(self._nb)]
+
+        def _appel(self, svc, params, reessai=True):
+            time.sleep(self._delai)
+            return {"count": 0, "messages": []}
+
+        def fermer(self):
+            pass
+
+    ClientFactice.delai_page = 0.0
+    wialon = ApiWialonFactice()
+    n_m3 = S._collecte_protegee(
+        "CAMTRACKPRO", lambda: len(wialon.messages_du_jour(now_local().date())),
+        timeout_s=0.30)
+    met_m3 = C.metriques_publiees().get("CAMTRACKPRO", {})
+    check("véhicule lent : la passe s'arrête (résultat 0)",
+          n_m3 == 0 and met_m3.get("issue") == "BUDGET_DEPASSE",
+          f"→ n={n_m3}, issue={met_m3.get('issue')}")
+    check("le point d'arrêt est nommé « véhicule »",
+          met_m3.get("etape_bloquante") == "vehicule",
+          f"→ {met_m3.get('etape_bloquante')}")
+    check("le nombre de véhicules traités est BORNÉ (arrêt avant les 6 unités)",
+          0 < (met_m3.get("nb_vehicules") or 0) < 6,
+          f"→ {met_m3.get('nb_vehicules')}")
+    check("la durée PAR VÉHICULE est mesurée (≥ 0,15 s)",
+          (met_m3.get("vehicule_s") or 0) >= 0.15, f"→ {met_m3.get('vehicule_s')}")
+    check("le verrou est rendu", not C.verrou_de("CAMTRACKPRO").occupe)
+
+    # ── M4 : le temps se consume à l'ÉCRITURE (aucun nouveau lot après) ─────
+    lots = {"n": 0, "points": 0}
+    _tranche_origine = S.CollectorBase._inserer_tranche
+
+    def _tranche_comptee(self, db, tranche, mapping, vus, historique):
+        time.sleep(0.08)                      # écriture volontairement lente
+        lots["n"] += 1
+        lots["points"] += len(tranche)
+        return _tranche_origine(self, db, tranche, mapping, vus, historique)
+
+    S.CollectorBase._inserer_tranche = _tranche_comptee
+    try:
+        db_m4 = SessionLocal()
+        try:
+            plaque_m4 = db_m4.scalar(select(Vehicule.gps_associe).where(
+                Vehicule.gps_associe.isnot(None)).limit(1))
+        finally:
+            db_m4.close()
+        points_m4 = [{"gps_associe": plaque_m4,
+                      "horodatage": datetime(2027, 6, 1, 4, 0, 0)
+                      + timedelta(seconds=30 * i),
+                      "lat": -18.9, "lng": 47.5, "vitesse": 30.0, "moteur": "ON",
+                      "type_evenement": None, "adresse": None,
+                      "observation": False} for i in range(40)]
+        n_m4 = S._collecte_protegee(
+            "MZONEX", lambda: S.MZoneXApiCollector().inserer(points_m4,
+                                                             historique=True),
+            timeout_s=0.30)
+    finally:
+        S.CollectorBase._inserer_tranche = _tranche_origine
+    lots_apres = dict(lots)
+    time.sleep(0.4)
+    met_m4 = C.metriques_publiees().get("MZONEX", {})
+    entree_m4 = next((d for d in S.sources_en_echec_detail()
+                      if d["source"] == "MZONEX"), {})
+    check("écriture lente : la passe s'arrête sans écrire les 40 points",
+          n_m4 == 0 and 0 < lots_apres["points"] < 40,
+          f"→ n={n_m4}, points tentés={lots_apres['points']}")
+    check("AUCUN nouveau lot d'écriture après l'échéance (compteur figé)",
+          lots == lots_apres, f"→ {lots} vs {lots_apres}")
+    check("les lots écrits sont ENTIERS (aucun demi-lot)",
+          lots_apres["points"] % lots_apres["n"] == 0
+          or lots_apres["points"] == 40, f"→ {lots_apres}")
+    check("le dépassement à l'écriture est classé « attente SQLite »",
+          entree_m4.get("classe") == C.CLASSE_ATTENTE_SQLITE, f"→ {entree_m4}")
+    check("la phase d'écriture est mesurée (≥ 0,1 s)",
+          (met_m4.get("ecriture_s") or 0) >= 0.1, f"→ {met_m4.get('ecriture_s')}")
+    check("le verrou est rendu et la source reste utilisable",
+          not C.verrou_de("MZONEX").occupe
+          and S._collecte_protegee("MZONEX", lambda: 3, timeout_s=2) == 3)
+finally:
+    apim.httpx = _httpx_origine
+
+# ══════════════════════════ [N] l'interface /api/sante distingue chaque état
+titre("[N] INTERFACE /api/sante — chaque état est DISTINGUÉ (bout en bout)")
+from fastapi.testclient import TestClient                     # noqa: E402
+from app.main import app as _app_fastapi                      # noqa: E402
+
+client_sante = TestClient(_app_fastapi)
+
+db_n = SessionLocal()
+try:
+    plaque_n = db_n.scalar(select(Vehicule.gps_associe).where(
+        Vehicule.gps_associe.isnot(None)).limit(1))
+finally:
+    db_n.close()
+# Un point FRAIS (horodatage LOCAL naïf, comme le collecteur : `depuis_utc`
+# convertit en heure locale) : sans lui, le statut « AUCUNE_COLLECTE » ou
+# « RETARD_COLLECTE » masquerait les états fins que l'on veut vérifier.
+S.MZoneXApiCollector().inserer(
+    [{"gps_associe": plaque_n, "horodatage": now_local(), "lat": -18.9,
+      "lng": 47.5, "vitesse": 0.0, "moteur": "OFF", "type_evenement": None,
+      "adresse": None, "observation": False}], historique=True)
+
+
+def _statut_sante(erreur=None, passe_active=False) -> dict:
+    """Isole l'état (une seule cause à la fois) puis interroge l'ENDPOINT."""
+    with S._ETAT_COLLECTE_LOCK:
+        S._ETAT_COLLECTE["sources"] = {}
+    if erreur is not None:
+        S._etat_collecte_erreur("TEST_SANTE", erreur)
+    passe = None
+    if passe_active:
+        passe = C.PasseCourante(source="TEST_SANTE", budget_s=60)
+        C.enregistrer_passe("TEST_SANTE", passe)
+    try:
+        reponse = client_sante.get("/api/sante")
+        assert reponse.status_code == 200, reponse.status_code
+        return reponse.json()
+    finally:
+        if passe is not None:
+            C.retirer_passe("TEST_SANTE", passe)
+        with S._ETAT_COLLECTE_LOCK:
+            S._ETAT_COLLECTE["sources"] = {}
+
+
+etats_attendus = [
+    ("portail indisponible", Exception("ErreurApiMZoneX: GET Events → HTTP 503"),
+     False, "COLLECTE_DEGRADEE"),
+    ("portail lent", C.BudgetDepasse("attente_http", 31, 30), False,
+     "COLLECTE_PORTAL_LENT"),
+    ("verrou occupé", C.VerrouOccupe("verrou « MZONEX » détenu"), False,
+     "VERROU_OCCUPE"),
+    ("attente SQLite", Exception("OperationalError: database is locked"), False,
+     "COLLECTE_BLOQUEE_LOCALEMENT"),
+    ("budget dépassé", C.BudgetDepasse("inconnue", 31, 30), False,
+     "COLLECTE_BUDGET_DEPASSE"),
+    ("configuration absente",
+     Exception("ErreurAuthMZoneX: MZONEX_USER / MZONEX_PASSWORD absents"), False,
+     "CONFIGURATION_ABSENTE"),
+    ("collecte en cours", None, True, "COLLECTE_EN_COURS"),
+    ("collecte échouée", Exception("TypeError: objet inattendu"), False,
+     "COLLECTE_ECHOUEE"),
+    ("aucune anomalie", None, False, "COLLECTE_OK"),
+]
+vus = {}
+for libelle, erreur, active, attendu in etats_attendus:
+    corps = _statut_sante(erreur, active)
+    vus[libelle] = corps.get("statut")
+    check(f"« {libelle} » → {attendu}", corps.get("statut") == attendu,
+          f"→ {corps.get('statut')}")
+check("les NEUF états sont tous DIFFÉRENTS (aucun regroupement)",
+      len(set(vus.values())) == len(vus), f"→ {sorted(vus.values())}")
+
+budget_ecriture = C.BudgetDepasse("ecriture", 31, 30)
+corps_plein = _statut_sante(budget_ecriture, True)
+check("l'interface publie la classe fine et l'étape consommatrice",
+      "attente_sqlite" in (corps_plein.get("classes_en_echec") or [])
+      and "ecriture" in (corps_plein.get("etapes_en_echec") or []),
+      f"→ {corps_plein.get('classes_en_echec')} / {corps_plein.get('etapes_en_echec')}")
+check("l'interface publie les verrous PAR SOURCE (propriétaire + expiration)",
+      isinstance(corps_plein.get("verrous_par_source"), dict)
+      and all("proprietaire" in e for e in corps_plein["verrous_par_source"].values()))
+check("l'interface publie les MÉTRIQUES par étape de la dernière passe",
+      isinstance(corps_plein.get("metriques_collecte"), dict)
+      and bool(corps_plein["metriques_collecte"]))
+check("l'interface publie les passes en cours (qui tourne, depuis quand)",
+      isinstance(corps_plein.get("passes_en_cours"), dict)
+      and "TEST_SANTE" in corps_plein["passes_en_cours"],
+      f"→ {corps_plein.get('passes_en_cours')}")
+check("l'interface indique l'attente SQLite mesurée et les réglages SQLite",
+      "attente_sqlite_s" in (corps_plein["metriques_collecte"].get("MZONEX") or {})
+      and isinstance(corps_plein.get("sqlite"), dict))
+
 # ─────────────────────────────────────────────────────────────── résultats
 print("\n" + "=" * 74)
 print(f"  RÉSULTAT : {R['ok']} OK / {R['ko']} KO")

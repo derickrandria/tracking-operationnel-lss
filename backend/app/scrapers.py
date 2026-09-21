@@ -222,6 +222,11 @@ LOT_INSERTION = int(os.getenv("COLLECTE_LOT_INSERTION", "250"))
 # millisecondes contre un ordre de grandeur de réactivité en moins pour elles.
 SOUFFLE_INTER_LOTS_S = float(os.getenv("COLLECTE_SOUFFLE_S", "0.01"))
 COMMIT_ESSAIS = int(os.getenv("COLLECTE_COMMIT_ESSAIS", "4"))
+# v1.54 — au-delà de ce coût, la durée d'un commit est de l'ATTENTE du verrou
+# d'écriture de SQLite (un autre écrivain tenait la base), pas du travail à
+# nous : c'est cette part qui alimente `attente_sqlite_s` (distincte du temps
+# passé chez le portail). Mesuré en local : commit normal < 30 ms.
+SQLITE_COMMIT_BASE_S = float(os.getenv("COLLECTE_COMMIT_BASE_S", "0.1"))
 ATTENTE_SORTIE_PASSE_S = float(os.getenv("COLLECTE_ATTENTE_SORTIE_S", "60"))
 RELECTURE_N1_MAX_POINTS = int(os.getenv("RELECTURE_N1_MAX_POINTS", "4000"))
 RELECTURE_N1_TIMEOUT_S = float(os.getenv("RELECTURE_N1_TIMEOUT_S", "180"))
@@ -1398,6 +1403,35 @@ class CollectorBase:
             mapping[v.plaque.strip().upper()] = v
         return mapping
 
+    @staticmethod
+    def _sonder_attente_sqlite() -> float:
+        """Mesure RÉELLE de l'attente du verrou d'écriture de SQLite (v1.54).
+
+        On demande le verrou d'écriture pour de vrai (`BEGIN IMMEDIATE`) et on
+        le rend aussitôt : la durée obtenue est le temps que la BASE nous a fait
+        attendre — ni le portail, ni notre code. Sans cette sonde, l'attente se
+        fondait dans la durée d'écriture et un portail lent était soupçonné à
+        tort (constat du 21/09).
+
+        Passe par une connexion BRUTE (`raw_connection`) pour ne pas perturber
+        la transaction SQLAlchemy de l'appelant. Coût : quelques microsecondes
+        quand personne n'écrit.
+        """
+        from .database import engine
+        t0 = time.monotonic()
+        try:
+            cx = engine.raw_connection()
+            try:
+                cur = cx.cursor()
+                cur.execute("BEGIN IMMEDIATE")
+                cur.execute("COMMIT")
+            finally:
+                cx.close()
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("Sonde du verrou d'écriture SQLite en échec (%s)",
+                        str(exc)[:120])
+        return time.monotonic() - t0
+
     def _inserer_tranche(self, db, tranche: list[dict],
                          mapping: dict, vus: dict, historique: bool) -> int:
         """Corps d'insertion d'UN LOT (le lot est committé par l'appelant)."""
@@ -1507,6 +1541,15 @@ class CollectorBase:
             # lot (idempotent : anti-rejeu par clé et par horodatage) au lieu de
             # perdre la passe entière.
             taille_lot = max(1, LOT_INSERTION)
+            # v1.54 — l'attente du verrou d'écriture est MESURÉE AVANT d'écrire
+            # (une fois par passe) et publiée à part : l'exploitant voit si son
+            # temps part chez le portail ou dans son propre SQLite.
+            _attente_base = self._sonder_attente_sqlite()
+            if _attente_base > SQLITE_COMMIT_BASE_S:
+                _pasee = passe_courante()
+                if _pasee is not None:
+                    _pasee.metriques.ajouter("attente_sqlite_s",
+                                             _attente_base - SQLITE_COMMIT_BASE_S)
             for debut_lot in range(0, len(points), taille_lot):
                 # v1.54 — POINT D'ARRÊT CONTRÔLÉ AVANT CHAQUE LOT : une passe
                 # qui a dépassé son budget N'ÉCRIT PLUS RIEN. L'écriture en
@@ -1518,10 +1561,23 @@ class CollectorBase:
                     t_lot = time.monotonic()
                     avant_tranche = inseres
                     try:
+                        t_commit = None
                         with chrono("ecriture"):
                             inseres += self._inserer_tranche(
                                 db, tranche, mapping, vus, historique)
+                            t_commit = time.monotonic()
                             db.commit()
+                        # v1.54 — ATTENTE SQLITE MESURÉE À CHAQUE COMMIT (pas
+                        # seulement en cas d'échec) : si le commit a attendu le
+                        # verrou d'écriture, cette attente est publiée à part,
+                        # sans être confondue avec le travail d'écriture.
+                        _duree_commit = time.monotonic() - t_commit
+                        if _duree_commit > SQLITE_COMMIT_BASE_S:
+                            _p = passe_courante()
+                            if _p is not None:
+                                _p.metriques.ajouter(
+                                    "attente_sqlite_s",
+                                    _duree_commit - SQLITE_COMMIT_BASE_S)
                         # métrique EXACTE : on ne compte que ce qui a été écrit
                         # (un lot entièrement dédoublonné ne « compte » pas).
                         compter("nb_points_ecrits", inseres - avant_tranche)
@@ -2649,16 +2705,40 @@ VALIDATEURS_TRAJETS = {
 
 
 def synchroniser_trajets_valides(source: str | None = None) -> dict:
+    """Passe Niveau 2 : sous LE verrou « N2_<source> », avec SON budget, SES
+    métriques et SON point d'arrêt.
+
+    v1.54 — comme la passe N1, la passe N2 peut être ANNULÉE proprement (par la
+    surveillance, au-delà de sa limite) : elle s'arrête avant le travail suivant
+    (appel réseau ou écriture) et rend ELLE-MÊME son verrou.
+    """
     source_nom = source or "MIXTE"
-    possession_n2 = _acquerir_verrou_n2(f"N2_{source_nom}")
+    ressource = f"N2_{source_nom}"
+    possession_n2 = _acquerir_verrou_n2(ressource)
     if possession_n2 is None:
         log.warning("Synchronisation Niveau 2 ignorée : le verrou « N2_%s » est "
                     "détenu par « %s » — aucune écriture de ma part",
-                    source_nom, verrou_de(f"N2_{source_nom}").proprietaire)
+                    source_nom, verrou_de(ressource).proprietaire)
         return {"occupee": True}
+    passe = PasseCourante(source=ressource, budget_s=LOCK_N2_TIMEOUT_S)
+    enregistrer_passe(ressource, passe)
     try:
-        return _synchroniser_trajets_valides(source)
+        with activer_passe(passe):
+            stats = _synchroniser_trajets_valides(source)
+        publier_metriques(passe.terminer("TERMINE"))
+        return stats
+    except BudgetDepasse as exc:
+        publier_metriques(passe.terminer("BUDGET_DEPASSE"))
+        _etat_collecte_erreur(ressource, exc)
+        log.warning("Synchronisation Niveau 2 (%s) arrêtée proprement : %s",
+                    source_nom, exc)
+        return {"budget_depasse": True, "etape": exc.etape}
+    except Exception as exc:
+        publier_metriques(passe.terminer("ECHEC"))
+        _etat_collecte_erreur(ressource, exc)
+        raise
     finally:
+        retirer_passe(ressource, passe)
         _liberer_verrou_n2(possession_n2)
 
 
@@ -2685,6 +2765,7 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
             log.info("Pas de validateur Niveau 2 pour %s — sync ignorée", nom)
             continue
         try:
+            verifier_etape("pagination")   # v1.54 — arrêt avant un appel réseau
             if nom == "MZONEX":
                 # §0sexies A2 + P2 — API MZoneX en principal, écran en secours
                 # SYSTÉMATIQUE, utilisé seulement s'il est COMPLET.
@@ -2702,13 +2783,41 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
                 recensements[nom] = list(getattr(collecteur, "recensement", [])
                                          or [])
             items = normaliser_valides(bruts)
-        except Exception:
+        except BudgetDepasse:
+            raise                          # v1.54 — signal d'ARRÊT : jamais absorbé
+        except Exception as exc:
+            # v1.54 — l'échec d'une source N2 est PUBLIÉ (classe fine) au lieu
+            # d'être seulement journalisé : un « database is locked » pendant N2
+            # devient visible dans /api/sante (attente_sqlite), jamais muet.
+            _etat_collecte_erreur(f"N2_{nom}", exc)
             log.exception("Échec collecte Niveau 2 (%s)", nom)
             continue
         db = SessionLocal()
         try:
-            stats = reconcilier_trajets_valides(
-                db, items, username=f"collecteur-{nom.lower()}")
+            # v1.54 — l'attente éventuelle du verrou d'écriture de SQLite est
+            # mesurée AVANT d'écrire (comme pour la collecte N1) : elle est
+            # publiée à part du temps passé chez le portail.
+            _attente_n2 = CollectorBase._sonder_attente_sqlite()
+            if _attente_n2 > SQLITE_COMMIT_BASE_S:
+                _p = passe_courante()
+                if _p is not None:
+                    _p.metriques.ajouter("attente_sqlite_s",
+                                         _attente_n2 - SQLITE_COMMIT_BASE_S)
+            verifier_etape("ecriture")     # v1.54 — arrêt avant une écriture
+            with chrono("ecriture"):
+                stats = reconcilier_trajets_valides(
+                    db, items, username=f"collecteur-{nom.lower()}")
+        except BudgetDepasse:
+            raise                          # échéance : la PASSE s'arrête ici
+        except Exception as exc:
+            # v1.54 — un « database is locked » (ou toute autre panne) sur la
+            # réconciliation d'UNE source ne doit pas emporter les autres : il
+            # est PUBLIÉ (classe fine, visible dans /api/sante) et la passe
+            # continue — aucune écriture ne reste « non traitée ».
+            _etat_collecte_erreur(f"N2_{nom}", exc)
+            log.exception("Échec réconciliation Niveau 2 (%s) — source suivante",
+                          nom)
+            continue
         finally:
             db.close()
         for cle in totaux:

@@ -849,6 +849,11 @@ def sante(db: Session = Depends(get_db)):
             statut_str = "COLLECTE_BLOQUEE_LOCALEMENT"
         elif CLASSE_VERROU_OCCUPE in classes and en_cours:
             statut_str = "COLLECTE_EN_COURS"      # un cycle tourne, rien d'anormal
+        elif CLASSE_VERROU_OCCUPE in classes:
+            # un verrou est détenu SANS passe active : possession résiduelle
+            # (tâche disparue) — état distinct d'une panne de collecte, l'action
+            # n'est pas d'attendre le portail mais de libérer la ressource.
+            statut_str = "VERROU_OCCUPE"
         elif CLASSE_PORTAIL_LENT in classes:
             statut_str = "COLLECTE_PORTAL_LENT"   # le portail répond, mais lentement
         elif CLASSE_PORTAIL_INDISPONIBLE in classes:

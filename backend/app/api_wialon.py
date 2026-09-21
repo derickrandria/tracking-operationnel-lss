@@ -40,6 +40,7 @@ from datetime import datetime, timedelta, timezone
 import time
 import httpx
 
+from .concurrence import BudgetDepasse, compter, mesurer, verifier_etape
 from .config import TZ, plaque_depuis_libelle_portail
 
 log = logging.getLogger("lss.api_wialon")
@@ -569,10 +570,13 @@ class ApiWialon:
         unites_list = self.unites()
         log.info("CamtrackPro API : %d unités détectées pour messages_du_jour (%s, timestamps UTC: %d -> %d)",
                  len(unites_list), jour, debut_epoch, fin_epoch)
+        t_unite = None
         for u in unites_list:
             # v1.54 — MÉTRIQUES PAR VÉHICULE + POINT D'ARRÊT CONTRÔLÉ : le coût
-            # par unité est mesuré et publié, et la passe s'arrête AVANT l'unité
-            # suivante si son budget est atteint (elle n'écrit plus après).
+            # de l'unité PRÉCÉDENTE est publié, et la passe s'arrête AVANT
+            # l'unité suivante si son budget est atteint.
+            mesurer("vehicule", t_unite)
+            t_unite = time.monotonic()
             verifier_etape("vehicule")
             compter("nb_vehicules")
             nom, uid = u.get("nm", ""), u.get("id")
@@ -650,6 +654,12 @@ class ApiWialon:
                 else:
                     log.warning("CamtrackPro API (messages) « %s » : 0 point GPS trouvé sur la plage [%s -> %s]",
                                 plaque, debut_local, fin_loc)
+            except BudgetDepasse:
+                # v1.54 — le budget est un SIGNAL D'ARRÊT, pas une panne de
+                # données : s'il était absorbé ici, la passe continuerait à
+                # interroger le portail et à écrire après son échéance (défaut
+                # trouvé par la suite v154).
+                raise
             except Exception as exc:
                 log.error("CamtrackPro API : échec extraction messages « %s » (id=%s) : %s", nom, uid, exc, exc_info=True)
 
