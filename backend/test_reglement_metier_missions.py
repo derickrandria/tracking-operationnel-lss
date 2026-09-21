@@ -7,18 +7,78 @@ Vérifie :
 4. Invalidation DMMG (Moramanga -> Andriaka -> Tana) (§24, §25)
 5. Nettoyage SuiviJournalier lors du passage à LIBRE (§29)
 6. Protection de l'état TERMINÉE (§36)
+
+Exécution — AUCUNE configuration manuelle, AUCUN chemin absolu :
+  python backend/test_reglement_metier_missions.py                (depuis la racine du dépôt)
+  python -m unittest backend.test_reglement_metier_missions -v    (découverte unittest)
+  python -m unittest discover -s backend -p "test_reglement_metier_missions.py"
+Le test s'exécute depuis N'IMPORTE QUEL répertoire (racine, backend/, intégration
+continue). La base de test est créée toute seule dans le dossier temporaire du
+système ; DATABASE_URL peut la surcharger, à condition de viser une base de test
+(la base applicative réelle est refusée, arrêt code 2).
 """
 import os
 import sys
+import tempfile
 import unittest
 from datetime import datetime, date, timedelta
+from pathlib import Path
 
 os.environ["TESTING"] = "1"
 os.environ["SIM_ENABLE"] = "0"
 os.environ["COLLECTOR_SOURCE"] = "AUCUN"
 
-sys.path.insert(0, os.path.abspath("backend"))
-sys.path.insert(0, os.path.abspath("."))
+# ══════════════════════════════════════════════════════════════════════════
+# AMORÇAGE ROBUSTE (v1.54, 21/09/2026) — correctif d'exécution, AUCUNE
+# assertion métier touchée.
+#
+# 1) RACINE DU DÉPÔT déduite de l'emplacement de CE fichier.
+#    Avant : `sys.path.insert(0, os.path.abspath("."))` + `abspath("backend")`
+#    → le test ne marchait QUE si le répertoire courant était la racine du
+#    dépôt ; lancé depuis `backend/` (ce que fait la campagne de tests, et
+#    ce que ferait un lanceur d'intégration continue), il mourait sur
+#    `ModuleNotFoundError: No module named 'backend'`.
+#    Désormais : aucun chemin absolu, aucun répertoire courant supposé.
+#
+# 2) BASE DE TEST SÛRE par défaut (dossier temporaire du système).
+#    Avant : sans variable DATABASE_URL, le test utilisait la base
+#    applicative par défaut (<dépôt>/data/lss.db) et écrivait dedans
+#    — configuration manuelle cachée, et risque réel sur une installation
+#    existante. Désormais : base temporaire automatique, et refus explicite
+#    (code 2) de toute base qui ne serait pas une base de test.
+# ══════════════════════════════════════════════════════════════════════════
+RACINE_DEPOT = Path(__file__).resolve().parents[1]
+if str(RACINE_DEPOT) not in sys.path:
+    sys.path.insert(0, str(RACINE_DEPOT))
+
+_base_auto = Path(tempfile.gettempdir()) / "test_reglement_metier_missions.db"
+_url_base = os.environ.get("DATABASE_URL", "")
+if not _url_base:
+    os.environ["DATABASE_URL"] = f"sqlite:///{_base_auto}"
+elif not _url_base.startswith("sqlite:///"):
+    print("⛔ Sécurité : ce test n'accepte qu'une base SQLite de test.")
+    sys.exit(2)
+else:
+    _fichier = Path(_url_base.replace("sqlite:///", "", 1))
+    _est_base_de_test = (
+        "/tmp/" in _url_base
+        or "test" in _fichier.name.lower()
+        or _fichier.parent.resolve() == Path(tempfile.gettempdir()).resolve())
+    if not _est_base_de_test:
+        print("⛔ Sécurité : base de test uniquement (fichier temporaire ou "
+              "nom contenant « test »). Base refusée : "
+              f"{_fichier.name}")
+        sys.exit(2)
+
+# Base repartie proprement (leçon « base /tmp périmée ») : une base de test
+# laissée par une exécution précédente ferait échouer les insertions.
+if os.environ["DATABASE_URL"].startswith("sqlite:///"):
+    for _suffixe in ("", "-wal", "-shm"):
+        try:
+            Path(str(Path(os.environ["DATABASE_URL"].replace("sqlite:///", "", 1))
+                     ) + _suffixe).unlink()
+        except OSError:
+            pass
 
 from backend.app.database import SessionLocal, Base, engine as db_engine
 from backend.app.models import (

@@ -53,6 +53,13 @@ RE_ERREUR_FIN = re.compile(r"^[A-Za-z_.]*(Error|Exception):", re.MULTILINE)
 RE_RESEAU = re.compile(r"ConnectError|TLS/SSL|Name or service not known"
                        r"|Temporary failure in name resolution", re.IGNORECASE)
 RE_INVOCATION = re.compile(r"can't open file|No such file or directory: '.*\.py'")
+# Cadriciel `unittest` (norme de la bibliothèque standard) : son bilan est
+# « Ran N tests in Xs » puis « OK » ou « FAILED (failures=…, errors=…) ».
+# Sans ces motifs, une suite unittest PARFAITEMENT verte était comptée
+# « sans verdict » — un faux négatif du contrôle qualité.
+RE_UNITTEST_RAN = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
+RE_UNITTEST_OK = re.compile(r"^OK( \(.*\))?\s*$", re.MULTILINE)
+RE_UNITTEST_KO = re.compile(r"^FAILED \((.*)\)\s*$", re.MULTILINE)
 
 CAT_R = "RÉUSSI"
 CAT_E = "ÉCHOUÉ"
@@ -79,10 +86,33 @@ def classer(stdout: str, stderr: str, code_retour: int) -> tuple[str, str]:
         pos_bilan = stdout.rindex(compteurs[-1][0])
     for m in RE_BILAN_TEXTE.finditer(stdout):
         pos_bilan = max(pos_bilan, m.end())
+    # Verdict d'un cadriciel (unittest) : « Ran N tests » + « OK »/« FAILED (…) ».
+    # unittest écrit ce bilan sur STDERR par défaut → on le cherche dans les DEUX
+    # flux, mais toujours de façon NOMINATIVE : les deux lignes doivent être
+    # présentes dans le MÊME flux (un « OK » isolé ne compte jamais comme bilan).
+    verdict_unittest = None      # (flux, « Ran N tests », verdict, est_ok)
+    for indice_flux, flux in enumerate((stdout, stderr)):
+        m_ran = RE_UNITTEST_RAN.search(flux)
+        if m_ran is None:
+            continue
+        m_ok = RE_UNITTEST_OK.search(flux)
+        m_ko = RE_UNITTEST_KO.search(flux)
+        if m_ok is not None or m_ko is not None:
+            verdict_unittest = (indice_flux, m_ran,
+                                m_ok if m_ok is not None else m_ko,
+                                m_ok is not None)
+            break
+    if verdict_unittest is not None and verdict_unittest[0] == 0:
+        pos_bilan = max(pos_bilan, verdict_unittest[2].end())
     bilan_texte = pos_bilan >= 0 and not compteurs
 
-    tb_apres = any(m.start() > pos_bilan for m in RE_TRACEBACK.finditer(stdout))
-    crash = tb_apres or (pos_bilan < 0
+    # Un vrai crash = traceback APRÈS le dernier bilan, ou AUCUN bilan du tout.
+    # Si le bilan vient d'un autre flux (cadriciel → stderr), les positions ne
+    # sont pas comparables : le verdict tient alors lieu de bilan.
+    tb_apres = (any(m.start() > pos_bilan for m in RE_TRACEBACK.finditer(stdout))
+                if (verdict_unittest is None or verdict_unittest[0] == 0)
+                else False)
+    crash = tb_apres or (pos_bilan < 0 and verdict_unittest is None
                          and (RE_TRACEBACK.search(stdout)
                               or RE_TRACEBACK.search(stderr)))
 
@@ -99,6 +129,15 @@ def classer(stdout: str, stderr: str, code_retour: int) -> tuple[str, str]:
     if ok is not None and ko is not None:
         return (CAT_R, f"{ok} contrôles, 0 en échec") if ko == 0 else (
             CAT_E, f"{ko} contrôle(s) en échec sur {ok + ko}")
+    if verdict_unittest is not None:
+        _, m_ran, m_verdict, est_ok = verdict_unittest
+        nb = int(m_ran.group(1))
+        if est_ok:
+            detail = f"unittest : {nb} test(s), 0 en échec"
+            if m_verdict.group(1):         # ex. « OK (skipped=2) » → on le DIT
+                detail += f" {m_verdict.group(1).strip()}"
+            return CAT_R, detail
+        return CAT_E, f"unittest : {m_verdict.group(1)} sur {nb} test(s)"
     if RE_BILAN_TEXTE.search(stdout):
         return CAT_R, "bilan texte « tout est passé »"
     if RE_RESEAU.search(stdout + stderr):
