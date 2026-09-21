@@ -97,85 +97,195 @@ payload = [{"gps_associe": plaque, "horodatage": base + timedelta(seconds=3 * i)
             "vitesse": 40.0, "moteur": "ON", "type_evenement": None}
            for i in range(N)]
 
-attentes: list = []
+# ════════════════════════════════════════════════════════════════════════════
+# v1.54 (21/09/2026) — MESURE DÉTERMINISTE, PAR ÉVÉNEMENTS (aucun `sleep`,
+# aucun seuil dépendant de la charge de la machine).
+#
+# Ce qui rendait cette suite instable : l'ancien instrument ÉCHANTILLONNAIT le
+# verrou toutes les 10 ms (`time.sleep(0.01)`) et convertissait un nombre
+# d'échantillons en millisecondes, puis comparait ce total à 1 s. Sous charge,
+# deux échantillons consécutifs peuvent s'espacer de bien plus que 10 ms — la
+# mesure « dérivait » sans qu'aucun comportement du produit n'ait changé. Le
+# « < 5 s » de l'écrivain concurrent dépendait, lui, du moment où le back-off
+# interne de SQLite tombait sur une fenêtre libre.
+#
+# Nouveau protocole (LOCK-STEP) : la suite N'ATTEND PAS une fenêtre au hasard,
+# elle l'OFFRE et attend qu'elle soit prise. Après chaque lot committé, elle
+# ouvre une fenêtre, attend (sur ÉVÉNEMENT, pas sur délai) qu'un écrivain
+# EXTÉRIEUR ait réellement pris le verrou, écrit et committé, puis seulement
+# commence le lot suivant. Chaque fait vérifié est ainsi STRUCTUREL, jamais
+# temporel :
+#   · offres == servies == nombre_de_lots − 1  → aucun maintien continu du
+#     verrou au-delà d'UN lot, et un autre écrivain passe entre chaque paire ;
+#   · sonde SANS attente pendant chaque lot  → le verrou est bien TENU pendant
+#     la transaction du lot (donc le commit par lot est réel) ;
+#   · commits == nombre_de_lots              → aucune transaction géante ;
+#   · aucun échec d'écriture                 → jamais « database is locked ».
+# Les durées sont AFFICHÉES (diagnostic), plus jamais utilisées comme verdict.
+# ════════════════════════════════════════════════════════════════════════════
+FENETRE_MAX_S = 30.0          # borne de SYNCHRONISATION = busy_timeout de l'écrivain
+                              # (ce n'est pas un délai d'attente « pour laisser
+                              #  passer le temps » : la suite ne progresse que
+                              #  lorsque l'écrivain a fini)
 
 
-def ecrivain_concurrent(tag, arret):
-    """Passe « N1 » concurrente : écrit son checkpoint pendant l'insertion."""
+class Orchestre:
+    lot_ecrit = threading.Event()     # un lot a été écrit (transaction OUVERTE)
+    fenetre = threading.Event()       # le verrou est LIBRE : fenêtre offerte
+    servi = threading.Event()         # l'écrivain extérieur a terminé
+    arret = threading.Event()         # fin de l'insertion : plus de fenêtre
+    offres = 0
+    servies = 0
+    commits = 0
+    echecs: list = []
+    attentes: list = []
+    fenetres_perdues: list = []
+    sondes_tenues = 0                 # lots pendant lesquels le verrou était TENU
+    sondes_libres = 0                 # (doit rester 0 : un lot est transactionnel)
+
+
+def _ecrire_checkpoint(tag: str, i: int, attente_s: float) -> float:
+    """Écriture EXTÉRIEURE (connexion brute) — comme une validation d'écran."""
+    t0 = time.monotonic()
+    cx = sqlite3.connect(chemin_fichier, timeout=attente_s)
+    try:
+        cx.execute("BEGIN IMMEDIATE")
+        cx.execute(
+            "INSERT INTO collecte_checkpoints (id, source, fenetre_debut,"
+            " fenetre_fin, statut, tentatives, updated_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (f"cp-{tag}-{i}", "MZONEX_N1",
+             f"2026-09-18 06:{i % 60:02d}:00", f"2026-09-18 07:{i % 60:02d}:00",
+             "EN_COURS", 1, "2026-09-18 07:00:00"))
+        cx.commit()
+    finally:
+        cx.close()
+    return time.monotonic() - t0
+
+
+def ecrivain_exterieur():
+    """Prend CHAQUE fenêtre offerte : il est la preuve que le verrou est rendu."""
     i = 0
-    while not arret.is_set():
-        t0 = time.time()
+    while not Orchestre.arret.is_set():
+        if not Orchestre.fenetre.wait(timeout=1.0):
+            continue                                   # aucune fenêtre offerte
+        Orchestre.fenetre.clear()
+        if Orchestre.arret.is_set():
+            break            # fin de l'insertion : la fenêtre finale n'est pas comptée
         i += 1
         try:
-            cx = sqlite3.connect(chemin_fichier, timeout=30.0)
-            cx.execute(
-                "INSERT INTO collecte_checkpoints (id, source, fenetre_debut,"
-                " fenetre_fin, statut, tentatives, updated_at)"
-                " VALUES (?,?,?,?,?,?,?)",
-                (f"cp-{tag}-{i}", "MZONEX_N1",
-                 f"2026-09-18 06:{i % 60:02d}:00",
-                 f"2026-09-18 07:{i % 60:02d}:00", "EN_COURS", 1,
-                 "2026-09-18 07:00:00"))
-            cx.commit()
-            cx.close()
-            attentes.append(("ok", time.time() - t0))
-        except Exception as exc:                      # database is locked…
-            attentes.append((f"{type(exc).__name__}", time.time() - t0))
-        time.sleep(0.05)
+            Orchestre.attentes.append(_ecrire_checkpoint("ext", i, FENETRE_MAX_S))
+            Orchestre.servies += 1
+        except Exception as exc:                       # database is locked…
+            Orchestre.echecs.append(f"{type(exc).__name__}: {exc}")
+        Orchestre.servi.set()
 
 
-# v1.50 — LA BONNE MESURE : pendant combien de temps le verrou d'écriture
-# reste-t-il pris SANS INTERRUPTION ? C'est elle qui décide si les écritures du
-# reste de la plateforme (validations, PATCH, audits) passent ou attendent.
-# (L'attente d'un écrivain donné dépend en plus du back-off interne de SQLite,
-# dont les paliers montent jusqu'à 100 ms : il peut rater une fenêtre de 10 ms
-# et attendre la suivante — sans jamais échouer, ce qui est le point capital.)
-plages = {"suite": 0, "max": 0, "fenetres_libres": 0, "stop": False}
+def _sonder_verrou_pris() -> bool:
+    """Sonde SANS attente : le verrou d'écriture est-il tenu EN CE MOMENT ?
 
-
-def moniteur():
-    while not plages["stop"]:
+    `timeout=0.0` → aucun temporisation, aucune dépendance à la charge : la
+    réponse est immédiate (BUSY = verrou pris, succès = verrou libre)."""
+    try:
+        cx = sqlite3.connect(chemin_fichier, timeout=0.0)
         try:
-            cx = sqlite3.connect(chemin_fichier, timeout=0.0)
             cx.execute("BEGIN IMMEDIATE")
             cx.execute("COMMIT")
+        finally:
             cx.close()
-            plages["fenetres_libres"] += 1
-            plages["suite"] = 0
-        except Exception:
-            plages["suite"] += 1
-            plages["max"] = max(plages["max"], plages["suite"])
-        time.sleep(0.01)
+        return False
+    except sqlite3.OperationalError:
+        return True
 
 
-arret = threading.Event()
-th = threading.Thread(target=ecrivain_concurrent, args=("concurrent", arret),
-                      daemon=True)
-mo = threading.Thread(target=moniteur, daemon=True)
+class CollecteurOrchestre(MZoneXApiCollector):
+    """Instrumente la frontière des LOTS, là où le produit committe."""
+
+    premier_lot = True
+
+    def _inserer_tranche(self, db, tranche, mapping, vus, historique):
+        # ① Le lot PRÉCÉDENT est déjà committé (l'appelant committe après ce
+        #    retour) : on OFFRE la fenêtre et on ATTEND (événement) qu'un
+        #    écrivain extérieur l'ait prise.
+        if not CollecteurOrchestre.premier_lot:
+            Orchestre.offres += 1
+            Orchestre.servi.clear()
+            Orchestre.fenetre.set()
+            if not Orchestre.servi.wait(timeout=FENETRE_MAX_S):
+                Orchestre.fenetres_perdues.append(Orchestre.offres)
+        CollecteurOrchestre.premier_lot = False
+        n = super()._inserer_tranche(db, tranche, mapping, vus, historique)
+        # ② Les INSERT du lot sont exécutés, le commit n'a PAS encore eu lieu :
+        #    le verrou d'écriture doit être TENU (fait structurel, vérifié par
+        #    une sonde sans attente).
+        if _sonder_verrou_pris():
+            Orchestre.sondes_tenues += 1
+        else:
+            Orchestre.sondes_libres += 1
+        Orchestre.lot_ecrit.set()
+        return n
+
+
+_vrai_sessionlocal = scrapers.SessionLocal
+
+
+class _SessionComptee:
+    """Compte les `commit()` : prouve qu'il y en a UN PAR LOT (pas une seule
+    transaction géante)."""
+
+    def __init__(self, *a, **k):
+        self._s = _vrai_sessionlocal(*a, **k)
+
+    def __getattr__(self, nom):
+        return getattr(self._s, nom)
+
+    def commit(self):
+        Orchestre.commits += 1
+        return self._s.commit()
+
+
+import math                                                  # noqa: E402
+lots_attendus = math.ceil(N / scrapers.LOT_INSERTION)
+
+scrapers.SessionLocal = _SessionComptee
+th = threading.Thread(target=ecrivain_exterieur, daemon=True)
 th.start()
-mo.start()
-t0 = time.time()
-inseres = MZoneXApiCollector().inserer(payload, historique=True)
-duree = time.time() - t0
-arret.set()
-plages["stop"] = True
-th.join(timeout=5)
-mo.join(timeout=2)
+t0 = time.monotonic()
+try:
+    inseres = CollecteurOrchestre().inserer(payload, historique=True)
+finally:
+    duree = time.monotonic() - t0
+    Orchestre.arret.set()
+    Orchestre.fenetre.set()          # débloque un écrivain en attente de fenêtre
+    th.join(timeout=5)
+    scrapers.SessionLocal = _vrai_sessionlocal
 
-echecs = [a for a in attentes if a[0] != "ok"]
-attente_max = max((a[1] for a in attentes), default=0.0)
+attente_max = max(Orchestre.attentes, default=0.0)
 check(f"{N} points insérés sans échec", inseres == N, f"→ {inseres}")
-check("AUCUN écrivain concurrent n'a échoué (0 « database is locked »)",
-      not echecs, f"→ {echecs[:3]} sur {len(attentes)} tentatives")
-check("le verrou n'est plus repris en continu : plage bloquée maximale < 1 s "
-      "(mesurée : 3,81 s avant le souffle inter-lots)",
-      plages["max"] * 0.01 < 1.0,
-      f"→ {plages['max'] * 10} ms de blocage continu, "
-      f"{plages['fenetres_libres']} fenêtres libres pendant {duree:.1f} s")
-check("un écrivain concurrent finit TOUJOURS par être servi (< 5 s, le temps "
-      "que le back-off de SQLite tombe sur une fenêtre libre)",
-      attente_max < 5.0,
-      f"→ {attente_max:.2f} s (insertion totale {duree:.1f} s)")
+check("AUCUN écrivain extérieur refusé (0 « database is locked ») — "
+      f"{Orchestre.servies} écritures concurrentes réussies",
+      not Orchestre.echecs,
+      f"→ {Orchestre.echecs[:3]} sur {Orchestre.servies} écritures")
+check("le verrou est OFFERT et REPRIS entre CHAQUE paire de lots "
+      "(preuve structurelle : aucun maintien continu au-delà d'un lot) — "
+      "offres == servies == lots − 1",
+      Orchestre.offres == lots_attendus - 1
+      and Orchestre.servies == Orchestre.offres
+      and not Orchestre.fenetres_perdues,
+      f"→ offres={Orchestre.offres}, servies={Orchestre.servies}, "
+      f"perdues={Orchestre.fenetres_perdues}, lots={lots_attendus}")
+check("pendant CHAQUE lot, le verrou est réellement TENU (sonde sans attente : "
+      "BUSY) — les lots sont donc de vraies transactions",
+      Orchestre.sondes_tenues == lots_attendus and Orchestre.sondes_libres == 0,
+      f"→ tenues={Orchestre.sondes_tenues}, libres={Orchestre.sondes_libres}, "
+      f"lots={lots_attendus}")
+check("UN COMMIT PAR LOT (aucune transaction géante) : commits == lots + le "
+      "commit de clôture (celui de `_reparer_debuts_sans_trajet`)",
+      Orchestre.commits == lots_attendus + 1,
+      f"→ {Orchestre.commits} commit(s) pour {lots_attendus} lot(s) + clôture")
+print(f"  ℹ️  diagnostic (jamais un verdict) : insertion {duree:.2f} s, "
+      f"attente maximale de l'écrivain extérieur {attente_max * 1000:.0f} ms, "
+      f"{Orchestre.servies} fenêtres prises")
 
 print("\n═══ [TD-121-bis] le progrès est MONOTONE : un lot déjà committé survit ═══")
 db = SessionLocal()
