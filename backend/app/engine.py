@@ -12,6 +12,7 @@ import logging
 import hashlib
 import math
 import os
+import uuid
 from datetime import date, datetime, time, timedelta
 from threading import RLock
 
@@ -2714,19 +2715,31 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
     4. Rapprochement par SAC DE MOTS exact (tokens_set).
     5. Rapprochement par INCLUSION forte de patronyme (nom_court in nom_long).
     6. Découverte chauffeur : création de fiche Conducteur.
-       - MZoneX : matricule = str(driverKeyCode), code_badge_mzonex = badge_code
+       - badge MZoneX connu : matricule = str(driverKeyCode), code_badge_mzonex = badge_code
        - CamtrackPro : matricule = None, code_badge_mzonex = None
+       - sinon : matricule = « AUTO-xxxxxxxx » (fiche auto créée — D2 ;
+         l'affectation au véhicule reste MANUELLE).
     """
     from .models import Conducteur, ConducteurAlias
     nom = " ".join((nom_brut or "").split()).strip()
 
-    # 1. Filtres non-personnes (D5), garages et clés de service (B2)
+    # 1. Filtres non-personnes (D5, liste SURCHARGEABLE) puis clés de service (B2).
+    # ⚠ v1.54 (21/09/2026) — RÉGRESSION CORRIGÉE : `est_libelle_service_ou_garage()`
+    #   fusionnait les deux listes en comparant la liste B2 par SOUS-CHAÎNE, ce qui
+    #   rendait « garage » définitivement bloquant : la surcharge D5
+    #   CONDUCTEUR_MOTS_IGNORES (contrat : liste SURCHARGEABLE) était donc ignorée.
+    #   Ici : D5 (surchargeable) puis B2 par comparaison EXACTE — règle d'origine.
+    #   La comparaison par sous-chaîne reste réservée au chemin BADGE
+    #   (`conducteur_du_badge`), où une clé de service ne doit jamais faire foi.
     if nom:
-        if est_libelle_service_ou_garage(nom):
+        if set(normaliser_libelle(nom).split()) & mots_ignores_conducteur():
             if nom.lower() not in _D5_DEJA_LOGUES:
                 _D5_DEJA_LOGUES.add(nom.lower())
-                log.info("§0quinquies D5 / B2 : libellé clé de service / garage / non-personne ignoré "
+                log.info("§0quinquies D5 : libellé chauffeur non-personne ignoré "
                          ": %r (tracé une seule fois)", nom)
+            return None
+        if normaliser_libelle(nom) in mots_ignores_badge():
+            log.info("§0septies B2 : clé de service exacte ignorée en découverte : %r", nom)
             return None
 
     # Règle MZoneX : si badge_code valide, chercher en priorité absolue par code_badge_mzonex ou matricule
@@ -2821,7 +2834,20 @@ def creer_conducteur_auto(db, nom_brut: str | None, badge_code: int | None = Non
     # Échelon 6 : Création nouvelle fiche
     tokens = nom.split()
     prenom_usuel = tokens[1] if tokens[0].isupper() and len(tokens) > 1 else tokens[-1]
-    matricule = str(badge_code) if (badge_code and badge_code > 0) else None
+    # §0quater D2 — matricule d'une fiche créée automatiquement :
+    #   badge MZoneX connu → le code badge (le badge fait foi) ;
+    #   CamtrackPro       → None (ce portail ne publie pas de matricule) ;
+    #   sinon             → « AUTO-xxxxxxxx » : fiche auto créée, à compléter par
+    #                        l'exploitant. C'est aussi le critère « matricule
+    #                        non-AUTO- » du gardien de dédoublonnage (J2).
+    # ⚠ v1.54 (21/09/2026) : la branche « AUTO- » avait été SUPPRIMÉE par 2f7447a
+    #   (matricule=None), privant la fiche de toute identité exploitable.
+    if badge_code and badge_code > 0:
+        matricule = str(badge_code)
+    elif plateforme == "CAMTRACKPRO":
+        matricule = None
+    else:
+        matricule = f"AUTO-{uuid.uuid4().hex[:8].upper()}"
 
     c = Conducteur(nom_prenom=nom, prenom_usuel=prenom_usuel.capitalize(),
                    matricule=matricule, code_badge_mzonex=badge_code if (badge_code and badge_code > 0) else None,

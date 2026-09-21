@@ -145,13 +145,29 @@ rz = client.post("/api/auth/login",
 h_admin = {"Authorization": f"Bearer {rz.json()['access_token']}"}
 r1 = client.post("/api/conducteurs", headers=h_admin, json={
     "nom_prenom": "TESTÉF Zéguy", "prenom_usuel": "Zeguy"})
-row_test = db.scalar(select(Conducteur).where(
-    Conducteur.matricule == r1.json().get("matricule", "?"))) \
+# ⚠ v1.54 (21/09/2026) — RECHERCHE RENDUE NON AMBIGUË. L'assertion métier est
+# INCHANGÉE (201 + forme canonique en base) et même RENFORCÉE : on vérifie LA
+# fiche renvoyée par l'API (son id), plus « une fiche portant ce matricule ».
+# Motif du changement : la recherche par `Conducteur.matricule == matricule
+# renvoyé` retombait sur `IS NULL` — donc sur un AUTRE conducteur (jeu de
+# démonstration : 18 fiches à matricule NULL depuis la purge des codes fictifs
+# « CHxxx ») — et le contrôle échouait à tort. La création MANUELLE sans
+# matricule laisse NULL par conception : « AUTO-xxxxxxxx » est réservé à la
+# DÉCOUVERTE automatique des chauffeurs (règle D2).
+row_test = db.scalar(select(Conducteur).where(Conducteur.id == r1.json()["id"])) \
     if r1.status_code == 201 else None
 check("Création manuelle « TESTÉF Zéguy » → 201, forme canonique renseignée "
       "en base", r1.status_code == 201 and row_test is not None
       and row_test.nom_normalise == "testef zeguy",
       f"{r1.status_code} {r1.text[:120]}")
+# Contrôle ajouté (v1.54) : la création manuelle n'INVENTE pas de matricule.
+# « AUTO-xxxxxxxx » marque une fiche CRÉÉE AUTOMATIQUEMENT par le moteur (D2) ;
+# un opérateur qui saisit une fiche à l'écran n'en reçoit pas (matricule NULL,
+# à compléter par l'exploitant) — c'est aussi le critère de qualité J2.
+check("Création manuelle → aucun matricule inventé (NULL, pas d'AUTO-)",
+      r1.status_code == 201 and row_test is not None
+      and row_test.matricule is None and row_test.code_badge_mzonex is None,
+      f"matricule={row_test and row_test.matricule!r}")
 r2 = client.post("/api/conducteurs", headers=h_admin, json={
     "nom_prenom": "TESTEF ZEGUY", "prenom_usuel": "Zeguy"})
 check("Re-création équivalente (sans accent, autre casse) → 409 clair",
