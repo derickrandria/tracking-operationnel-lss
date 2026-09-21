@@ -24,10 +24,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import socket
 import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
+import httpx
 
+socket.setdefaulttimeout(10.0)
+
+from .concurrence import chrono, compter, verifier_etape
 from .config import TZ, plaque_depuis_libelle_portail
 from .oauth_mzonex import ErreurAuthMZoneX, gestionnaire
 
@@ -36,19 +40,36 @@ log = logging.getLogger("lss.api_mzonex")
 BASE_API = os.getenv("MZONEX_API_BASE_URL",
                      "https://live.mzoneweb.net/mzone62.api").rstrip("/")
 _UA = "LSS-Tracking/1.25"
-_TIMEOUT = 45
+_TIMEOUT = float(os.getenv("MZONEX_API_TIMEOUT_S", "30.0"))
 # Fenêtre de relecture Niveau 1 : 3 min de chevauchement (l'anti-rejeu existant
-# dédoublonne) ; 1ʳᵉ passe plafonnée à 30 min pour ne pas inonder (§10).
+# dédoublonne) ; 1ʳᵉ passe calibrée sur 15 min pour un payload léger et rapide.
 CHEVAUCHEMENT_S = int(os.getenv("MZONEX_API_CHEVAUCHEMENT_S", "180"))
-# §0nonies decies M3 (arbitrage LSS du 29/08/2026) — fenêtre élargie à 3 h :
-# un boîtier « muet » (zone sans couverture GSM) qui renvoie son tampon avec
-# moins de 3 h de retard enrichit la journée EN COURS (volume mesuré en direct
-# le 29/08 : ~600 événements/15 min — très loin du plafond technique 9 000) ;
-# au-delà de 3 h, la relecture des jours passés (M1, §0nonies decies) fait foi.
+# §0nonies decies M3 (arbitrage LSS du 29/08/2026) — PROFONDEUR de la fenêtre
+# de relecture N1 : un boîtier « muet » (zone sans couverture GSM) qui renvoie
+# son tampon avec moins de 3 h de retard enrichit la journée EN COURS (volume
+# mesuré en direct le 29/08 : ~600 événements/15 min, très loin du plafond
+# technique) ; au-delà de 3 h, la relecture des jours passés (M1) fait foi.
+# ⚠️ NE PAS confondre avec la TAILLE DES TRANCHES ci-dessous : la profondeur
+# historique (3 h) et le découpage du payload (15 min) sont DEUX réglages
+# INDÉPENDANTS. Une collecte toutes les 15 minutes ne limite jamais à 15
+# minutes l'historique relu (régression du 12/09 corrigée le 18/09).
 FENETRE_MAX_S = int(os.getenv("MZONEX_API_FENETRE_MAX_S", "10800"))
+# Découpage du payload en tranches de 15 min (une requête OData par tranche) :
+# c'est CE réglage qui garde les réponses légères et rapides. Une fenêtre de
+# 3 h est servie en 12 tranches de 15 min — jamais tronquée.
+TRANCHE_S = int(os.getenv("MZONEX_API_TRANCHE_S", "900"))
+# Garde-fou anti-régression (18/09/2026) : une profondeur PLUS PETITE que la
+# tranche signifie que le réglage a été confondu avec la taille du payload —
+# c'est exactement la régression du 12/09. Signalé fort, jamais silencieux.
+if FENETRE_MAX_S <= max(60, TRANCHE_S):
+    logging.getLogger("lss.api_mzonex").warning(
+        "MZONEX_API_FENETRE_MAX_S=%s s est INFÉRIEUR à la tranche de payload "
+        "(%s s) : la profondeur de rattrapage des boîtiers muets est "
+        "anormalement faible (attendu : 10800 s = 3 h).",
+        FENETRE_MAX_S, TRANCHE_S)
 DECALAGE_PUBLICATION_S = int(os.getenv("MZONEX_API_DECALAGE_S", "20"))
 MAX_PAGES = int(os.getenv("MZONEX_API_MAX_PAGES", "10"))
-TAILLE_PAGE = int(os.getenv("MZONEX_API_TAILLE_PAGE", "900"))
+TAILLE_PAGE = int(os.getenv("MZONEX_API_TAILLE_PAGE", "200"))
 
 
 class ErreurApiMZoneX(RuntimeError):
@@ -81,7 +102,7 @@ def plaque_depuis_ligne_api(libelle: str | None) -> str | None:
     return plaque or None
 
 
-def point_depuis_evenement_api(v: dict) -> dict | None:
+def point_depuis_evenement_api(v: dict, map_vehicules: dict[str, str] | None = None) -> dict | None:
     """Événement API → point brut du contrat CollectorBase (§0sexies A2).
 
     Type laissé à None : ``ingest_event`` (§7.1) déroule lui-même la machine à
@@ -90,6 +111,8 @@ def point_depuis_evenement_api(v: dict) -> dict | None:
     """
     plaque = plaque_depuis_ligne_api(
         v.get("vehicle_Registration") or v.get("vehicle_Description"))
+    if not plaque and map_vehicules and v.get("vehicle_Id"):
+        plaque = map_vehicules.get(str(v.get("vehicle_Id")))
     ts = depuis_utc(v.get("utcTimestamp"))
     lat, lng = v.get("latitude"), v.get("longitude")
     if plaque is None or ts is None or lat is None or lng is None:
@@ -114,7 +137,7 @@ def _entier(t: dict, cle: str) -> int | None:
         return None
 
 
-def trajet_depuis_api(t: dict) -> dict | None:
+def trajet_depuis_api(t: dict, map_vehicules: dict[str, str] | None = None) -> dict | None:
     """Trajet officiel API → item du contrat réconciliation (§2.4).
 
     Même forme que les lignes de l'onglet « Trajets » lu à l'écran : début/fin
@@ -126,6 +149,8 @@ def trajet_depuis_api(t: dict) -> dict | None:
     """
     plaque = plaque_depuis_ligne_api(
         t.get("vehicle_Registration") or t.get("vehicle_Description"))
+    if not plaque and map_vehicules and t.get("vehicle_Id"):
+        plaque = map_vehicules.get(str(t.get("vehicle_Id")))
     debut = depuis_utc(t.get("startUtcTimestamp"))
     if plaque is None or debut is None:
         return None
@@ -157,43 +182,132 @@ class ApiMZoneX:
     def __init__(self, jetons=None):
         self._jetons = jetons or gestionnaire()
         self._groupe_id: str | None = None
+        self._cache_map_vehicules: dict[str, str] = {}
+
+    def map_vehicules(self) -> dict[str, str]:
+        """Dictionnaire guid vehicle_Id -> plaque normalisée (avec cache interne)."""
+        if self._cache_map_vehicules:
+            return self._cache_map_vehicules
+        vehs = self._pages("Vehicles?$orderby=description")
+        res = {}
+        for v in vehs:
+            plaque = plaque_depuis_ligne_api(v.get("description") or v.get("registration"))
+            vid = v.get("id")
+            if vid and plaque:
+                res[str(vid)] = plaque
+        self._cache_map_vehicules = res
+        return res
+
+    def dernieres_positions(self) -> list[dict]:
+        """Positions récentes des véhicules MZoneX issues de Vehicles (si publiées)."""
+        vehs = self._pages("Vehicles?$orderby=description")
+        points = []
+        for v in vehs:
+            plaque = plaque_depuis_ligne_api(v.get("description") or v.get("registration"))
+            if not plaque:
+                continue
+            lat = v.get("lastKnownLatitude") or v.get("latitude")
+            lng = v.get("lastKnownLongitude") or v.get("longitude")
+            ts_str = v.get("lastEventUtcTimestamp") or v.get("utcTimestamp")
+            ts = depuis_utc(ts_str) if ts_str else None
+            if lat is not None and lng is not None and ts is not None:
+                points.append({
+                    "gps_associe": plaque,
+                    "horodatage": ts,
+                    "lat": float(lat),
+                    "lng": float(lng),
+                    "adresse": None,
+                    "vitesse": max(0.0, float(v.get("speed") or 0.0)),
+                    "moteur": "ON",
+                    "type_evenement": None,
+                    "badge_code": _entier(v, "driverKeyCode"),
+                    # v1.49 — INSTANTANÉ ≠ ÉVÉNEMENT : la ligne « Vehicles »
+                    # décrit l'état CONNU du camion (dernière position, dernière
+                    # vitesse publiée), pas un fait horodaté. Le marquer
+                    # `observation` interdit à la machine à états d'en ouvrir ou
+                    # d'en fermer une ligne (engine.ingest_event) : sans cela,
+                    # une photo prise pendant un trajet créait un DÉPART à
+                    # l'heure de la photo (constat 17/09 : 15:32 affiché pour un
+                    # trajet MZoneX commencé 14:08:56).
+                    "observation": True
+                })
+        return points
 
     # ---------------------------------------------------------------- bas
     def _get(self, chemin_requete: str, reessai: bool = True) -> dict:
-        req = urllib.request.Request(
-            f"{BASE_API}/{chemin_requete}",
-            headers={"Authorization": "Bearer " + self._jetons.jeton(),
-                     "User-Agent": _UA, "Accept": "application/json"})
+        # v1.54 — MÉTRIQUES PAR ÉTAPE : l'authentification (obtention du jeton,
+        # potentiellement un aller-retour OAuth) et l'attente HTTP sont mesurées
+        # séparément. Sans cela, un dépassement de budget ne pouvait pas dire si
+        # le temps était passé à s'authentifier, à attendre le portail, à
+        # paginer ou à écrire en base (trou d'observabilité du 21/09).
+        with chrono("auth"):
+            jeton = self._jetons.jeton()
+        url = f"{BASE_API}/{chemin_requete}"
+        headers = {
+            "Authorization": "Bearer " + jeton,
+            "User-Agent": _UA,
+            "Accept": "application/json"
+        }
         try:
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
-                return json.load(r)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and reessai:
-                log.info("MZoneX API : jeton refusé (401) — ré-authentification")
-                self._jetons.invalider()
-                return self._get(chemin_requete, reessai=False)
-            corps = e.read().decode("utf-8", "replace")[:160]
-            raise ErreurApiMZoneX(
-                f"GET {chemin_requete.split('?')[0]} → HTTP {e.code} : "
-                f"{corps}") from e
-        except (TimeoutError, OSError) as e:
+            with chrono("attente_http"):
+                with httpx.Client(timeout=httpx.Timeout(_TIMEOUT, connect=5.0)) as client:
+                    resp = client.get(url, headers=headers)
+                    if resp.status_code == 401 and reessai:
+                        log.info("MZoneX API : jeton refusé (401) — ré-authentification")
+                        self._jetons.invalider()
+                        return self._get(chemin_requete, reessai=False)
+                    if resp.status_code != 200:
+                        corps = resp.text[:160]
+                        raise ErreurApiMZoneX(
+                            f"GET {chemin_requete.split('?')[0]} → HTTP {resp.status_code} : {corps}")
+                    donnees = resp.json()
+            return donnees
+        except httpx.TimeoutException as e:
+            raise TimeoutError(f"GET {chemin_requete.split('?')[0]} timeout après {_TIMEOUT}s : {e}") from e
+        except Exception as e:
             raise ErreurApiMZoneX(
                 f"GET {chemin_requete.split('?')[0]} injoignable : "
-                f"{type(e).__name__}") from e
+                f"{type(e).__name__} {e}") from e
 
     def _pages(self, chemin_requete: str) -> list:
-        """Pagination par $skip (le serveur n'émet pas de @odata.nextLink)."""
+        """Pagination par $skip (le serveur n'émet pas de @odata.nextLink).
+
+        Correctif v1.46 (constat du 04/09/2026) : quand le plafond MAX_PAGES ×
+        TAILLE_PAGE est atteint, la troncature était SILENCIEUSE — des données
+        disparaissaient sans aucun log. Le plafond est maintenant signalé en
+        WARNING (les volumes réels mesurés montent à ~2 600 évts/h, soit > 9 000
+        sur une simple demi-journée : toute fenêtre large doit être découpée,
+        cf. `evenements()` ci-dessous)."""
         lignes: list = []
         saute = 0
         sep = "&" if "?" in chemin_requete else "?"
         for _ in range(MAX_PAGES):
+            # v1.54 — POINT D'ARRÊT CONTRÔLÉ : si le budget de la passe est
+            # atteint, on s'arrête ICI (avant l'appel réseau) au lieu de
+            # continuer en tâche de fond après avoir été déclaré en échec.
+            verifier_etape("pagination")
             lot = self._get(
                 f"{chemin_requete}{sep}$top={TAILLE_PAGE}&$skip={saute}")
+            compter("nb_pages")
             vals = lot.get("value", [])
+            compter("nb_lignes", len(vals))
             lignes.extend(vals)
             if len(vals) < TAILLE_PAGE:
                 break
             saute += TAILLE_PAGE
+        else:
+            log.warning(
+                "MZoneX API — PLAFOND DE PAGINATION ATTEINT (%d pages × %d = "
+                "%d lignes) pour « %s » : des DONNÉES ONT ÉTÉ TRONQUÉES — "
+                "augmentez MZONEX_API_MAX_PAGES / MZONEX_API_TAILLE_PAGE ou "
+                "découpez la fenêtre (le découpage horaire d'`evenements()` "
+                "est là pour ça)", MAX_PAGES, TAILLE_PAGE, len(lignes),
+                chemin_requete.split("?")[0])
+            # Ne jamais transmettre un lot tronqué au moteur : le checkpoint
+            # de la fenêtre sera marqué en échec et repris ultérieurement.
+            raise ErreurApiMZoneX(
+                f"pagination incomplète pour {chemin_requete.split('?')[0]} "
+                f"({len(lignes)} lignes, plafond atteint)")
         return lignes
 
     # ---------------------------------------------------------------- flotte
@@ -237,10 +351,23 @@ class ApiMZoneX:
                    self.groupe_flotte()))
 
     def evenements(self, debut_utc: datetime, fin_utc: datetime) -> list[dict]:
-        """Fil d'événements de la flotte sur [debut_utc ; fin_utc] (UTC naïves)."""
-        chemin = ("Events?" + self._fenetre(debut_utc, fin_utc)
-                  + "&$orderby=utcTimestamp")
-        return self._pages(chemin)
+        """Fil d'événements de la flotte sur [debut_utc ; fin_utc] (UTC naïves).
+
+        Optimisation Payload v2026 : la fenêtre est découpée en tranches
+        (`TRANCHE_S`, 15 min par défaut) pour éviter tout engorgement et garantir
+        des temps de réponse < 2 s — la PROFONDEUR relue, elle, n'est jamais
+        limitée par la tranche (une fenêtre de 3 h = 12 tranches)."""
+        pas = timedelta(seconds=max(60, TRANCHE_S))
+        evs: list[dict] = []
+        borne = debut_utc
+        while borne < fin_utc:
+            verifier_etape("pagination")     # v1.54 — arrêt contrôlé par tranche
+            bout = min(borne + pas, fin_utc)
+            chemin = ("Events?" + self._fenetre(borne, bout)
+                      + "&$orderby=utcTimestamp")
+            evs.extend(self._pages(chemin))
+            borne = bout
+        return evs
 
     def _utc_naive(self, d_locale: datetime) -> datetime:
         return d_locale.replace(tzinfo=TZ).astimezone(

@@ -56,8 +56,11 @@ le 22/08/2026 — elles PRIMENT et supplantent l'affichage par chaînes v1.18) :
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, date, timedelta
+
+log = logging.getLogger("tracking.chaines")
 
 ETAT_EN_COURS = "EN_COURS"
 ETAT_EN_ATTENTE = "EN_ATTENTE"
@@ -161,11 +164,50 @@ def _fin_effective(seg: Segment, vivant_possible: bool, roule: bool,
     return max(sub, seg.debut)
 
 
+#: v1.48 — silence au-delà duquel les COMPTEURS d'une ligne ouverte se figent
+#: à la dernière preuve (défaut aligné sur SEUIL_GPS_HORS_LIGNE = 30 min).
+SEUIL_SILENCE_MUET_S = 1800.0
+
+
+def fin_bornee_ouverte(debut: datetime, maintenant: datetime,
+                       derniere_trace: datetime | None = None,
+                       seuil_silence_s: float = SEUIL_SILENCE_MUET_S) -> datetime:
+    """v1.48 — fin retenue pour les COMPTEURS d'une ligne OUVERTE :
+    ``max(debut, min(maintenant, derniere_trace + seuil_silence_s))``.
+
+    Deux règles du corpus se conciliaient mal :
+      · v1.16 — un trajet en cours reste « en cours » SANS condition de
+        fraîcheur : sinon un trajet commencé à 11:37 disparaissait après
+        15 min sans nouvel événement (« TCC cassé »). L'AFFICHAGE de la ligne
+        reste donc EN_COURS (aucun changement) ;
+      · §10 / consolidation — on ne ferme jamais à l'aveugle : la fin d'un
+        ouvert est ``min(clôture, dernier signal)``.
+
+    Constat exploitant du 17/09/2026 (panne MZoneX depuis 08:43) : sans borne,
+    chaque ligne ouverte comptait jusqu'à l'heure de consultation — 17 camions
+    affichaient « TCC 0:02 · TCJ 3:58 · TTJ 3:58 » à 12:42 pour un dernier
+    mouvement à 08:43, et ces valeurs auraient couru jusqu'à minuit.
+
+    Règle : la présomption de conduite est BORNÉE à la dernière preuve +
+    ``seuil_silence_s`` (la frontière même du badge « boîtier muet »). La
+    valeur est MONOTONE (la trace ne recule jamais) : au pire 30 min de
+    présomption, jamais un compteur fantôme. L'écran, l'export, la mesure et
+    l'archive donnent le même résultat. Fonction PURE.
+    """
+    if derniere_trace is None:
+        return max(maintenant, debut)
+    plafond = derniere_trace + timedelta(seconds=float(seuil_silence_s))
+    return max(debut, min(maintenant, plafond))
+
+
 def construire_journee(segments: list[Segment], *, maintenant: datetime,
+                       date_jour: date | None = None,
                        pause_min: float = 1200, seuil_km: float = 0.3,
                        roule: bool = False,
                        fin_substitution: datetime | None = None,
-                       pause_affichee_min: float = 1800) -> JourneeChainee:
+                       pause_affichee_min: float = 1800,
+                       derniere_trace: datetime | None = None,
+                       seuil_silence_s: float = SEUIL_SILENCE_MUET_S) -> JourneeChainee:
     """Assemble la journée v3 (AMÉLIORATIONS, arbitrages C1→C4 du 22/08/2026).
 
     AM-2 : UN TRAJET VALIDE = UNE LIGNE (plus de fusion d'affichage) ; les
@@ -182,28 +224,79 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     if not segs:
         return res
 
-    # ---- 0 · hygiène des segments OUVERTS (heure_fin NULL) : inchangée —
-    # seul l'ouvert le plus récent peut être vivant ; les débris ouverts
-    # antérieurs sont écartés de l'affichage (l'enregistrement reste en base).
-    debut_max = max((s.debut for s in segs if not s.rejete), default=None)
+    # Détermination de la date cible pour le bornage strict 00:00:00 - 23:59:59
+    if date_jour is not None:
+        target_date = date_jour
+    else:
+        valid_dates = [s.debut.date() for s in segs if s.debut and not s.rejete]
+        if valid_dates:
+            target_date = max(valid_dates)
+        else:
+            target_date = maintenant.date()
+
+    debut_jour = datetime.combine(target_date, datetime.min.time())
+    fin_jour = datetime.combine(target_date, datetime.max.time().replace(microsecond=0))
+
+    if maintenant.date() > target_date:
+        maintenant = fin_jour
+        est_jour_passe = True
+        roule = False
+    else:
+        est_jour_passe = False
+
+    # Filtrage et découpage strict des segments dans la fenêtre de la journée cible [00:00:00 -> 23:59:59]
+    segs_filtres: list[Segment] = []
+    for s in segs:
+        if s.debut is None:
+            continue
+        # Segment entièrement en dehors de la journée
+        if s.fin is not None and s.fin <= debut_jour:
+            continue
+        if s.debut > fin_jour:
+            continue
+
+        # Bornage au jour
+        deb_borne = max(s.debut, debut_jour)
+        fin_borne = min(s.fin, fin_jour) if s.fin is not None else (fin_jour if est_jour_passe else None)
+        if fin_borne is not None and fin_borne < deb_borne:
+            continue
+
+        segs_filtres.append(Segment(
+            debut=deb_borne,
+            fin=fin_borne,
+            distance_km=s.distance_km,
+            rejete=s.rejete,
+            ref=s.ref
+        ))
+
+    if not segs_filtres:
+        return res
+
+    debut_max = max((s.debut for s in segs_filtres if not s.rejete), default=None)
     if debut_max is None:
         return res                        # que des manœuvres : aucune ligne
-    segs = [s for s in segs if not (s.fin is None and s.debut < debut_max)]
-    segs.sort(key=lambda s: (s.debut, s.fin or datetime.max))
+
+    segs_filtres = [s for s in segs_filtres if not (s.fin is None and s.debut < debut_max)]
+    segs_filtres.sort(key=lambda s: (s.debut, s.fin or datetime.max))
 
     # ---- 1 · lignes = segments non rejetés (AM-2 : aucune fusion) ; une
     # ligne OUVERTE toujours affichée (v1.16 : verdict manœuvre à la clôture)
-    for s in segs:
+    for s in segs_filtres:
         if s.rejete:
             continue
-        fin_s = _fin_effective(s, vivant_possible=(s.debut >= debut_max),
-                               roule=roule,
+        fin_s = _fin_effective(s, vivant_possible=((s.debut >= debut_max) and not est_jour_passe),
+                               roule=(roule if not est_jour_passe else False),
                                fin_substitution=fin_substitution)
         if (fin_s is not None and s.distance_km is not None
                 and s.distance_km < seuil_km):
             continue                      # manœuvre clôturée : cachée (R2)
         ouverte = s.fin is None and fin_s is None
-        fin_travail = fin_s if not ouverte else maintenant
+        # v1.48 — la ligne reste « en cours » à l'écran (v1.16), mais sa durée
+        # de travail est bornée à la dernière PREUVE connue : un boîtier muet
+        # n'alimente plus un compteur fantôme.
+        fin_travail = (fin_bornee_ouverte(s.debut, maintenant, derniere_trace,
+                                          seuil_silence_s)
+                       if ouverte else fin_s)
         dist = None if s.distance_km is None else round(s.distance_km, 3)
         res.lignes.append(LigneJournee(
             debut=s.debut, fin=None if ouverte else fin_s,
@@ -235,9 +328,24 @@ def construire_journee(segments: list[Segment], *, maintenant: datetime,
     # ouverte) : l'amplitude englobe toujours toutes les lignes.
     if res.lignes:
         depart = res.lignes[0].debut
-        fin_ref = max(lg.fin or maintenant for lg in res.lignes)
-        res.tcj_s = union_duree_s((lg.debut, lg.fin or maintenant)
-                                  for lg in res.lignes)
-        res.ttj_s = max(0, int((fin_ref - depart).total_seconds()))
+        # v1.48 — bornes EFFECTIVES : une ligne ouverte s'arrête à sa dernière
+        # preuve (+ présomption bornée), jamais à l'heure de consultation.
+        bornes_eff = [
+            (lg.debut,
+             lg.fin if lg.fin is not None
+             else fin_bornee_ouverte(lg.debut, maintenant, derniere_trace,
+                                     seuil_silence_s))
+            for lg in res.lignes]
+        fin_ref = max(f for _, f in bornes_eff)
+        raw_tcj = union_duree_s(bornes_eff)
+        raw_ttj = max(0, int((fin_ref - depart).total_seconds()))
+
+        if raw_tcj > 86400 or raw_ttj > 86400:
+            log.error("Consolidation journalière : durée aberrante > 24h00 (TCJ=%ds, TTJ=%ds) détectée — trajet corrompu",
+                      raw_tcj, raw_ttj)
+
+        # Plafond strict à 24h (86400 s) par jour
+        res.ttj_s = min(86400, raw_ttj)
+        res.tcj_s = min(res.ttj_s, raw_tcj)
         res.total_pause_s = max(0, res.ttj_s - res.tcj_s)
     return res

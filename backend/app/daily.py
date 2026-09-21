@@ -24,20 +24,26 @@ Exécution : tâche de fond asyncio (remplaçant direct de Celery Beat en mode
 autonome ; voir README pour la version Celery en production).
 """
 import asyncio
+import hashlib
+import json
 import logging
 from datetime import date, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
-from .config import bascule_du, jour_attribution, now_local
+from .config import SIM_ENABLE, bascule_du, jour_attribution, now_local
 from .database import SessionLocal
 from .engine import ensure_suivi, ensure_suivis_du_jour
 from .event_bus import publish
 from .models import (Alerte, AuditLog, GraviteAlerte, HistoriqueJournalier,
                      Infraction, StatutAlerte, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet,
-                     TypeAlerte, Vehicule)
-from .serializers import iso, s_suivi
+                     TypeAlerte, Vehicule, uid)
+from .serializers import (compter_trajets_reels, fusionner_trajets_affichage,
+                       iso, journee_suivi, s_ligne, s_suivi,
+                       snapshot_canonique)
 
 log = logging.getLogger("lss.daily")
 
@@ -54,9 +60,78 @@ def _cloture_du(jour: date, seuils: dict | None = None) -> datetime:
     return datetime.combine(jour, datetime.min.time()) + timedelta(seconds=secondes)
 
 
+def _trajets_provisoires(db, jour: date) -> int:
+    """Trajets encore PROVISOIRE sur la journée (exigence 10)."""
+    return db.scalar(select(func.count(Trajet.id)).join(
+        SuiviJournalier, Trajet.suivi_id == SuiviJournalier.id).where(
+            SuiviJournalier.date_jour == jour,
+            Trajet.statut_source == StatutSourceTrajet.PROVISOIRE)) or 0
+
+
+def _trajets_simules(db, jour: date) -> int:
+    """Trajets issus du SIMULATEUR sur la journée (exigence 13)."""
+    return db.scalar(select(func.count(Trajet.id)).join(
+        SuiviJournalier, Trajet.suivi_id == SuiviJournalier.id).where(
+            SuiviJournalier.date_jour == jour,
+            Trajet.source_plateforme == "SIMULATEUR")) or 0
+
+
 def archiver_jour(db, jour: date) -> int:
     """Archive (une seule fois) tous les suivis du jour donné. Retourne le
-    nombre de lignes archivées. Idempotent (§A.2 : jamais de réécriture)."""
+    nombre de lignes NOUVELLEMENT archivées. Idempotent (§A.2).
+
+    v1.51 — trois garde-fous : une journée ne peut plus être figée à tort.
+
+      • exigence 5/10 : un trajet encore **PROVISOIRE** interdit d'écrire
+        l'historique du jour — une archive officielle ne contient JAMAIS de
+        donnée provisoire ; le jour repassera par `consolider_jour` ;
+      • exigence 13 : le mode simulateur ne fabrique pas d'archive officielle
+        sans accord EXPLICITE de l'exploitant (`LSS_SIMULATEUR_ARCHIVE=1`) —
+        une alerte visible est levée à chaque refus ;
+      • exigence 6 : la fonction ne SUPPRIME ni ne RÉÉCRIT rien — seules les
+        lignes manquantes sont créées (la seule réécriture du dépôt vit dans
+        `recalculer_archives_journee`, désormais autorisée explicitement et
+        tracée).
+    """
+    from .config import SIMULATEUR_ARCHIVE_AUTORISE, SIM_ENABLE
+
+    # --- garde-fou simulateur (exigence 13) --------------------------------
+    if not SIMULATEUR_ARCHIVE_AUTORISE:
+        n_sim = _trajets_simules(db, jour)
+        if SIM_ENABLE or n_sim:
+            db.add(AuditLog(username="systeme",
+                            action="archive.refusee_simulateur",
+                            entite="suivi", entite_id=None,
+                            details={"jour": jour.isoformat(),
+                                     "sim_enable": bool(SIM_ENABLE),
+                                     "trajets_simules": n_sim,
+                                     "regle": "v1.51 exigence 13 : le mode "
+                                              "simulateur ne fabrique jamais une "
+                                              "archive officielle en silence "
+                                              "(LSS_SIMULATEUR_ARCHIVE=1 pour "
+                                              "l'autoriser explicitement)"}))
+            db.commit()
+            log.warning("archiver_jour(%s) REFUSÉ : mode simulateur actif "
+                        "(SIM_ENABLE=%s, %d trajet(s) simulé(s)) — "
+                        "l'historique reste intact", jour, SIM_ENABLE, n_sim)
+            return 0
+
+    # --- garde-fou « aucune donnée provisoire dans une archive » -----------
+    n_prov = _trajets_provisoires(db, jour)
+    if n_prov:
+        db.add(AuditLog(username="systeme",
+                        action="archive.refusee_provisoire",
+                        entite="suivi", entite_id=None,
+                        details={"jour": jour.isoformat(),
+                                 "trajets_provisoires": n_prov,
+                                 "regle": "v1.51 exigence 10 : une archive "
+                                          "officielle ne contient aucune donnée "
+                                          "PROVISOIRE (consolider_jour d'abord)"}))
+        db.commit()
+        log.warning("archiver_jour(%s) REFUSÉ : %d trajet(s) encore "
+                    "PROVISOIRE(S) — consolidations requises", jour, n_prov)
+        return 0
+
     suivis = db.scalars(select(SuiviJournalier).where(SuiviJournalier.date_jour == jour)).all()
     archives = 0
     debut = datetime.combine(jour, datetime.min.time())
@@ -79,7 +154,13 @@ def archiver_jour(db, jour: date) -> int:
         db.add(HistoriqueJournalier(
             date_jour=jour, annee=jour.year, mois=jour.month,
             vehicule_id=s.vehicule_id, conducteur_id=s.conducteur_id,
-            donnees=s_suivi(s), nb_infractions=nb_inf, nb_alertes=nb_alertes))
+            # v1.53 — FABRIQUE UNIQUE : trajets BRUTS + compteurs distincts
+            # (avant : `s_suivi(s)` stockait la vue déjà fusionnée, si bien que
+            # le chemin « rattrapage » et le chemin « recalcul » produisaient
+            # deux snapshots différents pour la même journée — écart détecté par
+            # test_coherence_archives_v153.py, corrigé ici).
+            donnees=snapshot_canonique(s), nb_infractions=nb_inf,
+            nb_alertes=nb_alertes))
         archives += 1
     db.commit()
     return archives
@@ -179,6 +260,347 @@ def pre_consolider_veille(db, jour_veille: date, maintenant: datetime | None = N
     return consolider_jour(db, jour_veille, maintenant)
 
 
+def format_secondes_vers_hhmm(secondes: int | float | None) -> str:
+    """Convertit une durée en secondes en format HH:MM sans masquage artificiel à 24:00, avec journalisation d'erreur si > 24h."""
+    if secondes is None:
+        return "00:00"
+    try:
+        s = max(0, int(secondes))
+        if s > 86400:
+            log.error("Consolidation journalière : durée calculée supérieure à 24h00 (%d s) — données corrompues", s)
+        h = s // 3600
+        m = (s % 3600) // 60
+        return f"{h:02d}:{m:02d}"
+    except (TypeError, ValueError):
+        return "00:00"
+
+
+def rattraper_evenements_gps_camtrackpro(jour: date, db: Session,
+                                         reseau: bool = True) -> int:
+    """Interroge l'API distante Wialon / CamTrackPro pour extraire l'historique brut
+    des positions (messages/load_interval) du jour [00:00:00 -> 23:59:59], insère ces
+    événements réels dans `evenements_gps` avec absorption des doublons `begin_nested()`,
+    et réconcilie les trajets officiels dans `SuiviJournalier`.
+    `reseau=False` : JAMAIS d'appel réseau — RIEN n'est injecté (v149 :
+    utilisé au démarrage et par les tests ; §10/R2 : jamais de données
+    inventées)."""
+    from .api_wialon import ApiWialon, jeton_configure
+    from .engine import cle_idempotence_evenement
+    from .models import EvenementGPS, SourceEvenement, TypeEvenement, Vehicule
+    from .reconciliation import reconcilier_trajets_valides, normaliser_valides
+    from sqlalchemy.exc import IntegrityError
+
+    cloture = _cloture_du(jour)
+    inseres = 0
+
+    if not (reseau and jeton_configure()):
+        # v149 (16/09/2026) — FINI les trajets codés en dur : sans jeton,
+        # RIEN à injecter, jamais de données inventées (§10/R2). Les tables
+        # ci-dessous écrasaient les trajets RÉELS relus au portail CamtrackPro
+        # (constats : 7766TBL 12/09 → 5:30/14:00/240 km ; 6256TCE 13/09 →
+        # 8:26/9:24/48,2 km au lieu de 5:10→22:12 ; TCJ 18:29 vs 9:32…).
+        log.info("Jeton Wialon absent : aucun rattrapage CamtrackPro pour le "
+                 "%s (aucune donnée codée en dur)", jour)
+        return 0
+
+    api = ApiWialon()
+    try:
+        api.connecter()
+        log.info("Appel API réel CamTrackPro / Wialon pour le rattrapage GPS du %s...", jour)
+        points_recuperes = api.messages_du_jour(jour, fin_locale=cloture)
+        trajets_recuperes = api.trajets_du_jour(jour, fin_locale=cloture)
+    except Exception as e:
+        log.error("Échec appel API CamTrackPro / Wialon : %s", e)
+        raise RuntimeError(f"Échec appel API Wialon pour le rattrapage N1 : {e}") from e
+    finally:
+        api.fermer()
+
+    debut_jour = datetime.combine(jour, datetime.min.time())
+    fin_jour = datetime.combine(jour, datetime.max.time().replace(microsecond=0))
+
+    # 1. Insertion des événements GPS réels dans evenements_gps (strictement bornés au jour)
+    map_vehicules = {v.plaque: v for v in db.scalars(select(Vehicule)).all()}
+    for plaque, pts in points_recuperes.items():
+        v = map_vehicules.get(plaque)
+        if not v:
+            continue
+        for p in pts:
+            ht = p["horodatage"]
+            if ht < debut_jour or ht > fin_jour:
+                continue
+            cle = cle_idempotence_evenement(
+                v.id, ht, p["lat"], p["lng"], SourceEvenement.CAMTRACKPRO
+            )
+            ev = EvenementGPS(
+                vehicule_id=v.id,
+                horodatage=ht,
+                latitude=p["lat"],
+                longitude=p["lng"],
+                vitesse=p["vitesse"],
+                etat_moteur=p["etat_moteur"],
+                type_evenement=TypeEvenement.POSITION if p["type_evenement"] == "POSITION" else TypeEvenement.ARRET,
+                source=SourceEvenement.CAMTRACKPRO,
+                idempotence_key=cle,
+                received_at=now_local()
+            )
+            try:
+                with db.begin_nested():
+                    db.add(ev)
+                    db.flush()
+                    inseres += 1
+            except IntegrityError:
+                pass
+
+    db.commit()
+    log.info("rattraper_evenements_gps_camtrackpro(%s) : %d point(s) GPS réels insérés/vérifiés", jour, inseres)
+
+    # 2. Réconciliation des trajets officiels réels dans SuiviJournalier (strictement bornés au jour)
+    if trajets_recuperes:
+        trajets_bornes = []
+        for it in trajets_recuperes:
+            deb = it.get("debut")
+            fin = it.get("fin")
+            if deb is None:
+                continue
+            if fin is not None and fin <= debut_jour:
+                continue
+            if deb >= fin_jour:
+                continue
+            it_c = dict(it)
+            if deb < debut_jour:
+                it_c["debut"] = debut_jour
+            if fin is not None and fin > fin_jour:
+                it_c["fin"] = fin_jour
+            trajets_bornes.append(it_c)
+        propres = normaliser_valides(trajets_bornes)
+        reconcilier_trajets_valides(db, propres, username="camtrackpro_rattrapage", maintenant=cloture)
+        db.commit()
+
+    return inseres
+
+
+def recalculer_archives_journee(jour_cible: str | date, source_filtre: str | None = None,
+                                db=None, rattraper_portail: bool = True,
+                                autoriser_reecriture: bool = False,
+                                motif: str | None = None) -> dict:
+    """Re-consolide et re-calcule intégralement les archives d'une journée (ex: 2026-09-11).
+    Supporte un filtre par source (ex: 'CAMTRACKPRO' ou 'MZONEX').
+    Assure que les clés tcj_str, ttj_str, tcj_secondes, ttj_secondes, pauses_secondes sont
+    STRICTEMENT renseignées et non nulles.
+    Exécute une suppression préalable et réinsertion propre avec db.commit() explicite.
+    `rattraper_portail=False` : recalcule UNIQUEMENT depuis la base locale (aucun
+    appel réseau CamtrackPro/Wialon) — utilisé au démarrage (seed/scellement)
+    pour ne jamais bloquer le boot ; les catch-up de fond (AM-4, Boot
+    Catch-up 7 jours) gardent la valeur True (relecture portails réels)."""
+    from .engine import get_seuils, recalculer_temps, ensure_suivi
+    from .serializers import s_suivi
+
+    fermer_db = False
+    if db is None:
+        db = SessionLocal()
+        fermer_db = True
+
+    try:
+        jour = date.fromisoformat(jour_cible) if isinstance(jour_cible, str) else jour_cible
+        seuils = get_seuils(db)
+        cloture = _cloture_du(jour, seuils)
+        debut = datetime.combine(jour, datetime.min.time())
+        fin = debut + timedelta(days=1)
+
+        # 1. Rattrapage préalable des événements GPS CamTrackPro si possible.
+        #    `rattraper_portail=False` → lecture LOCALE uniquement (config
+        #    certifiée du jour, jamais de réseau) — utilisé au démarrage/tests.
+        if source_filtre in (None, "CAMTRACKPRO"):
+            try:
+                rattraper_evenements_gps_camtrackpro(jour, db,
+                                                     reseau=rattraper_portail)
+            except Exception as exc:
+                log.warning("Rattrapage GPS CamtrackPro omis (%s) — recalcul sur la base locale", exc)
+
+        # 2. Sélection des véhicules cibles
+        q_vehs = select(Vehicule)
+        if source_filtre:
+            q_vehs = q_vehs.where(Vehicule.plateforme_gps == source_filtre.upper())
+        vehicules_cibles = db.scalars(q_vehs).all()
+        target_veh_ids = [v.id for v in vehicules_cibles]
+
+        # 3. Consolidation préalable des trajets
+        n_consolides = consolider_jour(db, jour)
+
+        # 4. Lecture des anciens snapshots d'archives pour préserver les données valides
+        anciens_hists = db.scalars(select(HistoriqueJournalier).where(
+            HistoriqueJournalier.date_jour == jour,
+            HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
+        )).all()
+        map_anciens_hists = {h.vehicule_id: h for h in anciens_hists}
+
+        # Suppression préalable ciblée dans historique_journalier — v1.51,
+        # exigence 6 : la réécriture d'archives est DÉSORMAIS EXPLICITE et
+        # TRACÉE. Sans autorisation, on refuse au lieu de détruire (avant, le
+        # delete/re-insert était silencieux : une panne au milieu du travail
+        # faisait disparaître la journée sans laisser la moindre trace).
+        if target_veh_ids:
+            if map_anciens_hists and not autoriser_reecriture:
+                db.add(AuditLog(username="systeme",
+                                action="archive.reecriture_refusee",
+                                entite="suivi", entite_id=None,
+                                details={"jour": jour.isoformat(),
+                                         "motif": motif,
+                                         "archives_conservees": len(map_anciens_hists),
+                                         "regle": "v1.51 exigence 6 : un jour "
+                                                  "ARCHIVÉ n'est jamais réécrit "
+                                                  "silencieusement — passer "
+                                                  "autoriser_reecriture=True "
+                                                  "avec un motif"}))
+                db.commit()
+                log.warning("recalculer_archives_journee(%s) REFUSÉ : %d archive(s) "
+                            "existante(s), réécriture non autorisée (motif=%s)",
+                            jour, len(map_anciens_hists), motif)
+                return {"date_jour": jour.isoformat(), "source_filtre": source_filtre,
+                        "suivis_recalcules": 0, "archives_mises_a_jour": 0,
+                        "trajets_consolides": n_consolides, "statut": "REFUSEE",
+                        "raison": "archive existante — réécriture non autorisée "
+                                  "(v1.51 exigence 6 : aucune réécriture silencieuse)",
+                        "archives_conservees": len(map_anciens_hists)}
+            if map_anciens_hists:
+                empreintes = []
+                for h in anciens_hists[:200]:
+                    brut = json.dumps(h.donnees or {}, sort_keys=True, default=str)
+                    empreintes.append(hashlib.sha256(brut.encode("utf-8")).hexdigest()[:16])
+                db.add(AuditLog(username="systeme",
+                                action="archive.reecriture_autorisee",
+                                entite="suivi", entite_id=None,
+                                details={"jour": jour.isoformat(),
+                                         "motif": motif,
+                                         "archives_remplacees": len(map_anciens_hists),
+                                         "empreintes_avant": empreintes,
+                                         "regle": "v1.51 exigence 6 : réécriture "
+                                                  "d'archives explicitement "
+                                                  "autorisée et tracée"}))
+                db.commit()
+            db.execute(delete(HistoriqueJournalier).where(
+                HistoriqueJournalier.date_jour == jour,
+                HistoriqueJournalier.vehicule_id.in_(target_veh_ids)
+            ))
+            db.flush()
+
+        # 5. Préparation et réinsertion propre des archives
+        recalcules = 0
+        for v in vehicules_cibles:
+            s = ensure_suivi(db, v, jour)
+            recalculer_temps(db, s, cloture)
+            # v1.52 (18/09/2026) — CORRECTIF : `s_suivi` lit la RELATION `s.trajets`.
+            # Sur une session longue, cette collection peut être PÉRIMÉE (chargée
+            # avant l'écriture des trajets) : l'archive était alors écrite avec
+            # TCJ = TTJ = TCC = 0 et zéro ligne, alors que la base contenait bien
+            # les trajets — le calcul était juste, la SÉRIALISATION lisait un cache.
+            # On force la relecture : « TCJ/TTJ/TCC calculés AVANT toute
+            # sérialisation » n'a de sens que si elle lit l'état réel.
+            db.expire(s, ["trajets"])
+            d = snapshot_canonique(s, seuils)   # v1.53 — fabrique unique
+
+            db.expire(s, ["trajets"])
+            d = snapshot_canonique(s, seuils)   # v1.53 — fabrique unique
+
+            nb_inf = db.scalar(select(func.count(Infraction.id)).where(
+                Infraction.date_jour == jour, Infraction.vehicule_id == v.id,
+                Infraction.exterieure.is_(True))) or 0
+            nb_alertes = db.scalar(select(func.count(Alerte.id)).where(
+                Alerte.vehicule_id == v.id,
+                Alerte.date_heure >= debut, Alerte.date_heure < fin)) or 0
+
+            cond_id = s.conducteur_id or v.conducteur_actuel_id
+
+            _tcj_src = int(d.get("tcj_s") or d.get("tcj_secondes") or 0)
+            _ttj_src = int(d.get("ttj_s") or d.get("ttj_secondes") or _tcj_src)
+            if _tcj_src > 86400 or _ttj_src > 86400:
+                # v1.53 — une valeur d'archive > 24 h est anormale : on la ramène
+                # à la borne technique MAIS on le dit (jamais de correction muette).
+                log.warning(
+                    "Archive %s / véhicule %s : valeur > 24 h ramenée à la borne "
+                    "technique (TCJ %d → ≤86400, TTJ %d → ≤86400)",
+                    jour, v.id, _tcj_src, _ttj_src)
+            tcj_sec = max(0, min(86400, _tcj_src))
+            ttj_sec = max(0, min(86400, int(d.get("ttj_s") or d.get("ttj_secondes") or (tcj_sec + int(d.get("total_pause_s") or d.get("pauses_secondes") or 0)))))
+            if ttj_sec < tcj_sec:
+                ttj_sec = tcj_sec
+            pauses_sec = max(0, min(86400, ttj_sec - tcj_sec))
+
+            # Normalisation stricte de toutes les clés
+            d["tcj_s"] = tcj_sec
+            d["tcj_secondes"] = tcj_sec
+            d["tcj_str"] = format_secondes_vers_hhmm(tcj_sec)
+
+            d["total_pause_s"] = pauses_sec
+            d["pauses_secondes"] = pauses_sec
+            d["total_pause_str"] = format_secondes_vers_hhmm(pauses_sec)
+
+            d["ttj_s"] = ttj_sec
+            d["ttj_secondes"] = ttj_sec
+            d["ttj_str"] = format_secondes_vers_hhmm(ttj_sec)
+
+            # v1.52 (18/09/2026) — CORRECTIF : le TCC était ÉCRIT À ZÉRO ici,
+            # détruisant le temps de conduite continue à chaque reconstruction
+            # d'archive (le calcul l'avait pourtant produit : `recalculer_temps`
+            # puis `s_suivi` portent la valeur réelle). Un sérialiseur ne remet
+            # JAMAIS tcc_s à zéro : le masquage « 0:00 » d'une journée close est
+            # une décision d'AFFICHAGE (drapeau `tcc_masque`), jamais une
+            # destruction de donnée.
+            tcc_sec = max(0, min(86400, int(d.get("tcc_s") or d.get("tcc_secondes") or 0)))
+            d["tcc_s"] = tcc_sec
+            d["tcc_secondes"] = tcc_sec
+            d["tcc_str"] = format_secondes_vers_hhmm(tcc_sec)
+
+            tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+            if tcj_max <= 24:
+                tcj_max *= 3600
+            ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+            if ttj_max <= 24:
+                ttj_max *= 3600
+
+            d["flag_tcj"] = bool(tcj_sec > tcj_max)
+            # v1.53 — seuil INCLUSIF (12:00:00 pile est signalé)
+            d["flag_ttj"] = bool(ttj_sec >= ttj_max)
+            tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+            if tcc_max <= 24:
+                tcc_max *= 3600
+            d["flag_tcc"] = bool(tcc_sec > tcc_max)
+
+            h_new = HistoriqueJournalier(
+                id=uid(),
+                date_jour=jour,
+                annee=jour.year,
+                mois=jour.month,
+                vehicule_id=v.id,
+                conducteur_id=cond_id,
+                donnees=d,
+                nb_infractions=nb_inf,
+                nb_alertes=nb_alertes,
+                archive_le=now_local()
+            )
+            db.add(h_new)
+            recalcules += 1
+
+        db.commit()
+        log.info("recalculer_archives_journee(%s, source=%s) terminé : %d archive(s) réinsérée(s) avec commit",
+                 jour, source_filtre, recalcules)
+        return {
+            "date_jour": jour.isoformat(),
+            "source_filtre": source_filtre,
+            "suivis_recalcules": recalcules,
+            "archives_mises_a_jour": recalcules,
+            "trajets_consolides": n_consolides,
+            "statut": "OK"
+        }
+    except Exception:
+        db.rollback()
+        log.exception("Échec recalculer_archives_journee(%s)", jour_cible)
+        raise
+    finally:
+        if fermer_db:
+            db.close()
+
+
 def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
     """Enchaîne CONSOLIDATION 23:59:59 de la veille (v3 AM-3/C1) + archivage
     + création des lignes du nouveau jour (A+B reportées, C et D vides).
@@ -197,17 +619,27 @@ def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
         except Exception:
             items, echecs = [], ["ERREUR_INTERNE"]
         if echecs:
+            # v1.51 — exigence 5 : une source indisponible interdit l'archive
+            # partielle. La journée SE FERME quand même (23:59:59 : le split de
+            # minuit est une opération d'intégrité) mais l'historique n'est PAS
+            # écrit ; `rattrapage` l'archivera dès que la source répondra.
+            # (Avant : D4 archivait une veille incomplète — « minuit n'attend
+            # pas » ; c'est cette dérogation que l'exigence 5 remplace.)
             db.add(AuditLog(username="systeme",
-                            action="cycle_minuit.relecture_partielle",
+                            action="cycle_minuit.archive_differee",
                             entite="suivi", entite_id=None, details={
                                 "jour": jour_precedent.isoformat(),
                                 "portails_absents": echecs,
-                                "regle": "§0decies D4 (24/08/2026) : portails "
-                                         "injoignables à minuit — consolidation "
-                                         "sur la base (minuit n'attend pas)"}))
+                                "regle": "v1.51 exigence 5 : source "
+                                         "indisponible ⇒ AUCUNE archive "
+                                         "partielle — archive différée et "
+                                         "reprise automatique"}))
             db.commit()
             n_pre = consolider_jour(db, jour_precedent)
-            nb_arch = archiver_jour(db, jour_precedent)
+            nb_arch = 0
+            log.warning("Cycle de minuit %s : portail(s) absent(s) (%s) — "
+                        "ARCHIVE DIFFÉRÉE (aucune archive partielle)",
+                        jour_precedent, ", ".join(echecs))
         else:
             stats = _consolider_et_archiver_jour(
                 db, jour_precedent, items, username="cycle_minuit_d4")
@@ -218,7 +650,7 @@ def executer_cycle_quotidien(jour_precedent: date, jour_nouveau: date) -> dict:
 
         # nouvelle journée : 1 ligne par véhicule actif, A+B reportées,
         # C et D vides (assuré par ensure_suivi), emplacement J-1 = arrêt final J-1.
-        vehicules = db.scalars(select(Vehicule).where(Vehicule.statut != "INACTIF")).all()
+        vehicules = db.scalars(select(Vehicule).where(Vehicule.statut == "ACTIF")).all()
         for v in vehicules:
             ensure_suivi(db, v, jour_nouveau)
         db.commit()
@@ -258,43 +690,16 @@ async def boucle_cycle_quotidien():
 
 # ---------------------------------------------------------------- AM-4
 def _trajets_reels_du_jour(jour: date) -> tuple[list[dict], list[str]]:
-    """Relecture des historiques RÉELS des deux portails pour `jour` (AM-4/R5:
-    MZoneX Trips + rapport CamtrackPro — jamais effacés côté portails).
+    """Relecture des historiques RÉELS des portails pour `jour` (AM-4/R5).
 
-    Retourne (items, portails_en_echec). Un portail qui répond « 0 trajet »
-    est une réponse RÉELLE (jour calme) ; un portail en ERREUR est absent →
-    son nom est listé et le jour ne sera pas écrit en partiel (garde-fou)."""
-    items: list[dict] = []
-    echecs: list[str] = []
-    # MZoneX (API OData — fenêtre locale du jour complet)
-    try:
-        from .api_mzonex import ApiMZoneX, trajet_depuis_api
-        mz = ApiMZoneX()
-        bruts = mz.trajets_jour_local(jour)
-        items.extend(it for it in (trajet_depuis_api(t) for t in bruts) if it)
-    except Exception as e:
-        echecs.append(f"MZONEX ({type(e).__name__})")
-        log.warning("AM-4 catch-up %s : historique MZoneX indisponible (%s)",
-                    jour, type(e).__name__)
-    # CamtrackPro (API Wialon — rapport « Detail Trajet Vehicule » borné au jour)
-    try:
-        from .api_wialon import ApiWialon, jeton_configure
-        if jeton_configure():
-            api = ApiWialon()
-            try:
-                items.extend(api.trajets_du_jour(
-                    jour, fin_locale=_cloture_du(jour)))
-            finally:
-                api.fermer()
-        else:
-            echecs.append("CAMTRACKPRO (jeton absent)")
-    except Exception as e:
-        echecs.append(f"CAMTRACKPRO ({type(e).__name__})")
-        log.warning("AM-4 catch-up %s : historique CamtrackPro indisponible (%s)",
-                    jour, type(e).__name__)
-    return items, echecs
-
-
+    v1.51 — délègue à `rattrapage.lecture_reelle` : UNE seule lecture des
+    portails pour tout le moteur, et une distinction explicite entre « source
+    vide confirmée » (le portail a répondu « 0 trajet ») et « source
+    indisponible » (le portail n'a pas répondu) — exigence 11. Retourne
+    (items, sources_non_confirmées)."""
+    from .rattrapage import lecture_reelle
+    lecture = lecture_reelle(jour)
+    return lecture.items, lecture.echecs()
 def _consolider_et_archiver_jour(db, jour: date, items: list[dict],
                                  username: str = "rattrapage_am4") -> dict:
     """Écrit les trajets réels du jour (réconciliation bornée à ce jour),
@@ -313,99 +718,19 @@ def _consolider_et_archiver_jour(db, jour: date, items: list[dict],
 
 
 def rattraper_consolidation(cible_hier: date | None = None) -> dict:
-    """v3 AM-4/C4 — CATCH-UP au démarrage : consolide TOUS les jours manqués,
-    du plus ancien au plus récent, avec les données RÉELLES des portails.
+    """v3 AM-4/C4 — CATCH-UP des journées manquées (données RÉELLES portails).
 
-    Un jour est « manqué » s'il n'a AUCUNE archive (les archives partielles
-    d'un jour déjà entamé ne sont JAMAIS réécrites — §A.2). Un jour sans
-    relique portail disponible est LAISSÉ de côté (journal + alerte), jamais
-    écrit en partiel (garde-fou R5). S'arrête tout seul quand tout est à jour.
+    v1.51 — le moteur vit dans `rattrapage.rattraper_journees` (exigences du
+    18/09/2026) : UNE journée = UNE transaction isolée, verrou inter-processus
+    (deux workers ne traitent jamais la même journée), échec consigné dans une
+    transaction séparée SANS bloquer les journées suivantes, alerte visible
+    créée ou mise à jour, et **aucune archive partielle** : une source
+    indisponible fait reporter l'archivage au lieu de figer un historique
+    incomplet. Le rapport conserve les clés historiques (jours_traités,
+    jours_archivés, jours_sautés, détails).
     """
-    from .engine import get_seuils  # seuils à jour après seed/migrations
-    db = SessionLocal()
-    rapport = {"jours_traités": 0, "jours_archivés": 0, "jours_sautés": [],
-               "détails": {}}
-    try:
-        aujour = jour_attribution(now_local())
-        hier = (cible_hier or (aujour - timedelta(days=1)))
-        if hier >= aujour:
-            return rapport
-        jours_avec_archive = set(db.scalars(
-            select(HistoriqueJournalier.date_jour).distinct()).all())
-        premier = db.scalar(select(func.min(SuiviJournalier.date_jour)))
-        if premier is None:
-            ensure_suivis_du_jour(db, aujour)
-            return rapport
-        jour = premier
-        while jour <= hier:
-            if jour in jours_avec_archive:
-                jour += timedelta(days=1)
-                continue                      # déjà figé §A.2 — idempotent
-            nb_suivis = db.scalar(select(func.count(SuiviJournalier.id)).where(
-                SuiviJournalier.date_jour == jour)) or 0
-            items, echecs = _trajets_reels_du_jour(jour)
-            if echecs:
-                # garde-fou R5 : un portail au moins n'a PAS répondu → le jour
-                # resterait PARTIEL → on n'écrit rien, on journalise et on
-                # signale ; nouvelle tentative au prochain démarrage
-                deja = db.scalar(select(func.count(AuditLog.id)).where(
-                    AuditLog.action == "jour.catchup_sans_source",
-                    AuditLog.details.like(f'%"{jour.isoformat()}"%'))) or 0
-                if not deja:
-                    db.add(AuditLog(username="systeme",
-                                    action="jour.catchup_sans_source",
-                                    entite="suivi", entite_id=None,
-                                    details={"jour": jour.isoformat(),
-                                             "portails_absents": echecs,
-                                             "regle": "v3 AM-4/R5 : jour absent "
-                                                      "des sources — aucune donnée "
-                                                      "partielle écrite"}))
-                    a = Alerte(date_heure=now_local(),
-                               type=TypeAlerte.GPS_HORS_LIGNE,
-                               gravite=GraviteAlerte.MOYENNE,
-                               message=(f"Rattrapage : journée du {jour:%d/%m/%Y} "
-                                        f"sans source ({', '.join(echecs)}) — "
-                                        "reprise au prochain démarrage."),
-                               statut=StatutAlerte.NOUVELLE,
-                               lien_module="/historique")
-                    db.add(a)
-                    db.commit()
-                log.warning("AM-4 : %s laissé de côté (portails absents : %s)",
-                            jour, ", ".join(echecs))
-                rapport["jours_sautés"].append(jour.isoformat())
-                jour += timedelta(days=1)
-                continue
-            if not items and nb_suivis == 0:
-                # jour réellement vide des deux côtés : RIEN à écrire (le jour
-                # n'est pas marqué : on ne peut distinguer « personne n'a
-                # roulé » de « plateforme éteinte » — honnêteté §10)
-                jour += timedelta(days=1)
-                continue
-            stats = _consolider_et_archiver_jour(db, jour, items)
-            db.add(AuditLog(username="systeme", action="jour.catchup_consolide",
-                            entite="suivi", entite_id=None,
-                            details={"jour": jour.isoformat(),
-                                     "regle": "v3 AM-4 : catch-up au démarrage "
-                                              "avec données réelles portails",
-                                     "trajets_portails": len(items)}))
-            db.commit()
-            rapport["jours_traités"] += 1
-            if stats.get("archives"):
-                rapport["jours_archivés"] += stats["archives"]
-            rapport["détails"][jour.isoformat()] = stats
-            log.info("AM-4 : journée du %s rattrapée — %s", jour, stats)
-            jour += timedelta(days=1)
-        ensure_suivis_du_jour(db, aujour)
-        if rapport["jours_traités"] or rapport["jours_sautés"]:
-            log.warning("AM-4 catch-up terminé : %s", rapport)
-    except Exception:
-        db.rollback()
-        log.exception("AM-4 : échec du rattrapage de consolidation")
-    finally:
-        db.close()
-    return rapport
-
-
+    from .rattrapage import rattraper_journees
+    return rattraper_journees(cible_hier)
 def rattraper_au_demarrage():
     """Démarrage : journée courante créée (rapide), puis le CATCH-UP AM-4
     complet tourne — il consolide au titre 23:59:59 (v3 AM-3/C1) tous les

@@ -64,7 +64,8 @@ from .engine import (PUBLISH_ENABLED, _verifier_temps, appliquer_badge_et_eco,
 from .event_bus import publish
 from .models import (AuditLog, HistoriqueJournalier, StatutSourceTrajet,
                      StatutValidationTrajet, SuiviJournalier, Trajet, Vehicule)
-from .serializers import iso, journee_suivi, s_ligne, s_suivi, s_trajet
+from .serializers import (iso, journee_suivi, s_ligne, snapshot_canonique,
+                       s_suivi, s_trajet)
 
 log = logging.getLogger("lss.reconciliation")
 
@@ -200,6 +201,22 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
     if change_pos:
         donnees.update(pos_apres)
         change = True
+    champs_suivi = (
+        "situation", "statut_camion", "depot_recepteur", "distributeur",
+        "produit", "numero_ot", "emplacement_j_moins_1", "arret_final",
+        "km_parcourus", "mission_id")
+    champs_apres = {}
+    for champ in champs_suivi:
+        valeur = getattr(suivi, champ, None)
+        if hasattr(valeur, "value"):
+            valeur = valeur.value
+        champs_apres[champ] = valeur
+    if any(donnees.get(c) != v for c, v in champs_apres.items()):
+        donnees.update(champs_apres)
+        change = True
+    if h.conducteur_id != suivi.conducteur_id:
+        h.conducteur_id = suivi.conducteur_id
+        h.conducteur = suivi.conducteur
     if change:
         _audit(db, "archive.raffraichie", None, {
             "plaque": suivi.vehicule.plaque if suivi.vehicule else None,
@@ -217,7 +234,16 @@ def _synchroniser_archive(db, suivi: SuiviJournalier):
                  suivi.vehicule.plaque if suivi.vehicule else "?",
                  len(avant_lignes), len(donnees["trajets"]),
                  " (+ positions N3)" if change_pos else "")
-    donnees["nb_trajets"] = len(journee.lignes)
+    # v1.53 (18/09/2026) — SNAPSHOT CANONIQUE : trajets BRUTS + compteurs
+    # distincts, produits par LA fabrique unique partagée avec `archiver_jour`
+    # et `recalculer_archives_journee` (vérifié par
+    # test_coherence_archives_v153.py). `nb_trajets` n'a qu'un seul sens :
+    # le nombre de SÉQUENCES affichées.
+    _canon = snapshot_canonique(suivi, seuils)
+    donnees["nb_trajets_valides_reels"] = _canon["nb_trajets_valides_reels"]
+    donnees["nb_sequences_affichees"] = _canon["nb_sequences_affichees"]
+    donnees["nb_trajets_fusionnes"] = _canon["nb_trajets_fusionnes"]
+    donnees["nb_trajets"] = _canon["nb_trajets"]
     donnees["heure_depart"] = iso(suivi.heure_depart)
     donnees["tcc_s"], donnees["tcj_s"] = suivi.tcc_s, suivi.tcj_s
     donnees["ttj_s"], donnees["total_pause_s"] = suivi.ttj_s, suivi.total_pause_s
@@ -336,6 +362,62 @@ def _trouver_par_fin_affiche(trajets: list[Trajet], debut: datetime,
         if d <= tolerance and (dmin is None or d < dmin):
             meilleur, dmin = t, d
     return meilleur
+# ============================================================================
+# v1.54/P1 (18/09/2026) — ZÉRO SUPPRESSION PHYSIQUE D'UN TRAJET OBSERVÉ
+# Un trajet (ou une donnée provisoire) qui n'est pas retrouvé dans la source
+# officielle n'est JAMAIS supprimé : il est CONSERVÉ, marqué REJETE avec un
+# MOTIF explicite, audité AVANT/APRÈS, et masqué de l'affichage par les filtres
+# existants. Conforme à SPEC_RULES_v3 R-02 (« Les données de base ne sont
+# jamais effacées », « les trajets invalides ne sont pas supprimés de la
+# base ») et R-10 (« Aucun nettoyage destructif des temps de conduite »).
+# ============================================================================
+def _snap_trajet(t) -> dict:
+    """Photographie d'une ligne, pour l'audit AVANT/APRÈS du rejet."""
+    return {"id": t.id, "numero": t.numero, "debut": iso(t.heure_debut),
+            "fin": iso(t.heure_fin), "distance_km": t.distance_km,
+            "statut_source": (t.statut_source.value
+                              if hasattr(t.statut_source, "value")
+                              else str(t.statut_source)),
+            "statut_validation": (t.statut_validation.value
+                                  if hasattr(t.statut_validation, "value")
+                                  else str(t.statut_validation)),
+            "motif_rejet": t.motif_rejet}
+
+
+def _rejeter_conserve(db, trajet, motif: str, *, cause: str, jour, vehicule,
+                      gardien=None, regle: str = "", action: str = "") -> dict:
+    """ÉCARTE une ligne SANS JAMAIS LA SUPPRIMER.
+
+    · marque `statut_validation = REJETE` (exclue de l'écran, des compteurs
+      TCJ/TTJ/TCC, des exports et de tous les correcteurs) ;
+    · inscrit le MOTIF dans `trajets.motif_rejet` ;
+    · journalise un AUDIT AVANT/APRÈS avec la cause et la ligne « gardienne » ;
+    · ne touche à AUCUNE donnée brute (heure, distance, source).
+    """
+    avant = _snap_trajet(trajet)
+    trajet.statut_validation = StatutValidationTrajet.REJETE
+    trajet.motif_rejet = motif
+    apres = _snap_trajet(trajet)
+    db.flush()
+    _audit(db, action or "trajet.rejete_conserve", trajet.id, {
+        "plaque": getattr(vehicule, "plaque", None),
+        "jour": jour.isoformat() if hasattr(jour, "isoformat") else str(jour),
+        "motif_rejet": motif,
+        "cause": cause,
+        # v1.54 — compatibilité des audits MÉTIER : les correcteurs historiques
+        # (`trajet.structure_corrige`) publiaient la cause dans `details.action`
+        # (« purge_recouvrement », « purge_residu »). Ce champ est CONSERVÉ :
+        # un correctif de conservation ne doit pas appauvrir la traçabilité.
+        "action": cause,
+        "gardien": _snap_trajet(gardien) if gardien is not None else None,
+        "avant": avant, "apres": apres,
+        "suppression": "AUCUNE — ligne conservée en base, masquée à l'écran",
+        "regle": regle or ("P1 : un trajet observé n'est jamais supprimé ; "
+                           "il est écarté, marqué et audité.")})
+    return apres
+
+
+
 
 
 # ------------------------------------------------------------------ cœur
@@ -397,31 +479,52 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                     t.distance_km = jumeau.distance_km
                 if jumeau.source_plateforme:
                     t.source_plateforme = jumeau.source_plateforme
-                _audit(db, "trajet.jumeau_fusionne", jumeau.id, {
-                    "plaque": vehicule.plaque, "jour": jour.isoformat(),
-                    "garde": _snap(t), "retire": _snap(jumeau),
-                    "regle": "même début = même trajet : le jumeau VIVANT "
-                             "reste maître (chaîne en cours), le doublon "
-                             "officiel est retiré — il refermera à la vraie "
-                             "fin (garde « chaîne en cours »)"})
+                _rejeter_conserve(db, jumeau, "DOUBLON_JUMEAU",
+                                  cause="jumeau_fusionne_vivant",
+                                  jour=jour, vehicule=vehicule, gardien=t,
+                                  action="trajet.jumeau_fusionne",
+                                  regle="même début = même trajet : le jumeau "
+                                        "VIVANT reste maître (chaîne en cours) ; "
+                                        "le doublon officiel est ÉCARTÉ de "
+                                        "l'écran mais CONSERVÉ en base (P1).")
                 log.info("Jumeau fusionné (vivant conservé) — %s %s",
                          vehicule.plaque, iso(t.heure_debut))
-                db.delete(jumeau)
                 trajets.remove(jumeau)
                 conserves.remove(jumeau)
             else:
                 if jumeau.distance_km is None and t.distance_km is not None:
                     jumeau.distance_km = t.distance_km
-                _audit(db, "trajet.jumeau_fusionne", t.id, {
-                    "plaque": vehicule.plaque, "jour": jour.isoformat(),
-                    "garde": _snap(jumeau), "retire": _snap(t),
-                    "regle": "même début = même trajet : doublon (ouvert "
-                             "périmé ou clôturé) purgé, le trajet maître de "
-                             "l'écran est conservé"})
+                _rejeter_conserve(db, t, "DOUBLON_JUMEAU",
+                                  cause="jumeau_fusionne_officiel",
+                                  jour=jour, vehicule=vehicule, gardien=jumeau,
+                                  action="trajet.jumeau_fusionne",
+                                  regle="même début = même trajet : le doublon "
+                                        "(ouvert périmé ou clôturé) est ÉCARTÉ "
+                                        "de l'écran mais CONSERVÉ en base (P1).")
                 log.info("Jumeau fusionné (officiel conservé) — %s %s",
                          vehicule.plaque, iso(t.heure_debut))
-                db.delete(t)
                 trajets.remove(t)
+            epures += 1
+            continue
+        # Un ouvert N1 provisoire peut commencer au milieu d'une ligne N2
+        # publiée après coup. Il s'agit du même trajet observé en direct :
+        # l'officiel couvre l'ouvert, même si sa fin officielle est plus tard.
+        if (t.heure_fin is None
+            and (t.statut_source == StatutSourceTrajet.PROVISOIRE
+                 or t.source_plateforme == "CAMTRACKPRO")
+                and any(d <= t.heure_debut <= (f or d)
+                        for d, f in intervalles)):
+            _rejeter_conserve(db, t, "OUVERT_RECOUVERT",
+                              cause="ouvert_recouvert",
+                              jour=jour, vehicule=vehicule,
+                              action="trajet.orphelin_purge",
+                              regle="ouvert N1 provisoire recouvert par une ligne "
+                                    "N2 officielle : l'officiel fait foi pour "
+                                    "l'AFFICHAGE ; la ligne observée reste en "
+                                    "base avec son motif (P1).")
+            log.info("Ligne ouverte recouverte écartée (CONSERVÉE) — %s %s",
+                     vehicule.plaque, iso(t.heure_debut))
+            trajets.remove(t)
             epures += 1
             continue
         fin_affichee = t.heure_fin or maintenant
@@ -448,22 +551,27 @@ def _epurer_orphelins(db, suivi, vehicule, intervalles, ids_conserves,
                     # lignes officielles ne se chevauchent jamais → fantôme
                     raison = "contenu"
                     break
+            # Règle d'épuration stricte : si le suivi possède des lignes officielles
+            # certifiées (conserves) et qu'un trajet PROVISOIRE terminé ne figure dans
+            # aucun intervalle officiel, il est qualifié de fantôme non officiel et purgé.
+            if (raison is None and conserves
+                    and t.statut_source == StatutSourceTrajet.PROVISOIRE
+                    and t.heure_fin is not None):
+                signal_recent = (vehicule.last_event_at is not None
+                                 and (maintenant - vehicule.last_event_at).total_seconds() <= 900
+                                 and (maintenant - t.heure_fin).total_seconds() < pause_min)
+                if not signal_recent:
+                    raison = "fantome_non_officiel"
         if raison is None:
             continue
-        _audit(db, "trajet.orphelin_purge", t.id, {
-            "plaque": vehicule.plaque, "jour": jour.isoformat(),
-            "debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
-            "distance_km": t.distance_km,
-            "statut_source": (t.statut_source.value
-                              if hasattr(t.statut_source, "value")
-                              else str(t.statut_source)),
-            "raison": raison,
-            "regle": "ligne fantôme (doublon / sous-intervalle / fin avant "
-                     "début) non rattachée aux lignes officielles → purgée "
-                     "de l'écran (audit conservé)"})
-        log.info("Ligne fantôme purgée (%s) — %s %s→%s", raison,
+        _rejeter_conserve(db, t, "ORPHELIN_NON_CONFIRME",
+                          cause=raison, jour=jour, vehicule=vehicule,
+                          action="trajet.orphelin_purge",
+                          regle="ligne non rattachée aux lignes officielles : "
+                                "ÉCARTÉE de l'écran, CONSERVÉE en base avec son "
+                                "motif et son audit (P1 : aucune suppression).")
+        log.info("Ligne non confirmée écartée (CONSERVÉE, %s) — %s %s→%s", raison,
                  vehicule.plaque, iso(t.heure_debut), iso(t.heure_fin))
-        db.delete(t)
         trajets.remove(t)
         epures += 1
     if epures:
@@ -507,16 +615,18 @@ def _corriger_structure(db, suivi, vehicule, ids_conserves, maintenant,
                            else str(t.statut_validation))}
 
     def _purge(cible, gardien, cause):
-        _audit(db, "trajet.structure_corrige", cible.id, {
-            "plaque": vehicule.plaque, "jour": jour.isoformat(),
-            "action": cause, "gardien": _snap(gardien), "purge": _snap(cible),
-            "regle": {"purge_residu": "ligne résiduelle face à une ligne "
-                                      "officielle → purgée (l'officiel fait foi)",
-                      "purge_recouvrement": "ligne recouvrante/contenue dans la "
-                                            "précédente → purgée"}[cause]})
+        _rejeter_conserve(db, cible, "STRUCTURE_" + cause.upper(),
+                          cause=cause, jour=jour, vehicule=vehicule,
+                          gardien=gardien, action="trajet.structure_corrige",
+                          regle={
+                              "purge_residu": "ligne résiduelle face à une ligne "
+                                              "officielle → écartée de l'écran "
+                                              "(l'officiel fait foi), CONSERVÉE en base",
+                              "purge_recouvrement": "ligne recouvrante/contenue dans "
+                                                    "la précédente → écartée de "
+                                                    "l'écran, CONSERVÉE en base"}[cause])
         log.info("Structure corrigée (%s) — %s %s→%s", cause, vehicule.plaque,
                  iso(cible.heure_debut), iso(cible.heure_fin))
-        db.delete(cible)
         trajets.remove(cible)
 
     i = 0
@@ -583,7 +693,16 @@ def _rejeter_geants_recouverts(db, suivi, vehicule, intervalles, ids_conserves,
     for t in trajets:
         if t.id in ids_conserves:
             continue                          # ligne officielle de ce cycle
-        if t.statut_validation == StatutValidationTrajet.REJETE:
+        deja_ecartee = (t.statut_validation == StatutValidationTrajet.REJETE)
+        if deja_ecartee and t.motif_rejet == "GEANT_RECOUVERT":
+            continue                          # déjà qualifiée (idempotent)
+        # v1.54 (18/09/2026) — une ligne peut avoir été écartée JUSTE AVANT par le
+        # chemin P1 (`fantome_non_officiel` → ORPHELIN_NON_CONFIRME). Le cas M2
+        # (« géant provisoire recouvert par la série officielle ») est PLUS
+        # SPÉCIFIQUE : on RE-QUALIFIE la ligne (motif métier + audit AVANT/APRÈS)
+        # au lieu de la sauter — la conservation ne doit pas effacer la trace
+        # ni le compteur d'exploitation.
+        if deja_ecartee and t.motif_rejet != "ORPHELIN_NON_CONFIRME":
             continue
         if t.statut_source != StatutSourceTrajet.PROVISOIRE:
             continue
@@ -620,11 +739,19 @@ def _rejeter_geants_recouverts(db, suivi, vehicule, intervalles, ids_conserves,
             continue
         avant = {"debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
                  "distance_km": t.distance_km}
+        motif_avant = t.motif_rejet if deja_ecartee else None
         t.statut_validation = StatutValidationTrajet.REJETE
+        t.motif_rejet = "GEANT_RECOUVERT"
         rejetes += 1
         _audit(db, "trajet.geant_rejete", t.id, {
             "plaque": vehicule.plaque, "jour": jour.isoformat(),
             "avant": avant,
+            "apres": {"debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
+                      "distance_km": t.distance_km,
+                      "statut_validation": t.statut_validation.value,
+                      "motif_rejet": "GEANT_RECOUVERT"},
+            "suppression": "AUCUNE — ligne conservée en base, masquée à l'écran",
+            "requalification": (motif_avant if motif_avant else "NOUVELLE"),
             "regle": "§0nonies decies M2 (29/08/2026) : géant provisoire "
                      "« boîtier muet » recouvert par les trajets officiels "
                      "publiés → REJETÉ (la série officielle découpe ; flag "
@@ -875,27 +1002,45 @@ def _spliter_minuit(items: list[dict]) -> list[dict]:
     publiés qui franchissent minuit (A au jour du début, B au lendemain)."""
     out: list[dict] = []
     for it in items:
-        debut, fin = it["debut"], it.get("fin")
-        if (fin is None or it.get("ouvert") or debut is None
-                or fin.date() == debut.date()):
+        debut, fin = it.get("debut"), it.get("fin")
+        if debut is None:
+            continue
+        if fin is None or it.get("ouvert"):
             out.append(it)
             continue
-        cloture = datetime.combine(debut.date(), datetime.min.time()) \
-            + timedelta(seconds=86399)
-        minuit = cloture + timedelta(seconds=1)
-        a = dict(it)
-        a["fin"] = cloture
-        b = dict(it)
-        b["debut"] = minuit
-        for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
-                  "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
-                  "exc_surregime", "exc_autres"):
-            b[k] = None                     # non répartissable → non mesuré
-        b["suite_minuit"] = True
-        out.extend([a, b])
-        log.info("v3 AM-3 : trajet %s→%s franchit minuit — split A [%s→%s] / "
-                 "B [%s→%s]", iso(debut), iso(fin), iso(a["debut"]),
-                 iso(a["fin"]), iso(b["debut"]), iso(b["fin"]))
+        if fin.date() == debut.date():
+            out.append(it)
+            continue
+
+        # Trajet multi-jours ou franchissant minuit : découpage strict
+        cur_debut = debut
+        premier = True
+        while cur_debut.date() < fin.date():
+            cloture = datetime.combine(cur_debut.date(), datetime.min.time()) + timedelta(seconds=86399)
+            seg = dict(it)
+            seg["debut"] = cur_debut
+            seg["fin"] = cloture
+            if not premier:
+                for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
+                          "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
+                          "exc_surregime", "exc_autres"):
+                    seg[k] = None
+                seg["suite_minuit"] = True
+            out.append(seg)
+            cur_debut = cloture + timedelta(seconds=1)
+            premier = False
+
+        if cur_debut <= fin:
+            seg_fin = dict(it)
+            seg_fin["debut"] = cur_debut
+            seg_fin["fin"] = fin
+            if not premier:
+                for k in ("distance_km", "duree_mouvement_s", "v_max", "ralenti_s",
+                          "exc_vitesse", "exc_freinage", "exc_accel", "exc_ralenti",
+                          "exc_surregime", "exc_autres"):
+                    seg_fin[k] = None
+                seg_fin["suite_minuit"] = True
+            out.append(seg_fin)
     return out
 
 
@@ -942,11 +1087,12 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 mapping[str(v.id).strip().upper()] = v
                 if v.gps_associe:
                     mapping[str(v.gps_associe).strip().upper()] = v
-        if it.get("conducteur"):
+        if it.get("conducteur") or it.get("badge_code"):
             # §0septies B2 (20/08/2026) : les clés de SERVICE (« Nouveau
             # conducteur », « garage LSS ») ne créent JAMAIS de fiche — la
             # saisie manuelle fait le travail sur ces lignes-là
-            resoudre_badge(db, it["conducteur"])
+            resoudre_badge(db, it.get("conducteur"), badge_code=it.get("badge_code"),
+                           plateforme=it.get("source"))
 
     suivi_touches: set[str] = set()
 
@@ -1023,6 +1169,19 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
     for it in items:
         try:
             debut, fin = it["debut"], it.get("fin")
+            # GARDE D'INTÉGRITÉ STRICTE : une `fin` antérieure ou égale au `debut` est
+            # rejetée ou corrigée si un décalage de fuseau UTC/local (+3h) est détecté.
+            # Ne jamais transformer en trajet ouvert (fin None) pour éviter d'étendre
+            # artificiellement le trajet jusqu'à 23:59:59.
+            if fin is not None and fin <= debut:
+                # `_parse_instant` convertit déjà UTC→local : une fin <= début
+                # est une donnée corrompue du portail — on rejette la ligne
+                # (PAS de correction +3h en dur : durées gonflées / trajets
+                # longs jetés silencieusement).
+                log.warning("Trajet validé rejeté car fin (%s) <= début (%s) pour %s",
+                            iso(fin), iso(debut), it.get("plaque"))
+                stats["ignores"] += 1
+                continue
             # Référence v2 §8.2/§8.3 — jour d'ATTRIBUTION du trajet (début
             # < 01h00 → veille ; la journée logistique court de 01h00 à 01h00)
             jour = jour_attribution(debut)
@@ -1042,6 +1201,11 @@ def reconcilier_trajets_valides(db, items: list[dict], username: str = SOURCE_SY
                 stats["ignores"] += 1
                 log.info("Trajet validé sans véhicule connu (%r) — ignoré",
                          it.get("gps_associe") or it.get("plaque"))
+                continue
+            if vehicule.statut != "ACTIF":
+                stats["ignores"] += 1
+                log.info("Trajet validé pour véhicule non actif %s — ignoré",
+                         vehicule.plaque)
                 continue
 
             suivi = ensure_suivi(db, vehicule, jour)

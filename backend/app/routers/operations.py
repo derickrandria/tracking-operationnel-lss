@@ -1,18 +1,25 @@
 """Module 2 — Suivi Journalier (cœur du système) et Module 3 — Missions."""
-from datetime import date
+import logging
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
+
+log = logging.getLogger("lss.operations")
 
 from ..config import now_local
 from ..database import get_db
-from ..engine import (appliquer_champs_suivi, ensure_suivis_du_jour,
-                      get_seuils, prefill_positions_gps)
-from ..models import Mission, SuiviJournalier, Vehicule
+from ..engine import (PUBLISH_ENABLED, _formater_code_mission, appliquer_champs_suivi,
+                      ensure_suivi, ensure_suivis_du_jour, get_seuils,
+                      initialiser_ou_maj_mission, prefill_positions_gps,
+                      reconcilier_alertes_missions_en_attente)
+from ..models import (Alerte, Conducteur, Infraction, Mission, Role, StatutAlerte,
+                      StatutCamion, StatutMission, SuiviJournalier, TypeAlerte,
+                      Vehicule, uid)
 from ..security import ECRITURE, TOUS, audit, require_roles
-from ..serializers import s_mission, s_suivi
+from ..serializers import iso, s_alerte, s_mission, s_suivi
 
 router = APIRouter(prefix="/api", tags=["operations"])
 
@@ -31,8 +38,12 @@ def _masquer_tcc_si_jour_passe(lignes: list[dict], jour: date) -> list[dict]:
     cours. Masquage à la lecture seulement — `tcc_s` reste stocké en base."""
     if jour >= now_local().date():
         return lignes
+    # v1.52 (18/09/2026) — le masquage DÉCLARE l'intention d'affichage au lieu de
+    # détruire la valeur : `tcc_s` part intact (export, contre-vérification,
+    # audit) et `tcc_masque` dit à l'écran d'afficher « 0:00 » — N1 conservée
+    # visuellement, sans perte de donnée.
     for l in lignes:
-        l["tcc_s"] = 0
+        l["tcc_masque"] = True
     return lignes
 
 
@@ -47,14 +58,29 @@ def liste_suivi(date: str | None = None, db: Session = Depends(get_db),
         .options(selectinload(SuiviJournalier.trajets))
         .where(SuiviJournalier.date_jour == jour)
         .join(Vehicule, SuiviJournalier.vehicule_id == Vehicule.id)
+        .where(Vehicule.statut == "ACTIF")
         .order_by(Vehicule.plaque)).all()
     seuils = get_seuils(db)
     lignes = _masquer_tcc_si_jour_passe(
         [s_suivi(s, seuils) for s in suivis], jour)
-    return {"date": jour.isoformat(), "seuils": seuils, "lignes": lignes}
+    # v1.48 — état des sources joint à la grille : l'écran peut alors dire
+    # « source X en panne — collecte interrompue » (badge rouge) au lieu de
+    # « boîtier muet — données en transit » (orange) quand la panne est
+    # GLOBALE à un portail, et non propre à un boîtier.
+    from ..scrapers import sources_en_echec, sources_en_echec_detail
+    # v1.50 — l'écran doit pouvoir dire POURQUOI il est muet : un portail en
+    # panne (rien à attendre du portail) et une collecte bloquée localement
+    # (base verrouillée, disque) n'appellent pas la même réaction.
+    detail = sources_en_echec_detail()
+    return {"date": jour.isoformat(), "seuils": seuils, "lignes": lignes,
+            "sources_en_echec": sources_en_echec(),
+            "sources_en_echec_detail": detail,
+            "sources_bloquees_localement": [
+                d["source"] for d in detail if d.get("categorie") == "locale"]}
 
 
 class SuiviPatch(BaseModel):
+    conducteur_id: str | None = None
     situation: str | None = None
     statut_camion: str | None = None
     depot_recepteur: str | None = None
@@ -127,6 +153,89 @@ def modifier_suivi_batch(data: SuiviBatchPatch, db: Session = Depends(get_db),
         db.commit()
     return {"lignes": lignes_maj, "ignores": ignores,
             "serveur_heure": now_local().strftime("%H:%M:%S")}
+
+
+class ArbitrageConducteurIn(BaseModel):
+    suivi_id: str
+    choix: str  # "PASSAGE_TEMPORAIRE" | "REMPLACEMENT_JOURNEE" | "MAINTENIR_TITULAIRE"
+    conducteur_id: str | None = None
+    alerte_id: str | None = None
+
+
+@router.post("/suivi/arbitrer-conducteur")
+def arbitrer_conducteur(data: ArbitrageConducteurIn, db: Session = Depends(get_db),
+                        user=Depends(require_roles(*ECRITURE))):
+    s = db.get(SuiviJournalier, data.suivi_id)
+    if s is None:
+        raise HTTPException(404, "Ligne de suivi introuvable")
+
+    vehicule = s.vehicule
+    conducteur_cible = db.get(Conducteur, data.conducteur_id) if data.conducteur_id else None
+    titulaire = vehicule.conducteur_actuel if (vehicule and vehicule.conducteur_actuel) else s.conducteur
+
+    if data.choix == "PASSAGE_TEMPORAIRE":
+        # Conserver le titulaire sur la ligne de suivi avec le flag RELAIS
+        if titulaire:
+            s.conducteur_id = titulaire.id
+        s.conducteur_origine = "RELAIS"
+        # Les trajets individuels conservent leurs badges respectifs (répartition proportionnelle du TCH)
+        audit(db, user, "suivi.arbitrage_relais", "suivi", s.id, {
+            "choix": "PASSAGE_TEMPORAIRE",
+            "titulaire": titulaire.nom_prenom if titulaire else None,
+            "relais": conducteur_cible.nom_prenom if conducteur_cible else None
+        })
+
+    elif data.choix == "REMPLACEMENT_JOURNEE":
+        # Réassigner toute la journée au nouveau chauffeur
+        if conducteur_cible:
+            s.conducteur_id = conducteur_cible.id
+        s.conducteur_origine = "MANUEL"
+        # Réassigner tous les trajets du jour au nouveau chauffeur
+        if s.trajets and conducteur_cible:
+            for t in s.trajets:
+                t.conducteur_badge_id = conducteur_cible.id
+                t.conducteur_badge = conducteur_cible.nom_prenom
+        audit(db, user, "suivi.arbitrage_remplacement", "suivi", s.id, {
+            "choix": "REMPLACEMENT_JOURNEE",
+            "nouveau_conducteur": conducteur_cible.nom_prenom if conducteur_cible else None
+        })
+
+    elif data.choix == "MAINTENIR_TITULAIRE":
+        # Forcer 100% au titulaire et écraser les badges portails
+        if titulaire:
+            s.conducteur_id = titulaire.id
+            if s.trajets:
+                for t in s.trajets:
+                    t.conducteur_badge_id = titulaire.id
+                    t.conducteur_badge = titulaire.nom_prenom
+        s.conducteur_origine = "MANUEL"
+        audit(db, user, "suivi.arbitrage_maintien_titulaire", "suivi", s.id, {
+            "choix": "MAINTENIR_TITULAIRE",
+            "titulaire": titulaire.nom_prenom if titulaire else None
+        })
+
+    # Fermer l'alerte d'arbitrage associée si spécifiée
+    if data.alerte_id:
+        alt = db.get(Alerte, data.alerte_id)
+        if alt:
+            alt.statut = StatutAlerte.TRAITEE
+
+    # Clôturer toutes les alertes de changement/conflit pour ce véhicule sur ce jour
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == s.vehicule_id,
+        Alerte.type.in_([TypeAlerte.CHANGEMENT_CONDUCTEUR_DETECTE, TypeAlerte.CONFLIT_AFFECTATION, TypeAlerte.DOUBLON_CONDUCTEUR]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    from ..engine import recalculer_temps
+    recalculer_temps(db, s, now_local())
+    db.commit()
+
+    return {
+        "statut": "OK",
+        "choix": data.choix,
+        "suivi": s_suivi(s, get_seuils(db))
+    }
 
 
 # ------------------- exports Suivi Journalier (Addendum v1.1 §3) -------------------
@@ -210,19 +319,950 @@ def prefill_gps(date: str | None = None, db: Session = Depends(get_db),
     return {"positions_remplies": nb}
 
 
+@router.post("/suivi/sync-gps")
+def sync_gps_immediat(db: Session = Depends(get_db),
+                      user=Depends(require_roles(*ECRITURE))):
+    """Déclenche immédiatement une synchronisation complète Niveau 1 + Niveau 2
+    des portails GPS (MZoneX et CamtrackPro) et actualise le suivi."""
+    from ..scrapers import (
+        MZoneXApiCollector, _collecter_camtrackpro_n1,
+        synchroniser_trajets_valides, _mzonex_api_active
+    )
+    from ..api_wialon import jeton_configure
+    from ..engine import rattraper_ouvertures, auto_positions_horaires
+    
+    resultat = {
+        "mzonex_n1_points": 0,
+        "camtrackpro_n1_points": 0,
+        "n2_trajets": {},
+        "statut": "OK",
+        "erreurs": []
+    }
+    
+    # 1. Niveau 1 MZoneX
+    if _mzonex_api_active():
+        try:
+            resultat["mzonex_n1_points"] = MZoneXApiCollector().run()
+        except Exception as e:
+            resultat["erreurs"].append(f"MZoneX N1: {str(e)}")
+            log.warning("Sync GPS manuelle MZoneX N1 en échec : %s", e)
+            
+    # 2. Niveau 1 CamtrackPro
+    if jeton_configure():
+        try:
+            resultat["camtrackpro_n1_points"] = _collecter_camtrackpro_n1()
+        except Exception as e:
+            resultat["erreurs"].append(f"CamtrackPro N1: {str(e)}")
+            log.warning("Sync GPS manuelle CamtrackPro N1 en échec : %s", e)
+            
+    # 3. Niveau 2 (Trajets officiels MIXTE)
+    try:
+        resultat["n2_trajets"] = synchroniser_trajets_valides("MIXTE")
+    except Exception as e:
+        resultat["erreurs"].append(f"Niveau 2 Trajets: {str(e)}")
+        log.warning("Sync GPS manuelle N2 en échec : %s", e)
+        
+    # 4. Rattrapages
+    try:
+        from ..scrapers import _synchroniser_dernier_point_mzonex
+        # v1.49 — le résultat est REMONTÉ (avant, il était jeté) : un portail
+        # muet n'est pas un succès, l'écran et l'audit doivent pouvoir le dire.
+        resultat["dernier_point_mzonex"] = _synchroniser_dernier_point_mzonex(db)
+        rattraper_ouvertures()
+        auto_positions_horaires(db)
+    except Exception:
+        pass
+        
+    audit(db, user, "suivi.sync_gps_manuel", "suivi", str(now_local().date()), resultat)
+    db.commit()
+    return resultat
+
+
+@router.post("/suivi/sync-mzonex")
+def sync_mzonex_live(db: Session = Depends(get_db),
+                     user=Depends(require_roles(*ECRITURE))):
+    """Force la synchronisation immédiate du dernier point connu pour chaque véhicule MZoneX."""
+    from ..scrapers import _synchroniser_dernier_point_mzonex
+    res = _synchroniser_dernier_point_mzonex(db)
+    audit(db, user, "suivi.sync_mzonex", "vehicules", "mzonex", res)
+    db.commit()
+    return res
+
+
+@router.post("/suivi/recalculer-archive")
+def recalculer_archive_api(date_jour: str = Query(default="2026-09-11"),
+                           db: Session = Depends(get_db),
+                           user=Depends(require_roles(*ECRITURE))):
+    """Re-consolide et re-calcule intégralement les archives d'une journée."""
+    from ..daily import recalculer_archives_journee
+    # v1.51 exigence 6 : la réécriture d'archives demandée par un
+    # opérateur est EXPLICITE et tracée (jamais silencieuse).
+    res = recalculer_archives_journee(date_jour, db=db,
+                                      autoriser_reecriture=True,
+                                      motif="api_recalcul_manuel")
+    audit(db, user, "historique.recalculer_archive", "historique", date_jour, res)
+    db.commit()
+    return res
+
+
 # ============================== MISSIONS ==============================
-@router.get("/missions")
-def liste_missions(date: str | None = None, statut: str | None = None,
-                   conducteur_id: str | None = None,
-                   db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
-    jour = _jour(date)
-    query = select(Mission).where(Mission.date_jour == jour)
-    if statut:
-        query = query.where(Mission.statut == statut)
+class MissionCreate(BaseModel):
+    vehicule_id: str
+    conducteur_id: str | None = None
+    numero_ot: str | None = None
+    distributeur: str | None = None
+    produit: str | None = None
+    depot_prevu: str | None = None
+    date_jour: str | None = None
+
+
+class MissionPatch(BaseModel):
+    numero_ot: str | None = None
+    distributeur: str | None = None
+    produit: str | None = None
+    depot_prevu: str | None = None
+    depot_effectif: str | None = None
+    est_deviee: bool | None = None
+    motif_deviation: str | None = None
+    statut: str | None = None  # EN_COURS, TERMINÉE, DÉVIÉE, RETARDÉE
+    statut_camion_actuel: str | None = None  # LIBRE, VIDE, CHARGÉ
+    validation_chargement: str | None = None
+    validation_dechargement: str | None = None
+    motif_invalidation: str | None = None
+
+
+class MissionValiderChargement(BaseModel):
+    horodatage: str | None = None
+
+
+class MissionValiderDechargement(BaseModel):
+    horodatage: str | None = None
+
+
+class MissionInvaliderDechargement(BaseModel):
+    motif: str
+    commentaire: str | None = None
+
+
+class MissionDeclarerDeviation(BaseModel):
+    nouveau_depot: str
+    motif: str | None = None
+
+
+class ActionMissionRapideIn(BaseModel):
+    action: str  # VALIDER_CHARGEMENT, VALIDER_DECHARGEMENT, INVALIDER_DECHARGEMENT, DECLARER_DEVIATION, TRAITER_ALERTE
+    alerte_id: str | None = None
+    plaque: str | None = None
+    vehicule_id: str | None = None
+    mission_id: str | None = None
+    motif: str | None = None
+    commentaire: str | None = None
+    nouveau_depot: str | None = None
+    numero_ot: str | None = None
+    distributeur: str | None = None
+    produit: str | None = None
+
+
+def _calculer_stats_missions(missions: list[Mission], db: Session) -> dict:
+    total = len(missions)
+    en_cours = [m for m in missions if m.statut == StatutMission.EN_COURS]
+    terminees = sum(1 for m in missions if m.statut == StatutMission.TERMINEE)
+    deviees = sum(1 for m in missions if m.statut == StatutMission.DEVIEE or getattr(m, "est_deviee", False))
+    retardees = sum(1 for m in missions if m.statut == StatutMission.RETARDEE)
+
+    nb_vide = sum(1 for m in en_cours if str(getattr(m, "statut_camion_actuel", "VIDE")).upper() in ("VIDE", "STATUTCAMION.VIDE"))
+    nb_charge = sum(1 for m in en_cours if str(getattr(m, "statut_camion_actuel", "VIDE")).upper() in ("CHARGE", "CHARGÉ", "STATUTCAMION.CHARGE"))
+
+    km_vide = sum(getattr(m, "km_vide", 0.0) or 0.0 for m in missions)
+    km_charge = sum(getattr(m, "km_charge", 0.0) or 0.0 for m in missions)
+    km_tot = sum(getattr(m, "kilometrage_total", 0.0) or (m.kilometrage or 0.0) or (getattr(m, "km_vide", 0.0) or 0.0) + (getattr(m, "km_charge", 0.0) or 0.0) for m in missions)
+
+    # Infractions
+    m_ids = [m.id for m in missions]
+    if m_ids:
+        nb_inf = db.scalar(
+            select(func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids),
+                   Infraction.validation != "INVALIDE")
+        ) or 0
+    else:
+        nb_inf = 0
+
+    return {
+        "total": total,
+        "en_cours": len(en_cours),
+        "nb_en_cours_vide": nb_vide,
+        "nb_en_cours_charge": nb_charge,
+        "terminees": terminees,
+        "deviees": deviees,
+        "retardees": retardees,
+        "km_vide": round(km_vide, 1),
+        "km_charge": round(km_charge, 1),
+        "km_total": round(km_tot, 1),
+        "nb_infractions": nb_inf,
+    }
+
+
+def _recuperer_missions_filtrees(db: Session, date_debut: str | None,
+                                 date_fin: str | None, statut: str | None,
+                                 conducteur_id: str | None, vehicule_id: str | None,
+                                 depot: str | None, distributeur: str | None,
+                                 q: str | None) -> tuple[date, date, list[Mission]]:
+    now = now_local()
+    fin = date.fromisoformat(date_fin) if date_fin else now.date()
+    debut = date.fromisoformat(date_debut) if date_debut else fin
+
+    query = select(Mission).where(Mission.date_jour >= debut, Mission.date_jour <= fin)
+
+    if statut and statut != "TOUTES":
+        try:
+            st_enum = StatutMission(statut)
+            query = query.where(Mission.statut == st_enum)
+        except ValueError:
+            pass
+
     if conducteur_id:
         query = query.where(Mission.conducteur_id == conducteur_id)
-    missions = db.scalars(query.order_by(Mission.heure_debut)).all()
-    return {"date": jour.isoformat(), "missions": [s_mission(m) for m in missions]}
+    if vehicule_id:
+        query = query.where(Mission.vehicule_id == vehicule_id)
+    if distributeur:
+        query = query.where(Mission.distributeur == distributeur)
+    if depot:
+        depot_l = f"%{depot.lower()}%"
+        query = query.where(func.lower(Mission.depot_prevu).like(depot_l) |
+                            func.lower(Mission.depot_effectif).like(depot_l) |
+                            func.lower(Mission.depot).like(depot_l))
+
+    missions = db.scalars(query.order_by(Mission.date_jour.desc(), Mission.heure_debut.desc())).all()
+
+    if q and q.strip():
+        motif = q.strip().lower()
+        missions = [
+            m for m in missions
+            if motif in (m.code_mission or "").lower()
+            or motif in (m.numero_ot or "").lower()
+            or (m.vehicule and motif in m.vehicule.plaque.lower())
+            or (m.conducteur and (
+                motif in (m.conducteur.nom_prenom or "").lower()
+                or motif in (m.conducteur.prenom_usuel or "").lower()
+                or motif in (m.conducteur.matricule or "").lower()
+            ))
+        ]
+
+    return debut, fin, missions
+
+
+@router.get("/missions")
+def liste_missions(date_debut: str | None = None, date_fin: str | None = None,
+                   statut: str | None = None, conducteur_id: str | None = None,
+                   vehicule_id: str | None = None, depot: str | None = None,
+                   distributeur: str | None = None, q: str | None = None,
+                   date: str | None = None,  # compatibilité rétroactive
+                   rattrapage: bool = False,
+                   db: Session = Depends(get_db), user=Depends(require_roles(*TOUS))):
+    if date and not date_debut and not date_fin:
+        date_debut = date_fin = date
+
+    if rattrapage:
+        from ..engine import rattraper_missions_7j
+        rattraper_missions_7j(db)
+
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+
+    stats = _calculer_stats_missions(missions, db)
+
+    # Récupération en lot des infractions par mission
+    m_ids = [m.id for m in missions]
+    inf_counts = {}
+    if m_ids:
+        rows = db.execute(
+            select(Infraction.mission_id, func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids), Infraction.validation != "INVALIDE")
+            .group_by(Infraction.mission_id)
+        ).all()
+        inf_counts = {r[0]: r[1] for r in rows}
+
+    return {
+        "date_debut": debut.isoformat(),
+        "date_fin": fin.isoformat(),
+        "stats": stats,
+        "missions": [s_mission(m, inf_counts.get(m.id, 0)) for m in missions],
+    }
+
+
+@router.post("/missions/rattrapage")
+@router.get("/missions/rattrapage-7j")
+def declencher_rattrapage_missions_7j(db: Session = Depends(get_db),
+                                      user=Depends(require_roles(*TOUS))):
+    """Exécute la collecte rétrospective et reconstruction des missions sur les 7 derniers jours (§3)."""
+    from ..engine import rattraper_missions_7j
+    stats = rattraper_missions_7j(db)
+    audit(db, user, "mission.rattrapage_7j", "mission", "rattrapage_7j", stats)
+    return {
+        "statut": "OK",
+        "message": "Collecte rétrospective et rattrapage sur 7 jours exécutés avec succès.",
+        "stats": stats
+    }
+
+
+@router.post("/missions")
+def creer_mission(data: MissionCreate, db: Session = Depends(get_db),
+                  user=Depends(require_roles(*ECRITURE))):
+    """Option A : Attribution d'un OT / Création de mission depuis l'UI."""
+    vehicule = db.get(Vehicule, data.vehicule_id)
+    if not vehicule:
+        raise HTTPException(404, "Véhicule introuvable")
+
+    jour = date.fromisoformat(data.date_jour) if data.date_jour else now_local().date()
+    suivi = ensure_suivi(db, vehicule.id, jour)
+
+    if data.conducteur_id:
+        suivi.conducteur_id = data.conducteur_id
+
+    m = initialiser_ou_maj_mission(
+        db, suivi, vehicule,
+        numero_ot=data.numero_ot,
+        distributeur=data.distributeur,
+        produit=data.produit,
+        depot_prevu=data.depot_prevu,
+    )
+    audit(db, user, "mission.creation", "mission", m.id, {
+        "plaque": vehicule.plaque, "ot": data.numero_ot, "produit": data.produit,
+        "distributeur": data.distributeur, "depot": data.depot_prevu
+    })
+    db.commit()
+    return s_mission(m)
+
+
+@router.patch("/missions/{mid}")
+def modifier_mission(mid: str, data: MissionPatch, db: Session = Depends(get_db),
+                     user=Depends(require_roles(*ECRITURE))):
+    """Mise à jour / Forçage manuel de statut d'une mission."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    diffs = {}
+    for cle, val in data.model_dump(exclude_unset=True).items():
+        if val is None and cle not in ("motif_deviation", "depot_effectif"):
+            continue
+        if cle == "statut" and val:
+            try:
+                st_val = StatutMission(val)
+                if m.statut != st_val:
+                    diffs["statut"] = {"avant": m.statut.value, "apres": st_val.value}
+                    m.statut = st_val
+                    if st_val == StatutMission.TERMINEE:
+                        m.heure_fin = m.heure_fin or now_local()
+                        m.statut_camion_actuel = "LIBRE"
+                        if m.heure_debut:
+                            m.duree_s = int((m.heure_fin - m.heure_debut).total_seconds())
+                        # Détachement du suivi actif si présent
+                        suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+                        if suivi:
+                            suivi.statut_camion = StatutCamion.LIBRE
+                            suivi.mission_id = None
+            except ValueError:
+                pass
+            continue
+
+        if cle == "statut_camion_actuel" and val:
+            if m.statut_camion_actuel != val:
+                diffs["statut_camion_actuel"] = {"avant": m.statut_camion_actuel, "apres": val}
+                m.statut_camion_actuel = val
+                if val == "CHARGE":
+                    m.heure_chargement = m.heure_chargement or now_local()
+                elif val == "LIBRE":
+                    m.statut = StatutMission.TERMINEE
+                    m.heure_fin = m.heure_fin or now_local()
+                    if m.heure_debut:
+                        m.duree_s = int((m.heure_fin - m.heure_debut).total_seconds())
+                    suivi = db.scalar(select(SuiviJournalier).where(SuiviJournalier.mission_id == m.id))
+                    if suivi:
+                        suivi.statut_camion = StatutCamion.LIBRE
+                        suivi.mission_id = None
+            continue
+
+        anc = getattr(m, cle, None)
+        if anc != val:
+            diffs[cle] = {"avant": anc, "apres": val}
+            setattr(m, cle, val)
+
+    if diffs:
+        # Synchronisation immédiate vers SuiviJournalier
+        suivi = db.scalar(select(SuiviJournalier).where(
+            (SuiviJournalier.mission_id == m.id) |
+            ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+        ))
+        if suivi:
+            if m.statut == StatutMission.TERMINEE or m.statut_camion_actuel == "LIBRE":
+                suivi.statut_camion = StatutCamion.LIBRE
+                suivi.mission_id = None
+                suivi.numero_ot = None
+                suivi.distributeur = None
+                suivi.produit = None
+                suivi.depot_recepteur = None
+            elif m.statut_camion_actuel in ("CHARGE", "CHARGÉ"):
+                suivi.statut_camion = StatutCamion.CHARGE
+                suivi.mission_id = m.id
+                if m.numero_ot:
+                    suivi.numero_ot = m.numero_ot
+                if m.distributeur:
+                    suivi.distributeur = m.distributeur
+                if m.produit:
+                    suivi.produit = m.produit
+                if m.depot_effectif or m.depot_prevu:
+                    suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+            elif m.statut_camion_actuel == "VIDE":
+                suivi.statut_camion = StatutCamion.VIDE
+                suivi.mission_id = m.id
+                if m.numero_ot:
+                    suivi.numero_ot = m.numero_ot
+                if m.distributeur:
+                    suivi.distributeur = m.distributeur
+                if m.produit:
+                    suivi.produit = m.produit
+                if m.depot_effectif or m.depot_prevu:
+                    suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+            if PUBLISH_ENABLED["on"]:
+                from ..event_bus import publish
+                publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
+        audit(db, user, "mission.modification", "mission", m.id, diffs)
+        db.commit()
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("mission.update", s_mission(m))
+
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/valider-chargement")
+def valider_chargement_mission(mid: str, data: MissionValiderChargement | None = None,
+                               db: Session = Depends(get_db),
+                               user=Depends(require_roles(*ECRITURE))):
+    """Validation opérationnelle du chargement GRT."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    ts_val = None
+    if data and data.horodatage:
+        try:
+            ts_val = datetime.fromisoformat(data.horodatage)
+        except ValueError:
+            pass
+    if not ts_val:
+        for e in reversed(m.etapes or []):
+            if e.get("etat") in ("ENTREE_GRT", "CHARGEMENT_EFFECTUE") and e.get("ts"):
+                try:
+                    ts_val = datetime.fromisoformat(e["ts"])
+                    break
+                except Exception:
+                    pass
+    if not ts_val:
+        ts_val = m.heure_chargement or now_local()
+
+    m.validation_chargement = "VALIDÉ"
+    m.statut_camion_actuel = "CHARGE"
+    m.heure_chargement = ts_val
+
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
+    if suivi:
+        suivi.statut_camion = StatutCamion.CHARGE
+        if m.depot_effectif or m.depot_prevu:
+            suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+        suivi.mission_id = m.id
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
+    # Auto-résolution des alertes associées
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type.in_([TypeAlerte.VALIDATION_CHARGEMENT, TypeAlerte.MISSION_SANS_OT]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.validation_chargement", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "heure_chargement": iso(ts_val)
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/valider-dechargement")
+def valider_dechargement_mission(mid: str, data: MissionValiderDechargement | None = None,
+                                 db: Session = Depends(get_db),
+                                 user=Depends(require_roles(*ECRITURE))):
+    """Validation opérationnelle du déchargement -> Clôture mission et bascule en LIBRE."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    ts_val = None
+    if data and data.horodatage:
+        try:
+            ts_val = datetime.fromisoformat(data.horodatage)
+        except ValueError:
+            pass
+    if not ts_val:
+        for e in reversed(m.etapes or []):
+            if e.get("etat") in ("ARRIVEE_DEPOT_RECEPTEUR", "DECHARGEMENT_EFFECTUE", "DEVIATION_DETECTEE") and e.get("ts"):
+                try:
+                    ts_val = datetime.fromisoformat(e["ts"])
+                    break
+                except Exception:
+                    pass
+    if not ts_val:
+        ts_val = m.heure_fin or now_local()
+
+    m.validation_dechargement = "VALIDÉ"
+    m.statut = StatutMission.TERMINEE
+    m.statut_camion_actuel = "LIBRE"
+    m.heure_fin = ts_val
+    if m.heure_debut:
+        m.duree_s = max(0, int((ts_val - m.heure_debut).total_seconds()))
+
+    if not any(e.get("etat") == "DECHARGEMENT_EFFECTUE" for e in (m.etapes or [])):
+        m.etapes = (m.etapes or []) + [{"etat": "DECHARGEMENT_EFFECTUE", "ts": iso(ts_val),
+                                       "lieu": m.depot_effectif or m.depot_prevu or "Dépôt Récepteur",
+                                       "zone": "DEPOT"}]
+
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
+    if suivi:
+        suivi.statut_camion = StatutCamion.LIBRE
+        suivi.situation = f"Déchargé au {m.depot_effectif or m.depot_prevu or 'dépôt'} — Repositionnement"
+        suivi.mission_id = None
+        suivi.numero_ot = None
+        suivi.distributeur = None
+        suivi.produit = None
+        suivi.depot_recepteur = None
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
+    # Auto-résolution des alertes
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.validation_dechargement", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "heure_fin": iso(ts_val)
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/invalider-dechargement")
+def invalider_dechargement_mission(mid: str, data: MissionInvaliderDechargement,
+                                   db: Session = Depends(get_db),
+                                   user=Depends(require_roles(*ECRITURE))):
+    """Invalidation du déchargement (échantillonnage, repos parking) -> Conserve statut CHARGÉ et EN_COURS."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    m.validation_dechargement = "INVALIDÉ"
+    m.motif_invalidation = data.motif + (f" ({data.commentaire})" if data.commentaire else "")
+    m.statut = StatutMission.EN_COURS
+    m.statut_camion_actuel = "CHARGE"
+
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
+    if suivi:
+        suivi.statut_camion = StatutCamion.CHARGE
+        suivi.mission_id = m.id
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type == TypeAlerte.VALIDATION_DECHARGEMENT,
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.invalidation_dechargement", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "motif": m.motif_invalidation
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/{mid}/declarer-deviation")
+def declarer_deviation_mission(mid: str, data: MissionDeclarerDeviation,
+                               db: Session = Depends(get_db),
+                               user=Depends(require_roles(*ECRITURE))):
+    """Déclaration manuelle ou confirmation d'une déviation de dépôt."""
+    m = db.get(Mission, mid)
+    if m is None:
+        raise HTTPException(404, "Mission introuvable")
+
+    m.est_deviee = True
+    m.statut = StatutMission.DEVIEE
+    m.depot_effectif = data.nouveau_depot
+    m.motif_deviation = data.motif or f"Déviation vers {data.nouveau_depot} (prévu : {m.depot_prevu or '—'})"
+
+    suivi = db.scalar(select(SuiviJournalier).where(
+        (SuiviJournalier.mission_id == m.id) |
+        ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+    ))
+    if suivi:
+        suivi.depot_recepteur = data.nouveau_depot
+        suivi.statut_camion = StatutCamion.CHARGE
+        suivi.situation = f"Dévié vers {data.nouveau_depot}"
+        suivi.mission_id = m.id
+        if PUBLISH_ENABLED["on"]:
+            from ..event_bus import publish
+            publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
+    db.query(Alerte).filter(
+        Alerte.vehicule_id == m.vehicule_id,
+        Alerte.type == TypeAlerte.DEVIATION_DETECTEE,
+        Alerte.statut != StatutAlerte.TRAITEE
+    ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    audit(db, user, "mission.deviation", "mission", m.id, {
+        "plaque": m.vehicule.plaque if m.vehicule else "?",
+        "nouveau_depot": data.nouveau_depot,
+        "motif": m.motif_deviation
+    })
+    db.commit()
+    if PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return s_mission(m)
+
+
+@router.post("/missions/action-rapide")
+def executer_action_rapide_mission(data: ActionMissionRapideIn, db: Session = Depends(get_db),
+                                   user=Depends(require_roles(*ECRITURE))):
+    """Exécute une action directe depuis les alertes ou boutons de l'onglet Missions."""
+    v = None
+    if data.vehicule_id:
+        v = db.get(Vehicule, data.vehicule_id)
+    elif data.plaque:
+        v = db.scalar(select(Vehicule).where(Vehicule.plaque == data.plaque.strip()))
+
+    m = None
+    if data.mission_id:
+        m = db.get(Mission, data.mission_id)
+    elif v:
+        # Recherche mission active pour ce véhicule
+        m = db.scalar(select(Mission).where(
+            Mission.vehicule_id == v.id,
+            Mission.statut.in_([StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE])
+        ).order_by(Mission.date_jour.desc(), Mission.numero_mission_du_jour.desc()))
+        if not m:
+            m = db.scalar(select(Mission).where(Mission.vehicule_id == v.id).order_by(Mission.date_jour.desc()))
+
+    if data.action == "VALIDER_CHARGEMENT":
+        if not m and v:
+            suivi = ensure_suivi(db, v, now_local().date())
+            m = initialiser_ou_maj_mission(db, suivi, v, data.numero_ot, data.distributeur, data.produit, data.nouveau_depot or "DABI")
+        if m:
+            m.validation_chargement = "VALIDÉ"
+            m.statut_camion_actuel = "CHARGE"
+            m.heure_chargement = m.heure_chargement or now_local()
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                suivi.statut_camion = StatutCamion.CHARGE
+                if m.depot_effectif or m.depot_prevu:
+                    suivi.depot_recepteur = m.depot_effectif or m.depot_prevu
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type.in_([TypeAlerte.VALIDATION_CHARGEMENT, TypeAlerte.MISSION_SANS_OT]),
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "VALIDER_DECHARGEMENT":
+        if m:
+            m.validation_dechargement = "VALIDÉ"
+            m.statut = StatutMission.TERMINEE
+            m.statut_camion_actuel = "LIBRE"
+            m.heure_fin = m.heure_fin or now_local()
+            if m.heure_debut:
+                m.duree_s = max(0, int((m.heure_fin - m.heure_debut).total_seconds()))
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                suivi.statut_camion = StatutCamion.LIBRE
+                suivi.situation = f"Déchargé au {m.depot_effectif or m.depot_prevu or 'dépôt'} — Repositionnement"
+                suivi.mission_id = None
+                suivi.numero_ot = None
+                suivi.distributeur = None
+                suivi.produit = None
+                suivi.depot_recepteur = None
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE, TypeAlerte.MISSION_RETARDEE]),
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "INVALIDER_DECHARGEMENT":
+        if m:
+            if data.nouveau_depot or (data.motif and "déviation" in data.motif.lower()):
+                m.est_deviee = True
+                m.statut = StatutMission.DEVIEE
+                if data.nouveau_depot:
+                    m.depot_effectif = data.nouveau_depot
+                m.motif_deviation = data.commentaire or data.motif or f"Déviation vers {data.nouveau_depot}"
+                m.validation_dechargement = "INVALIDÉ"
+                m.statut_camion_actuel = "CHARGE"
+            else:
+                m.validation_dechargement = "INVALIDÉ"
+                m.motif_invalidation = data.motif or "Invalidation déchargement"
+                if data.commentaire:
+                    m.motif_invalidation += f" ({data.commentaire})"
+                m.statut = StatutMission.EN_COURS
+                m.statut_camion_actuel = "CHARGE"
+
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                suivi.statut_camion = StatutCamion.CHARGE
+                if data.nouveau_depot:
+                    suivi.depot_recepteur = data.nouveau_depot
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type.in_([TypeAlerte.VALIDATION_DECHARGEMENT, TypeAlerte.DEVIATION_DETECTEE]),
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "DECLARER_DEVIATION":
+        if m:
+            m.est_deviee = True
+            m.statut = StatutMission.DEVIEE
+            m.depot_effectif = data.nouveau_depot or m.depot_effectif
+            m.motif_deviation = data.motif or f"Déviation vers {data.nouveau_depot}"
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                suivi.depot_recepteur = m.depot_effectif
+                suivi.statut_camion = StatutCamion.CHARGE
+                suivi.situation = f"Dévié vers {m.depot_effectif}"
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type == TypeAlerte.DEVIATION_DETECTEE,
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "SAISIR_OT":
+        if not m and v:
+            suivi = ensure_suivi(db, v, now_local().date())
+            m = initialiser_ou_maj_mission(db, suivi, v, data.numero_ot, data.distributeur, data.produit, data.nouveau_depot or "DABI")
+        elif m:
+            if data.numero_ot:
+                m.numero_ot = data.numero_ot
+            if data.distributeur:
+                m.distributeur = data.distributeur
+            if data.produit:
+                m.produit = data.produit
+            if data.nouveau_depot:
+                m.depot_prevu = data.nouveau_depot
+                if not m.est_deviee:
+                    m.depot_effectif = data.nouveau_depot
+            if m.statut_camion_actuel == "LIBRE":
+                m.statut_camion_actuel = "VIDE"
+
+            suivi = db.scalar(select(SuiviJournalier).where(
+                (SuiviJournalier.mission_id == m.id) |
+                ((SuiviJournalier.vehicule_id == m.vehicule_id) & (SuiviJournalier.date_jour == m.date_jour))
+            ))
+            if suivi:
+                if data.numero_ot:
+                    suivi.numero_ot = data.numero_ot
+                if data.distributeur:
+                    suivi.distributeur = data.distributeur
+                if data.produit:
+                    suivi.produit = data.produit
+                if data.nouveau_depot:
+                    suivi.depot_recepteur = data.nouveau_depot
+                if suivi.statut_camion == StatutCamion.LIBRE:
+                    suivi.statut_camion = StatutCamion.VIDE
+                suivi.mission_id = m.id
+                if PUBLISH_ENABLED["on"]:
+                    from ..event_bus import publish
+                    publish("suivi.update", {"suivi": s_suivi(suivi, get_seuils(db))})
+
+        if v:
+            db.query(Alerte).filter(
+                Alerte.vehicule_id == v.id,
+                Alerte.type == TypeAlerte.MISSION_SANS_OT,
+                Alerte.statut != StatutAlerte.TRAITEE
+            ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+    elif data.action == "TRAITER_ALERTE":
+        if data.alerte_id:
+            a = db.get(Alerte, data.alerte_id)
+            if a:
+                a.statut = StatutAlerte.TRAITEE
+
+    if data.alerte_id:
+        a = db.get(Alerte, data.alerte_id)
+        if a:
+            a.statut = StatutAlerte.TRAITEE
+
+    db.commit()
+    if m and PUBLISH_ENABLED["on"]:
+        from ..event_bus import publish
+        publish("mission.update", s_mission(m))
+    return {"statut": "OK", "action": data.action, "mission": s_mission(m) if m else None}
+
+
+@router.get("/missions/alertes")
+def alertes_missions(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    """Récupère les alertes spécifiques au cycle des Missions (GRT, chargement, déchargement, déviation)."""
+    # Réconciliation automatique des alertes en attente des jours passés
+    reconcilier_alertes_missions_en_attente(db)
+
+    types_missions = [
+        TypeAlerte.MISSION_SANS_OT,
+        TypeAlerte.VALIDATION_CHARGEMENT,
+        TypeAlerte.VALIDATION_DECHARGEMENT,
+        TypeAlerte.DEVIATION_DETECTEE,
+    ]
+    alertes = list(db.scalars(
+        select(Alerte)
+        .where(
+            Alerte.type.in_(types_missions),
+            Alerte.statut.in_([StatutAlerte.NOUVELLE, StatutAlerte.VUE])
+        )
+        .order_by(Alerte.date_heure.desc())
+    ).all())
+
+    return {
+        "nb_alertes": len(alertes),
+        "items": [s_alerte(a) for a in alertes]
+    }
+
+
+@router.get("/missions/stats")
+def stats_missions(date_debut: str | None = None, date_fin: str | None = None,
+                   statut: str | None = None, conducteur_id: str | None = None,
+                   vehicule_id: str | None = None, depot: str | None = None,
+                   distributeur: str | None = None, q: str | None = None,
+                   db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+    stats = _calculer_stats_missions(missions, db)
+    return {"date_debut": debut.isoformat(), "date_fin": fin.isoformat(), "stats": stats}
+
+
+@router.get("/missions/export.xlsx")
+def export_missions_excel_endpoint(date_debut: str | None = None, date_fin: str | None = None,
+                                  statut: str | None = None, conducteur_id: str | None = None,
+                                  vehicule_id: str | None = None, depot: str | None = None,
+                                  distributeur: str | None = None, q: str | None = None,
+                                  db: Session = Depends(get_db),
+                                  user=Depends(require_roles(*TOUS))):
+    from ..exporters import export_missions_excel
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+
+    m_ids = [m.id for m in missions]
+    inf_counts = {}
+    if m_ids:
+        rows = db.execute(
+            select(Infraction.mission_id, func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids), Infraction.validation != "INVALIDE")
+            .group_by(Infraction.mission_id)
+        ).all()
+        inf_counts = {r[0]: r[1] for r in rows}
+
+    lignes = [s_mission(m, inf_counts.get(m.id, 0)) for m in missions]
+    titre_periode = f"du {debut:%d/%m/%Y} au {fin:%d/%m/%Y}"
+    audit(db, user, "mission.export_excel", "mission", titre_periode, {"nb_missions": len(lignes)})
+    db.commit()
+
+    contenu = export_missions_excel(titre_periode, lignes, utilisateur=user.nom_complet)
+    nom = f"Missions_{debut.isoformat()}_{fin.isoformat()}.xlsx"
+    return Response(contenu, media_type=XLSX_MIME,
+                    headers={"Content-Disposition": f"attachment; filename={nom}"})
+
+
+@router.get("/missions/export.pdf")
+def export_missions_pdf_endpoint(date_debut: str | None = None, date_fin: str | None = None,
+                                 statut: str | None = None, conducteur_id: str | None = None,
+                                 vehicule_id: str | None = None, depot: str | None = None,
+                                 distributeur: str | None = None, q: str | None = None,
+                                 db: Session = Depends(get_db),
+                                 user=Depends(require_roles(*TOUS))):
+    from ..exporters import export_missions_pdf
+    debut, fin, missions = _recuperer_missions_filtrees(
+        db, date_debut, date_fin, statut, conducteur_id, vehicule_id, depot, distributeur, q)
+
+    m_ids = [m.id for m in missions]
+    inf_counts = {}
+    if m_ids:
+        rows = db.execute(
+            select(Infraction.mission_id, func.count(Infraction.id))
+            .where(Infraction.mission_id.in_(m_ids), Infraction.validation != "INVALIDE")
+            .group_by(Infraction.mission_id)
+        ).all()
+        inf_counts = {r[0]: r[1] for r in rows}
+
+    lignes = [s_mission(m, inf_counts.get(m.id, 0)) for m in missions]
+    titre_periode = f"du {debut:%d/%m/%Y} au {fin:%d/%m/%Y}"
+    audit(db, user, "mission.export_pdf", "mission", titre_periode, {"nb_missions": len(lignes)})
+    db.commit()
+
+    contenu = export_missions_pdf(titre_periode, lignes, utilisateur=user.nom_complet)
+    nom = f"Missions_{debut.isoformat()}_{fin.isoformat()}.pdf"
+    return Response(contenu, media_type="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename={nom}"})
 
 
 @router.get("/missions/jour/{date_param}")
@@ -268,3 +1308,13 @@ def detail_mission(mid: str, db: Session = Depends(get_db),
     if m is None:
         raise HTTPException(404, "Mission introuvable")
     return s_mission(m)
+
+
+@router.post("/missions/reinitialiser")
+def api_reinitialiser_missions(db: Session = Depends(get_db),
+                               user=Depends(require_roles(Role.ADMIN))):
+    """Réinitialisation chirurgicale à 0 de toutes les données et alertes Missions (Admin uniquement)."""
+    from ..reparation import reinitialiser_donnees_missions
+    res = reinitialiser_donnees_missions(db)
+    return {"statut": "OK", "resultat": res}
+

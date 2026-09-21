@@ -38,11 +38,13 @@ MÉTHODE (déterministe, sans mutation tant que la journée n'est pas jugée) :
     archives régénérées, journal AVANT/APRÈS, alerte.
 """
 import logging
+import os
 from datetime import date, datetime, time, timedelta
 
 from sqlalchemy import func, select
+from sqlalchemy.orm import joinedload, selectinload
 
-from .config import jour_attribution, normaliser_libelle, now_local
+from .config import calculer_tokens_set, jour_attribution, normaliser_libelle, now_local
 from .daily import (_trajets_reels_du_jour as _relecture_portails,
                     archiver_jour, consolider_jour)
 from .database import SessionLocal
@@ -54,7 +56,7 @@ from .models import (Alerte, AuditLog, Conducteur, GraviteAlerte,
 from .reconciliation import (_badge_eco, _propager, _recalculer_pauses,
                              _renumeroter, _spliter_minuit,
                              _synchroniser_archive)
-from .serializers import iso
+from .serializers import iso, s_conducteur
 
 log = logging.getLogger("lss.reparation")
 
@@ -240,7 +242,8 @@ def _reecrire_archives_jour(db, jour: date, plaques: dict) -> dict:
 
 
 # ----------------------------------------------------------------- une journée
-def verifier_et_reparer_jour(db, jour: date, items: list[dict]) -> dict:
+def verifier_et_reparer_jour(db, jour: date, items: list[dict], *,
+                             autoriser_reecriture: bool = False) -> dict:
     """D1 : compare la journée à la relecture portails et la répare si écart.
     Retourne un rapport {conforme, guéries, masquées, insérés, segments_b}."""
     seuils = get_seuils(db)
@@ -384,7 +387,18 @@ def verifier_et_reparer_jour(db, jour: date, items: list[dict]) -> dict:
     db.commit()
 
     cons = consolider_jour(db, jour)          # officiel 23:59:59 (v3 AM-3)
-    archives = _reecrire_archives_jour(db, jour, plaques)
+    # v1.54/P3 — aucune réécriture d'archive sans autorisation EXPLICITE : la
+    # réparation recalcule les trajets, elle ne remplace plus les snapshots en
+    # place par défaut (l'archive est marquée « à recalculer »).
+    if autoriser_reecriture or os.getenv("LSS_ARCHIVES_APPLY", "0") == "1":
+        archives = _reecrire_archives_jour(db, jour, plaques)
+    else:
+        archives = {"reecriture": "REFUSEE_P3",
+                    "motif": "aucune réécriture automatique — autoriser via "
+                             "LSS_ARCHIVES_APPLY=1 ou endpoint dédié"}
+        log.warning("v1.54/P3 : réécriture d'archive REFUSÉE pour le %s — "
+                    "archives laissées en place, marquées « à recalculer »",
+                    jour.isoformat())
     db.flush()
     _audit(db, ACT_REPARATION, None, {
         "jour": jour.isoformat(), "gueries": rapport["gueries"],
@@ -409,7 +423,7 @@ def verifier_et_reparer_jour(db, jour: date, items: list[dict]) -> dict:
 
 
 # -------------------------------------------------------------------- global
-def executer_reparation_v130() -> dict:
+def executer_reparation_v130(*, autoriser_reecriture: bool = False) -> dict:
     """§0decies D1/D3 — contrôle complet 19/08/2026 → veille, une seule fois ;
     idempotent par journée ; reprise au boot suivant tant qu'un portail manque."""
     db = SessionLocal()
@@ -440,7 +454,8 @@ def executer_reparation_v130() -> dict:
                             jour.isoformat(), ", ".join(echecs))
                 rapport["sautees"].append(jour.isoformat())
                 continue
-            res = verifier_et_reparer_jour(db, jour, items)
+            res = verifier_et_reparer_jour(db, jour, items,
+                                            autoriser_reecriture=autoriser_reecriture)
             if res.get("conforme"):
                 rapport["conformes"] += 1
             else:
@@ -851,6 +866,9 @@ def reparer_conducteurs_v138(db=None) -> dict:
             if c.nom_normalise != canon:
                 c.nom_normalise = canon
                 stats["rekey"] = stats.get("rekey", 0) + 1
+            tset = calculer_tokens_set(c.nom_prenom)[:170]
+            if c.tokens_set != tset:
+                c.tokens_set = tset
         db.commit()
         stats["index_unique"] = _assurer_index_unique(db)
         db.commit()
@@ -865,3 +883,637 @@ def reparer_conducteurs_v138(db=None) -> dict:
         if propre:
             db.close()
     return stats
+
+
+def _dt_iso_rep(texte) -> datetime | None:
+    if not texte:
+        return None
+    try:
+        return datetime.fromisoformat(str(texte))
+    except (ValueError, TypeError):
+        return None
+
+
+def reparer_historique_conducteurs_passes(db=None) -> dict:
+    """Correction des attributions de conducteurs sur les données passées et archives :
+    1. Réalignement sur le chauffeur majoritaire / titulaire du véhicule.
+    2. Propagation et enrichissement des badges de trajets dans les snapshots JSON d'archives.
+    3. Élimination des attributions erronées dues aux badges de relais momentanés.
+    """
+    propre = db is None
+    db = db or SessionLocal()
+    stats = {"suivis_corriges": 0, "archives_corrigees": 0, "trajets_badges_enrichis": 0}
+    try:
+        # 1. Parcourir tous les SuiviJournalier existants
+        suivis = db.scalars(select(SuiviJournalier).options(
+            selectinload(SuiviJournalier.trajets),
+            joinedload(SuiviJournalier.vehicule)
+        )).all()
+
+        for s in suivis:
+            if getattr(s, "conducteur_origine", None) == "MANUEL":
+                continue
+            veh = s.vehicule
+            titulaire_id = veh.conducteur_actuel_id if veh else None
+
+            # Calcul des durées par conducteur sur les trajets réels
+            duree_par_cond: dict[str, int] = {}
+            for t in (s.trajets or []):
+                if t.statut_validation == StatutValidationTrajet.REJETE:
+                    continue
+                cid = t.conducteur_badge_id or titulaire_id
+                if cid:
+                    duree = int((t.heure_fin - t.heure_debut).total_seconds()) if (t.heure_fin and t.heure_debut and t.heure_fin >= t.heure_debut) else 0
+                    duree_par_cond[cid] = duree_par_cond.get(cid, 0) + duree
+
+            if duree_par_cond:
+                majoritaire_id = max(duree_par_cond.items(), key=lambda x: x[1])[0]
+                if s.conducteur_id != majoritaire_id:
+                    log.info("Réparation Suivi %s (%s) : conducteur %s -> majoritaire %s",
+                             s.id, veh.plaque if veh else "?", s.conducteur_id, majoritaire_id)
+                    s.conducteur_id = majoritaire_id
+                    s.conducteur_origine = "BADGE"
+                    stats["suivis_corriges"] += 1
+            elif titulaire_id and s.conducteur_id != titulaire_id and not s.conducteur_id:
+                s.conducteur_id = titulaire_id
+                stats["suivis_corriges"] += 1
+
+        db.commit()
+
+        # 2. Parcourir tous les HistoriqueJournalier existants
+        hists = db.scalars(select(HistoriqueJournalier).options(
+            joinedload(HistoriqueJournalier.vehicule)
+        )).all()
+
+        for h in hists:
+            veh = h.vehicule
+            titulaire_id = veh.conducteur_actuel_id if veh else None
+            d = dict(h.donnees or {})
+            trajets_snap = list(d.get("trajets") or [])
+            modifie = False
+
+            # Enrichir les snapshots de trajets depuis la table `trajets` de la base
+            db_trajets = db.scalars(select(Trajet).join(
+                SuiviJournalier, Trajet.suivi_id == SuiviJournalier.id
+            ).where(
+                SuiviJournalier.vehicule_id == h.vehicule_id,
+                SuiviJournalier.date_jour == h.date_jour
+            )).all()
+
+            if db_trajets and trajets_snap:
+                map_db_t = {t_db.id: t_db for t_db in db_trajets if t_db.id}
+                for t in trajets_snap:
+                    if not isinstance(t, dict):
+                        continue
+                    tid = t.get("id")
+                    if tid and tid in map_db_t:
+                        db_t = map_db_t[tid]
+                        if db_t.conducteur_badge and not t.get("conducteur_badge"):
+                            t["conducteur_badge"] = db_t.conducteur_badge
+                            t["conducteur_badge_id"] = db_t.conducteur_badge_id
+                            modifie = True
+                            stats["trajets_badges_enrichis"] += 1
+
+            duree_par_cond_hist: dict[str, int] = {}
+            for t in trajets_snap:
+                if not isinstance(t, dict):
+                    continue
+                if t.get("statut_validation") == "REJETE":
+                    continue
+                cid = t.get("conducteur_badge_id") or titulaire_id
+                if cid:
+                    deb = _dt_iso_rep(t.get("heure_debut"))
+                    fin = _dt_iso_rep(t.get("heure_fin"))
+                    duree = int((fin - deb).total_seconds()) if (deb and fin and fin >= deb) else 0
+                    duree_par_cond_hist[cid] = duree_par_cond_hist.get(cid, 0) + duree
+
+            if duree_par_cond_hist:
+                majoritaire_id = max(duree_par_cond_hist.items(), key=lambda x: x[1])[0]
+                if h.conducteur_id != majoritaire_id:
+                    log.info("Réparation Historique %s (%s - %s) : conducteur %s -> majoritaire %s",
+                             h.id, h.date_jour, veh.plaque if veh else "?", h.conducteur_id, majoritaire_id)
+                    h.conducteur_id = majoritaire_id
+                    maj_cond = db.get(Conducteur, majoritaire_id)
+                    if maj_cond:
+                        d["conducteur_id"] = maj_cond.id
+                        d["chauffeur"] = maj_cond.nom_prenom
+                        d["conducteur"] = s_conducteur(maj_cond, court=True)
+                    modifie = True
+                    stats["archives_corrigees"] += 1
+            elif titulaire_id and not h.conducteur_id:
+                h.conducteur_id = titulaire_id
+                maj_cond = db.get(Conducteur, titulaire_id)
+                if maj_cond:
+                    d["conducteur_id"] = maj_cond.id
+                    d["chauffeur"] = maj_cond.nom_prenom
+                    d["conducteur"] = s_conducteur(maj_cond, court=True)
+                modifie = True
+                stats["archives_corrigees"] += 1
+
+            if modifie:
+                d["trajets"] = trajets_snap
+                h.donnees = d
+
+        db.commit()
+        log.info("Réparation historique conducteurs terminée : %s", stats)
+        migrer_schema_missions(db)
+    except Exception:
+        db.rollback()
+        log.exception("Erreur lors de la réparation de l'historique des conducteurs")
+    finally:
+        if propre:
+            db.close()
+    return stats
+
+
+def migrer_schema_missions(db=None) -> dict:
+    """Vérifie et ajoute TOUTES les colonnes manquantes dans la table `missions` (idempotent, SQLite/PostgreSQL)."""
+    propre = False
+    if db is None:
+        db = SessionLocal()
+        propre = True
+    resultat = {"ajouts": []}
+    try:
+        from sqlalchemy import text
+        colonnes_existantes = set()
+        for row in db.execute(text("PRAGMA table_info(missions)")).fetchall():
+            colonnes_existantes.add(row[1])
+
+        ajouts = [
+            ("code_mission", "VARCHAR(50)"),
+            ("statut_camion_actuel", "VARCHAR(20) DEFAULT 'VIDE'"),
+            ("heure_chargement", "DATETIME"),
+            ("depot_prevu", "VARCHAR(50)"),
+            ("depot_effectif", "VARCHAR(50)"),
+            ("est_deviee", "BOOLEAN DEFAULT 0"),
+            ("motif_deviation", "VARCHAR(200)"),
+            ("validation_chargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+            ("validation_dechargement", "VARCHAR(20) DEFAULT 'EN_ATTENTE'"),
+            ("motif_invalidation", "VARCHAR(200)"),
+            ("est_repositionnement", "BOOLEAN DEFAULT 0"),
+            ("distributeur", "VARCHAR(30)"),
+            ("km_vide", "FLOAT DEFAULT 0.0"),
+            ("km_charge", "FLOAT DEFAULT 0.0"),
+            ("kilometrage_total", "FLOAT DEFAULT 0.0"),
+            ("origine", "VARCHAR(200)"),
+            ("etapes", "TEXT"),
+            ("created_at", "DATETIME"),
+            ("updated_at", "DATETIME"),
+        ]
+        for nom_col, type_col in ajouts:
+            if nom_col not in colonnes_existantes:
+                try:
+                    db.execute(text(f"ALTER TABLE missions ADD COLUMN {nom_col} {type_col}"))
+                    resultat["ajouts"].append(nom_col)
+                    log.info("Migration table missions : colonne %s ajoutée", nom_col)
+                except Exception as e:
+                    log.warning("Migration colonne missions.%s : %s", nom_col, e)
+        db.commit()
+    except Exception as e:
+        log.warning("migrer_schema_missions ignoré : %s", e)
+    finally:
+        if propre:
+            db.close()
+    return resultat
+
+
+def reparer_fins_incoherentes(db=None) -> dict:
+    """GARDE D'INTÉGRITÉ idempotente (exécutée à chaque démarrage) — un trajet
+    NON rejeté dont `heure_fin < heure_debut` est CORROMPU (surface constatée :
+    la fin d'un trajet recopiée sur le suivant lors d'un rapprochement, qui
+    faussait la colonne de pauses à l'écran — « pauses vides »). RÈGLE de
+    correction NON destructive (AM-2 / R2 : jamais de suppression, aucune heure
+    inventée) :
+      · s'il existe un AUTRE trajet non rejeté au MÊME `heure_debut` (jumeau du
+        vrai trajet) → le corrompu est marqué REJETÉ (conservé en base, masqué,
+        comme les manœuvres) ;
+      · sinon la fin impossible est écartée → `heure_fin = None` (le trajet est
+        « en cours », sa ligne, sa distance et son statut sont conservés).
+    Les pauses (`_recalculer_pauses`), les compteurs réglementaires
+    (`recalculer_temps` : TCC/TCJ/TTJ) et l'archive éventuelle
+    (`_synchroniser_archive`) sont recalculés. Retourne un dict de statistiques.
+    """
+    propre = db is None
+    db = db or SessionLocal()
+    stats = {"corriges": 0, "rejetes": 0, "suivis": 0}
+    try:
+        corrompus = db.scalars(select(Trajet).where(
+            Trajet.heure_fin.isnot(None),
+            Trajet.heure_fin < Trajet.heure_debut,
+            Trajet.statut_validation != StatutValidationTrajet.REJETE)).all()
+        if not corrompus:
+            db.commit()
+            return stats
+
+        def _plaque(sid):
+            sv = db.get(SuiviJournalier, sid)
+            return sv.vehicule.plaque if sv and sv.vehicule else None
+
+        touches: set[str] = set()
+        for t in corrompus:
+            avant = {"debut": iso(t.heure_debut), "fin": iso(t.heure_fin),
+                     "distance_km": t.distance_km}
+            jumeau = db.scalar(select(Trajet.id).where(
+                Trajet.suivi_id == t.suivi_id,
+                Trajet.id != t.id,
+                Trajet.statut_validation != StatutValidationTrajet.REJETE,
+                Trajet.heure_debut == t.heure_debut))
+            if jumeau:
+                t.statut_validation = StatutValidationTrajet.REJETE
+                stats["rejetes"] += 1
+                _audit(db, "trajet.fin_incoherente", t.id, {
+                    "plaque": _plaque(t.suivi_id),
+                    "avant": avant,
+                    "action": "rejete_jumeau",
+                    "regle": "v146 : heure_fin < heure_debut et jumeau présent "
+                             "au même début → marqué REJETÉ (conservé, masqué, "
+                             "comme les manœuvres)"})
+            else:
+                t.heure_fin = None
+                stats["corriges"] += 1
+                _audit(db, "trajet.fin_incoherente", t.id, {
+                    "plaque": _plaque(t.suivi_id),
+                    "avant": avant,
+                    "action": "fin_nulle_en_cours",
+                    "regle": "v146 : heure_fin < heure_debut → fin impossible "
+                             "écartée (traité « en cours »), ligne/distance/"
+                             "statut conservés — aucune donnée supprimée"})
+            touches.add(t.suivi_id)
+
+        from .engine import recalculer_temps
+        for sid in touches:
+            suivi = db.get(SuiviJournalier, sid)
+            if suivi is None:
+                continue
+            trajets = list(db.scalars(select(Trajet).where(
+                Trajet.suivi_id == sid).order_by(Trajet.numero)).all())
+            _renumeroter(sorted(trajets, key=lambda t: t.heure_debut))
+            _recalculer_pauses(trajets)
+            db.flush()
+            try:
+                recalculer_temps(db, suivi, now_local())
+            except Exception:
+                log.exception("reparer_fins_incoherentes : recalcul échoué %s",
+                              sid)
+            _synchroniser_archive(db, suivi)
+            stats["suivis"] += 1
+        db.commit()
+        if stats["corriges"] or stats["rejetes"]:
+            log.warning("Réparation v146 (fins incohérentes, %s) : %s",
+                        now_local().date(), stats)
+    except Exception:
+        db.rollback()
+        log.exception("Réparation v146 (fins incohérentes) en échec — reprise "
+                      "au prochain démarrage")
+        stats["erreur"] = True
+    finally:
+        if propre:
+            db.close()
+    return stats
+
+
+def reparer_trajets_sans_fin(db=None) -> dict:
+    """GARDE D'INTÉGRITÉ idempotente (exécutée à chaque démarrage, APRÈS
+    `reparer_fins_incoherentes`) — un trajet NON rejeté resté SANS
+    `heure_fin` sur une JOURNÉE PASSÉE est une ligne « en cours » jamais
+    jugée (fin absente du portail au moment de la collecte, panne au
+    bouclage, session interrompue) : elle fausse TCJ/TTJ/TCH et l'onglet
+    Historique (« trajets continus sans fin »). Surface constatée les
+    12-16/09/2026 (fins jamais reçues pour 26-31 trajets VALIDE/jour).
+
+    RÈGLE de clôture NON destructive (AM-2 / R2 — jamais de suppression,
+    aucune heure inventée hors sources existantes) :
+      1. début du trajet SUIVANT du même suivi (chaîne — la pause entre les
+         deux lignes reste calculée par `_recalculer_pauses`) ;
+      2. sinon le DERNIER événement GPS du véhicule ce jour-là postérieur
+         au début (dernière position connue du portail) ;
+      3. sinon 23:59:59 du jour (clôture réglementaire AM-3).
+    Jamais de fin <= début (repli 23:59:59). Les compteurs réglementaires
+    (TCC/TCJ/TTJ) et l'archive sont recalculés. Retourne un dict de stats."""
+    propre = db is None
+    db = db or SessionLocal()
+    from .models import EvenementGPS
+    stats = {"fermes": 0, "suivis": 0}
+    try:
+        aujour = now_local().date()
+        ouverts = db.scalars(select(Trajet).join(SuiviJournalier).where(
+            Trajet.heure_fin.is_(None),
+            Trajet.heure_debut.isnot(None),
+            SuiviJournalier.date_jour < aujour)).all()
+        if not ouverts:
+            db.commit()
+            return stats
+
+        def _plaque(sid):
+            sv = db.get(SuiviJournalier, sid)
+            return sv.vehicule.plaque if sv and sv.vehicule else None
+
+        touches: set[str] = set()
+        # regroupement par suivi pour la chaîne (numero ordonné)
+        par_suivi: dict[str, list] = {}
+        for t in ouverts:
+            par_suivi.setdefault(t.suivi_id, []).append(t)
+        for sid, trajets in par_suivi.items():
+            sv = db.get(SuiviJournalier, sid)
+            if sv is None:
+                continue
+            chaines = sorted(
+                db.scalars(select(Trajet).where(
+                    Trajet.suivi_id == sid).order_by(Trajet.numero)).all(),
+                key=lambda t: (t.heure_debut or datetime.min,
+                               t.numero or 0))
+            fin_jour = (datetime.combine(sv.date_jour, datetime.min.time())
+                        + timedelta(seconds=86399))
+            for t in trajets:
+                if t.heure_fin is not None or t.heure_debut is None:
+                    continue
+                fin = None
+                suiv = next((x for x in chaines
+                             if x.id != t.id and x.heure_debut
+                             and x.heure_debut > t.heure_debut), None)
+                if suiv is not None:
+                    fin = suiv.heure_debut
+                else:
+                    ev = db.scalar(select(EvenementGPS).where(
+                        EvenementGPS.vehicule_id == sv.vehicule_id,
+                        EvenementGPS.horodatage > t.heure_debut,
+                        EvenementGPS.horodatage <= fin_jour
+                    ).order_by(EvenementGPS.horodatage.desc()))
+                    if ev is not None:
+                        fin = ev.horodatage
+                if fin is None or fin > fin_jour:
+                    fin = fin_jour
+                if fin <= t.heure_debut:
+                    fin = fin_jour if fin_jour > t.heure_debut else t.heure_debut
+                t.heure_fin = fin
+                stats["fermes"] += 1
+                _audit(db, "trajet.sans_fin_jour_passe", t.id, {
+                    "plaque": _plaque(sid),
+                    "debut": iso(t.heure_debut),
+                    "fin_posee": iso(fin),
+                    "regle": "v147 : trajet « en cours » resté sans fin sur "
+                             "une journée passée → clôturé par la chaîne / "
+                             "la dernière position connue / 23:59:59 "
+                             "(aucune donnée supprimée)"})
+            touches.add(sid)
+
+        from .engine import recalculer_temps
+        for sid in touches:
+            suivi = db.get(SuiviJournalier, sid)
+            if suivi is None:
+                continue
+            trajets = list(db.scalars(select(Trajet).where(
+                Trajet.suivi_id == sid).order_by(Trajet.numero)).all())
+            _renumeroter(sorted(trajets, key=lambda t: t.heure_debut))
+            _recalculer_pauses(trajets)
+            db.flush()
+            try:
+                recalculer_temps(db, suivi, now_local())
+            except Exception:
+                log.exception("reparer_trajets_sans_fin : recalcul échoué %s",
+                              sid)
+            _synchroniser_archive(db, suivi)
+            stats["suivis"] += 1
+        db.commit()
+        if stats["fermes"]:
+            log.warning("Réparation v147 (trajets sans fin sur jours passés) :"
+                        " %s", stats)
+    except Exception:
+        db.rollback()
+        log.exception("Réparation v147 (trajets sans fin) en échec — reprise "
+                      "au prochain démarrage")
+        stats["erreur"] = True
+    finally:
+        if propre:
+            db.close()
+    return stats
+
+
+def nettoyer_alertes_missions_invalides(db=None) -> dict:
+    """Purge / clôture toutes les fausses alertes de déchargement/chargement ou alertes sur lieux non officiels."""
+    propre = False
+    if db is None:
+        db = SessionLocal()
+        propre = True
+    resultat = {"succes": True, "missions_corrigees": 0}
+    try:
+        from .models import Mission, Alerte, StatutMission, StatutAlerte, TypeAlerte
+        from .geozones import normaliser_code_depot, nom_officiel_depot
+        from .engine import reconcilier_alertes_missions_en_attente
+
+        # 1. Correction des déviations fantômes vers Moramanga dues au transit RN2
+        missions = db.query(Mission).all()
+        for m in missions:
+            code_prev = normaliser_code_depot(m.depot_prevu)
+            code_eff = normaliser_code_depot(m.depot_effectif)
+            if m.est_deviee and code_eff == "DMMG" and code_prev in ("DABI", "DSNR", "DABE", "DFIA", "DMDV", "DMKR"):
+                m.est_deviee = False
+                m.depot_effectif = nom_officiel_depot(m.depot_prevu) or m.depot_prevu
+                m.motif_deviation = None
+                if m.statut == StatutMission.DEVIEE:
+                    m.statut = StatutMission.TERMINEE if m.heure_fin else StatutMission.EN_COURS
+                if m.etapes:
+                    m.etapes = [e for e in m.etapes if e.get("etat") != "DEVIATION_DETECTEE" or e.get("zone") != "DMMG"]
+                resultat["missions_corrigees"] += 1
+
+        db.query(Alerte).filter(
+            Alerte.type.in_([TypeAlerte.DEVIATION_DETECTEE, TypeAlerte.VALIDATION_DECHARGEMENT]),
+            Alerte.message.like("%Depot Moramanga (DMMG)%prévu : Depot Alarobia%"),
+            Alerte.statut != StatutAlerte.TRAITEE
+        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+
+        db.commit()
+
+        # 2. Réconciliation stricte
+        nb = reconcilier_alertes_missions_en_attente(db)
+        resultat["nb_restaurees"] = nb
+        log.info("Nettoyage et réconciliation des alertes missions terminé.")
+    except Exception as e:
+        log.warning("nettoyer_alertes_missions_invalides : %s", e)
+        resultat["succes"] = False
+    finally:
+        if propre:
+            db.close()
+    return resultat
+
+
+def reinitialiser_donnees_missions(db=None) -> dict:
+    """Nettoie les anciennes lignes de missions orphelines/synthétiques et synchronise
+    proprement les missions actives à partir des données de SuiviJournalier saisies pour chaque camion.
+    - Conserve intactes toutes les informations saisies (OT, distributeur, produit, dépôt, statut camion).
+    - Clôture les alertes des jours passés (< aujourd'hui).
+    - Rétablit et persiste les alertes légitimes à compter d'aujourd'hui.
+    """
+    propre = False
+    if db is None:
+        db = SessionLocal()
+        propre = True
+    resultat = {"succes": True}
+    try:
+        from .models import Mission, Alerte, SuiviJournalier, StatutCamion, StatutAlerte, TypeAlerte, StatutMission, Vehicule, uid
+        from .geozones import nom_officiel_depot
+        from .engine import _formater_code_mission, reconcilier_alertes_missions_en_attente
+        from .config import now_local
+        
+        maintenant = now_local()
+        jour_auj = maintenant.date()
+        debut_auj_dt = datetime.combine(jour_auj, time.min)
+
+        # 1. Purge complète des missions pour repartir sur une base 100% fidèle au SuiviJournalier
+        nb_missions = db.query(Mission).delete()
+        resultat["missions_supprimees"] = nb_missions
+
+        # 2. Clôture des alertes des jours passés (< aujourd'hui) et alertes invalides
+        types_missions = [
+            TypeAlerte.MISSION_SANS_OT,
+            TypeAlerte.VALIDATION_CHARGEMENT,
+            TypeAlerte.VALIDATION_DECHARGEMENT,
+            TypeAlerte.DEVIATION_DETECTEE,
+            TypeAlerte.MISSION_RETARDEE,
+        ]
+        nb_alertes_passees = db.query(Alerte).filter(
+            Alerte.type.in_(types_missions),
+            Alerte.date_heure < debut_auj_dt
+        ).update({Alerte.statut: StatutAlerte.TRAITEE}, synchronize_session=False)
+        resultat["alertes_passees_cloturees"] = nb_alertes_passees
+
+        # 3. Synchronisation et recréation fidèle des missions depuis SuiviJournalier
+        suivis_recents = db.scalars(
+            select(SuiviJournalier).where(SuiviJournalier.date_jour == jour_auj)
+            .order_by(SuiviJournalier.vehicule_id.asc())
+        ).all()
+
+        missions_creees = 0
+        for s in suivis_recents:
+            v = db.get(Vehicule, s.vehicule_id)
+            if not v:
+                continue
+
+            statut_c_raw = s.statut_camion.value if hasattr(s.statut_camion, "value") else str(s.statut_camion or "LIBRE")
+            statut_c = "CHARGE" if str(statut_c_raw).upper() in ("CHARGE", "CHARGÉ") else ("VIDE" if str(statut_c_raw).upper() == "VIDE" else "LIBRE")
+            sit_l = (s.situation or "").lower()
+
+            # Règle 8 & 10 : Si le véhicule est au repos, au garage, ou en retour/repositionnement sans mission active,
+            # il est STRICTEMENT en statut LIBRE sans Ordre de Transport officiel.
+            if statut_c == "LIBRE" and ("repos" in sit_l or "retour tana" in sit_l or "cyclone" in sit_l or "garage" in sit_l or "maintenance" in sit_l):
+                s.numero_ot = None
+                s.depot_recepteur = None
+                s.distributeur = None
+                s.produit = None
+                s.mission_id = None
+                continue
+
+            num_ot = s.numero_ot
+            depot_p = s.depot_recepteur or s.situation
+            nom_dep = nom_officiel_depot(depot_p) or depot_p
+
+            # 1. Si le camion est CHARGÉ ou VIDE dans le SuiviJournalier -> Création d'une mission active fidèle 1:1
+            if statut_c in ("VIDE", "CHARGE"):
+                code = _formater_code_mission(num_ot, s.date_jour, missions_creees + 1)
+                statut_m = StatutMission.EN_COURS
+                
+                ts_debut = s.trajets[0].heure_debut if (s.trajets and s.trajets[0].heure_debut) else (s.heure_depart or datetime.combine(jour_auj, time(6, 0)))
+                ts_chg = datetime.combine(jour_auj, time(10, 0)) if statut_c == "CHARGE" else None
+
+                etapes = []
+                if num_ot:
+                    etapes.append({"etat": "INITIALISATION_OT", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
+                if ts_debut:
+                    etapes.append({"etat": "DEPART_BASE", "ts": iso(ts_debut), "lieu": "Base LSS — Antananarivo", "zone": "BASETNR"})
+                if statut_c == "CHARGE":
+                    etapes.append({"etat": "CHARGEMENT_EFFECTUE", "ts": iso(ts_chg or ts_debut), "lieu": "GRT (GALANA RAFINERIE TERMINALE)", "zone": "GRT"})
+
+                km_tot = float(s.km_parcourus or 0.0)
+                km_v = round(km_tot * 0.5, 1) if statut_c == "CHARGE" else round(km_tot, 1)
+                km_c = round(km_tot * 0.5, 1) if statut_c == "CHARGE" else 0.0
+
+                m = Mission(
+                    id=uid(),
+                    code_mission=code,
+                    date_jour=s.date_jour,
+                    conducteur_id=s.conducteur_id or v.conducteur_actuel_id,
+                    vehicule_id=v.id,
+                    numero_mission_du_jour=1,
+                    statut=statut_m,
+                    statut_camion_actuel=statut_c,
+                    heure_debut=ts_debut,
+                    heure_chargement=ts_chg,
+                    heure_fin=None,
+                    numero_ot=num_ot,
+                    distributeur=s.distributeur,
+                    produit=s.produit,
+                    depot=nom_dep if nom_dep and nom_dep != "Hors zone" else None,
+                    depot_prevu=nom_dep if nom_dep and nom_dep != "Hors zone" else None,
+                    depot_effectif=nom_dep if nom_dep and nom_dep != "Hors zone" else None,
+                    est_deviee=False,
+                    validation_chargement="VALIDÉ" if statut_c == "CHARGE" else "EN_ATTENTE",
+                    validation_dechargement="EN_ATTENTE" if (nom_dep and nom_dep != "Hors zone" and statut_c == "CHARGE") else "NON_REQUIS",
+                    km_vide=km_v,
+                    km_charge=km_c,
+                    kilometrage=round(km_v + km_c, 1),
+                    kilometrage_total=round(km_v + km_c, 1),
+                    origine="Base LSS — Antananarivo",
+                    etapes=etapes
+                )
+                db.add(m)
+                db.flush()
+                s.mission_id = m.id
+                missions_creees += 1
+
+            # 2. Si le camion est LIBRE mais a quitté Base TNR avec durée de roulage >= 1h (Règle 1 : Sans OT pour le moment)
+            elif (s.heure_depart is not None or (s.tcj_s and s.tcj_s >= 3600) or (s.km_parcourus and s.km_parcourus >= 30)) and ("repos" not in sit_l and "retour" not in sit_l and "cyclone" not in sit_l and "maintenance" not in sit_l):
+                code = f"MIS-{jour_auj.strftime('%Y%m%d')}-{missions_creees + 1:02d}"
+                ts_debut = s.trajets[0].heure_debut if (s.trajets and s.trajets[0].heure_debut) else (s.heure_depart or datetime.combine(jour_auj, time(6, 0)))
+                etapes = [{"etat": "DEPART_BASE", "ts": iso(ts_debut), "lieu": "Sortie Base Tanà (RN2)", "zone": "BASETNR"}]
+                km_tot = float(s.km_parcourus or 0.0)
+
+                m = Mission(
+                    id=uid(),
+                    code_mission=code,
+                    date_jour=s.date_jour,
+                    conducteur_id=s.conducteur_id or v.conducteur_actuel_id,
+                    vehicule_id=v.id,
+                    numero_mission_du_jour=1,
+                    statut=StatutMission.EN_COURS,
+                    statut_camion_actuel="LIBRE",
+                    heure_debut=ts_debut,
+                    heure_chargement=None,
+                    heure_fin=None,
+                    numero_ot=None,
+                    distributeur=None,
+                    produit=None,
+                    depot=None,
+                    depot_prevu=None,
+                    depot_effectif=None,
+                    est_deviee=False,
+                    validation_chargement="NON_REQUIS",
+                    validation_dechargement="NON_REQUIS",
+                    km_vide=round(km_tot, 1),
+                    km_charge=0.0,
+                    kilometrage=round(km_tot, 1),
+                    kilometrage_total=round(km_tot, 1),
+                    origine="Base LSS — Antananarivo",
+                    etapes=etapes
+                )
+                db.add(m)
+                db.flush()
+                s.mission_id = m.id
+                missions_creees += 1
+            else:
+                s.mission_id = None
+
+        resultat["missions_creees"] = missions_creees
+        db.commit()
+
+        # 4. Rétablir les alertes légitimes à compter d'aujourd'hui
+        reconcilier_alertes_missions_en_attente(db)
+        log.warning("Synchronisation des missions depuis SuiviJournalier terminée : %s", resultat)
+    except Exception as e:
+        db.rollback()
+        log.exception("reinitialiser_donnees_missions en échec : %s", e)
+        resultat["succes"] = False
+        resultat["erreur"] = str(e)
+    finally:
+        if propre:
+            db.close()
+    return resultat

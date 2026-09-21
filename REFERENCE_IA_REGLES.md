@@ -376,6 +376,54 @@ Origine : retour de l'exploitant après installation de la v1.44 (capture d'écr
 
 ---
 
+## 0duotricies decies. Arbitrages LSS du 16/09/2026 — audit moteur & affichage (v1.50, mandants)
+
+Origine : audit conduit le 16/09/2026 à la demande de l'exploitant sur trois
+défauts constatés en exploitation. Chaque point est mesuré AVANT/APRÈS (sonde
+`backend/probe_metriques_v150.py`, suites de non-régression). Les règles déjà
+établies qui NE changent PAS sont citées à côté de celles qui changent.
+
+**ARBITRAGE FINAL DE L'EXPLOITANT (16/09/2026) — à appliquer AVANT tout
+correctif futur.** H1, R1 et AM-1/AM-6 sont des **LOIS MANDATÉES** : elles
+décrivent le comportement VOULU. Le travail consiste à les **OBSERVER**, jamais
+à les optimiser. Le danger réel n'est pas la loi, c'est l'**ÉCART entre la loi
+et son exécution** : trop d'endroits connaissent ces règles, et chacune de ces
+copies peut dériver. Toute anomalie détectée est donc **CLASSÉE** avant d'être
+traitée :
+
+| Classe | Définition | Traitement |
+|---|---|---|
+| **DÉFAUT** | le code trahit la loi (exécution) | on corrige l'EXÉCUTION, la loi ne bouge pas |
+| **LOI** | comportement voulu (H1, R1, AM-1/AM-6) | on ne touche à RIEN : on mesure, on trace, on exploite ; on ne « corrige » jamais une loi et on ne requalifie jamais un écart mandaté en incident |
+| **TROU DE LOI** | la loi est muette et le code en tire une mesure fausse (ex. ligne ouverte mesurée à l'horloge murale) | on borne la mesure à la **PREUVE** disponible et on REMONTE l'incertitude (audit), jamais on ne comble en silence |
+
+Corollaire : la loi doit rester **observable par un test** (les suites v1.50
+portent les marqueurs `[LD-*]` pour une loi et `[TD-*]` pour un défaut/trou).
+
+| # | Règle | Conséquence |
+|---|---|---|
+| **P0** | **CLASSEMENT AVANT CORRECTIF (règle de méthode, mandatée le 16/09/2026).** Aucune correction n'est apportée à une règle métier sans avoir d'abord classé le constat en **DÉFAUT** (le code trahit la loi → on corrige l'exécution), **LOI** (comportement voulu → on mesure, trace et exploite : on ne « corrige » JAMAIS une loi, on ne requalifie JAMAIS un écart mandaté en incident) ou **TROU DE LOI** (la loi est muette → on borne la mesure à la PREUVE disponible et on remonte l'incertitude en audit, jamais on ne l'absorbe). Sont des LOIS à ne pas toucher : **H1** (pause ≥ 30 min ⇒ TCC = 0), **R1** (cumul du chrono de la veille au passage de minuit), **AM-1/AM-6** (le span d'une manœuvre rejetée — même de 3 h — est un ARRÊT, donc H1 peut couper le TCC). Toute anomalie résiduelle reste TRACÉE (`metrique.*`, `trajet.*`), jamais absorbée. Verrou : chaque règle est couverte par un test marqué `[LD-*]` (loi) ou `[TD-*]` (défaut/trou) dans `backend/test_audit_metriques_v150.py` ; la sonde `backend/probe_metriques_v150.py` affiche le classement de chaque scénario. | Un écart loi/exécution se voit et se corrige **au bon endroit** (l'exécution) ; aucune loi n'est « optimisée » par inadvertance. |
+| **P1** | **♦ RETIRÉ LE 16/09/2026 (même jour) — LA SPEC PRIME : SPEC_RULES_v3 §1/[R-01] « un trajet est valide si sa distance est ≥ 0,3 km ».** L'audit avait adopté une validité **conjonctive** « distance ≥ 500 m **ET** durée ≥ 300 s » ; la vérification de conformité a montré que ce critère **contredisait la source de vérité unique** (SPEC_RULES_v3, « ce document prime sur les documents historiques, la référence antérieure et les addenda de suivi »). Décision de l'exploitant : **retour à 0,3 km, la durée n'entre JAMAIS dans le verdict** (elle reste MESURÉE et exposée : audit, affichage). `SEUIL_DUREE_MIN_TRAJET_S` et `REGLE_VALIDITE_TRAJET` ont été **supprimés du paramétrage** — une loi qu'un réglage peut réactiver est une divergence qui attend son heure. **Ce qui reste acquis de P1** : un JUGE UNIQUE (`validation_trajet.juger`) appelé par le temps réel, la consolidation et la relecture portail — supprimant les trois verdicts divergents d'autrefois. | Micro-segments : < 0,3 km = manœuvre traitée en ARRÊT ([R-07]) ; ≥ 0,3 km = trajet publié (ex. la ligne 0,337 km de 3046TBS, VALIDE — mesuré). |
+| **P2** | **HYSTÉRÉSIE D'ARRÊT : tout arrêt < 180 s ne coupe JAMAIS le segment en cours (`SEUIL_ABSORPTION_ARRET_S`) — conservé le 16/09/2026, mais ⚠️ HORS SPEC_RULES_v3 (règle non traitée par la spec, non contradictoire : à y inscrire à la prochaine révision).** Un feu, un quai, une coupure d'allumage de moins de 3 minutes sont ABSORBÉS : aucun nouveau numéro de trajet, aucune validation Niveau 2 prématurée. La règle de fusion à 20 min (`DUREE_MIN_PAUSE_VALIDE`) est INCHANGÉE pour tout le reste. | Plus de T2/T3 fantômes sur les micro-arrêts. |
+| **P3** | **AGRÉGATION BORNÉE À LA PREUVE (choix adopté — AMENDE §10 « on ne ferme jamais à l'aveugle » pour le TEMPS RÉEL).** Une ligne OUVERTE ne fait plus courir les compteurs jusqu'à l'heure de consultation : la présomption est bornée à `seuil_silence` (30 min, LA frontière du badge « boîtier muet »), puis les compteurs SE FIGENT à la dernière trace. Silence < 30 min : le comportement v1.16/R3 est conservé (le TCC provisoire continue, exigence exploitant du 05/08). **Mesure** : journée terminée à 08:20 → TTJ 17:00 avant, 2:50 après ; TCJ 16:40 avant, 2:30 après. Alertes de dépassement fantômes supprimées. Idem pour les lignes de la grille et les exports. | Fin des TTJ/TCJ gonflés en soirée sur boîtiers muets, sans casser le TCC provisoire des camions en route. |
+| **P4** | **INACTIFS MASQUÉS PAR DÉFAUT (choix adopté).** La grille du suivi et les exports n'affichent plus les camions sans AUCUNE activité mesurée (TCJ = 0:00 **ET** TCI = 0:00 **ET** TTJ = 0:00). Filtre en SQL (`GET /api/suivi?inclure_inactifs=false`), compteur `nb_inactifs` retourné, bascule « Actifs / Tous les camions » persistée à l'écran, paramètre repris à l'identique par les exports (§A.2 écran = export). Une ligne portant un TCC provisoire ou une amplitude reste VISIBLE : on ne masque jamais une donnée mesurée. | Grille lisible les jours de flotte partielle ; la flotte complète reste à un clic (Partie B d'un camion qui n'a pas roulé). |
+| **P5** | **AUCUNE COORDONNÉE BRUTE DANS UNE COLONNE DE LIEU (choix adopté — généralise la règle E4).** Le libellé unique est `libelle_ou_zone` / `formater_zone` : géozone (« Base LSS — Antananarivo »), sinon « proche &lt;nom&gt; », sinon axe logistique — « **Zone RN2 (Proche coord. 8.74, 49.10)** » —, sinon « **Zone non référencée (Proche coord. 8.74, 49.10)** ». Détection par regex métier `^-?\d+\.\d+,\s*-?\d+\.\d+$`. Appliqué à l'INGESTION (adresse), à la LECTURE (serializer : libellés hérités normalisés) et au FRONTEND (dernier rempart). **Réparation unique** en base des chaînes héritées : `reparation.reparer_libelles_position_v150` (idempotente, marqueur d'audit `libelles_position_v150.terminee`, seuls les couples de coordonnées sont réécrits). | Plus jamais « 8.7407, 49.103 » à l'écran, dans l'export ou dans l'archive. |
+| **P6** | **R1 / H1 / H2 / TCJ / TTJ : LOIS MANDATÉES — INCHANGÉES (vérifié).** L'audit a formellement reconfirmé la loi : R1 (amorce du TCC de la veille au passage de minuit — le TCC peut donc LÉGITIMEMENT dépasser le TTJ du jour civil, ex. 7:56:59 &gt; 4:57:00) ; H1 (camion en pause ≥ 30 min → TCC = 0) ; H2 (arrêt court EN COURS → le chrono continue) ; TCJ/TTJ (AM-1/T1/F1). Le chrono de la dernière session TERMINÉE est désormais CONSERVÉ (`tcc_derniere_session_s`) au lieu d'être perdu quand H1 remet le compteur courant à 0 — donnée d'audit, aucun changement d'affichage. **Une anomalie de consommation de ces lois n'est jamais une loi à changer (P0).** | Aucune règle de compteur modifiée au-delà de P3 ; toute incohérence résiduelle est tracée par audit (`metrique.*`) au lieu d'être absorbée. |
+
+**Conséquence** : version **1.50**, **réalignée sur SPEC_RULES_v3 le
+16/09/2026** (P1 retiré, seuils de durée supprimés). ⚠️ Ce document est
+**historique** : la source de vérité est `SPEC_RULES_v3.md` ; les documents
+antérieurs sont archivés dans `CHANGELOG_REGLES.md`. Suite de non-régression dédiée :
+`backend/test_audit_metriques_v150.py` (52 assertions marquées `[LD-*]` loi /
+`[TD-*]` défaut — moteur pur, juge de validité, géozones, ingestion, API,
+réparation) et sonde `backend/probe_metriques_v150.py` (classement affiché). Les verrous de seuils des
+suites existantes (`test_validite_v15`, `test_reference_v118`,
+`test_ouverture_v19`, `test_affichage_position_v131`,
+`test_positions_tcc_v144`) ont été mis à jour pour porter les valeurs
+P1/P2/P5, avec commentaire de renvoi au présent §.
+
+---
+
 ## CONFORMITÉ
 
 - Règles applicables : §1.1, §5.1, §8, §12.1
@@ -828,8 +876,9 @@ Ces valeurs doivent être stockées dans la table `ParametrageSeuil` et modifiab
 |---|---|
 | TCC | Temps de Conduite Continu (segment sans pause ≥ 30 min) |
 | TCJ | Temps de Conduite Journalier (somme de la conduite pure) |
+| TCI | Temps de Conduite Inter-zones (vocabulaire exploitant) — identique au TCJ dans la nomenclature interne ; exposé par l'API (`tci_s`) pour rendre l'identité « TTJ = TCI + Σ pauses » vérifiable à l'écran comme à l'export (§0duotricies decies) |
 | TTJ | Temps de Travail Journalier (TCJ + tous arrêts/pauses) |
-| Manœuvre | Mouvement < 0,3 km (ignoré) |
+| Manœuvre | Mouvement ignoré : distance **< 0,3 km** (SPEC_RULES_v3 [R-01]/[R-07] — traité comme un ARRÊT, jamais compté ni affiché, conservé pour l'audit). La durée n'entre pas dans la définition : l'essai « < 500 m ou < 300 s » (v1.50, 16/09/2026) a été **retiré le jour même**, la spec primant. |
 | Pause valide | Arrêt de 20–30 min (déduit du TCJ, ne coupe pas TCC) |
 | Pause TCC | Arrêt ≥ 30 min (déduit du TCJ et reset du TCC) |
 | Arrêt | Vitesse ≤ 3 km/h (`SEUIL_VITESSE_ARRET`, §0ter E du 14/08/2026) |

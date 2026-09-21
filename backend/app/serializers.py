@@ -1,16 +1,26 @@
 """Sérialisation des entités vers les réponses JSON de l'API."""
 from datetime import datetime
 
-from .chaines import (ETAT_OFFICIEL, LigneJournee, Segment,
-                      construire_journee)
+from .chaines import (ETAT_OFFICIEL, SEUIL_SILENCE_MUET_S, LigneJournee,
+                      Segment, construire_journee)
 from .config import jour_attribution, now_local
 from .models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
-                     Mission, StatutValidationTrajet, SuiviJournalier, Trajet,
+                     Mission, StatutMission, StatutValidationTrajet, SuiviJournalier, Trajet,
                      Vehicule)
 
 
 def iso(dt):
     return dt.isoformat() if dt else None
+
+
+def fmt_hms_journee(secondes: int | float | None) -> str:
+    """Formatte une durée journalière (00:00 à 24:00 maximum)."""
+    if secondes is None:
+        return "00:00"
+    s = max(0, min(86400, int(secondes)))
+    h = s // 3600
+    m = (s % 3600) // 60
+    return f"{h:02d}:{m:02d}"
 
 
 def fmt_hms(secondes) -> str | None:
@@ -23,6 +33,12 @@ def fmt_hms(secondes) -> str | None:
     return f"{signe}{s // 3600:02d}:{(s % 3600) // 60:02d}"
 
 
+def _enum_val(obj):
+    if obj is None:
+        return None
+    return obj.value if hasattr(obj, "value") else str(obj)
+
+
 def s_conducteur(c: Conducteur | None, court=False):
     if c is None:
         return None
@@ -31,9 +47,16 @@ def s_conducteur(c: Conducteur | None, court=False):
         "nom_prenom": c.nom_prenom,
         "prenom_usuel": c.prenom_usuel,
         "matricule": c.matricule,
+        "nom_normalise": getattr(c, "nom_normalise", None),
+        "tokens_set": getattr(c, "tokens_set", None),
+        "code_badge_mzonex": getattr(c, "code_badge_mzonex", None),
         "telephone": c.telephone,
-        "statut": c.statut.value if c.statut else None,
+        "statut": _enum_val(c.statut),
     }
+    if hasattr(c, "aliases") and c.aliases:
+        d["aliases"] = [{"id": a.id, "alias_brut": a.alias_brut} for a in c.aliases]
+    else:
+        d["aliases"] = []
     if not court:
         d["date_creation"] = iso(c.date_creation)
     return d
@@ -46,7 +69,7 @@ def s_vehicule(v: Vehicule, avec_conducteur=True):
         "description": v.description,
         "marque": v.marque,
         "capacite": v.capacite,
-        "statut": v.statut.value if v.statut else None,
+        "statut": _enum_val(v.statut),
         "gps_associe": v.gps_associe,
         "plateforme_gps": getattr(v, "plateforme_gps", None) or "MZONEX",
         "conducteur_actuel_id": v.conducteur_actuel_id,
@@ -68,12 +91,14 @@ def s_trajet(t: Trajet):
         "heure_fin": iso(t.heure_fin),
         "pause_apres_s": t.pause_apres_s,
         # Addendum v1.4 §3.1 — statut de fiabilité + traçabilité plateforme
-        "statut_source": (t.statut_source.value if t.statut_source else "VALIDÉ"),
+        "statut_source": (_enum_val(t.statut_source) if t.statut_source else "VALIDÉ"),
         "source_plateforme": t.source_plateforme,
         "distance_km": t.distance_km,
         # Addendum v1.5 §7.1 — validité métier (REJETE = jamais dans TCC/TCJ/TTJ)
-        "statut_validation": (t.statut_validation.value
+        "statut_validation": (_enum_val(t.statut_validation)
                               if t.statut_validation else "EN_ATTENTE"),
+        "conducteur_badge": t.conducteur_badge,
+        "conducteur_badge_id": t.conducteur_badge_id,
     }
 
 
@@ -128,14 +153,30 @@ def journee_suivi(s: SuiviJournalier, seuils: dict | None = None,
     OFFICIELLE — jamais de PROVISOIRE dans l'historique."""
     seuils = seuils or {}
     maintenant = maintenant or now_local()
+    # v148 — le test « journée passée » DOIT être évalué AVANT de ramener
+    # `maintenant` à la clôture du jour : sinon `jour_attribution(maintenant)`
+    # == s.date_jour, la condition `s.date_jour < ...` devient fausse, et la
+    # journée passée n'était JAMAIS officialisée (dernière ligne de chaque
+    # journée rendue PROVISOIRE à l'écran, à l'export et dans l'archive,
+    # contre l'Addendum v1.8 §4 / CA-4 et [R-11]).
+    est_jour_passe = bool(s.date_jour and s.date_jour < maintenant.date())
+    if s.date_jour and maintenant.date() > s.date_jour:
+        maintenant = datetime.combine(s.date_jour, datetime.max.time().replace(microsecond=0))
     roule, fin_sub = etat_roulage(s.vehicule, maintenant, seuils)
     journee = construire_journee(
         _segments_de(s), maintenant=maintenant,
+        date_jour=s.date_jour,
         pause_min=float(seuils.get("DUREE_MIN_PAUSE_VALIDE", 1200)),
         seuil_km=float(seuils.get("SEUIL_DISTANCE_MIN_TRAJET_KM", 0.3)),
         roule=roule, fin_substitution=fin_sub,
-        pause_affichee_min=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC", 1800)))
-    if s.date_jour and s.date_jour < jour_attribution(maintenant):
+        # v1.52 — seuil d'AFFICHAGE, distinct du seuil MOTEUR de coupure du TCC
+        pause_affichee_min=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN", 1800)),
+        # v1.48 — compteurs bornés à la dernière preuve : `fin_sub` est le
+        # dernier événement GPS connu du véhicule (None si jamais vu).
+        derniere_trace=fin_sub,
+        seuil_silence_s=float(seuils.get("SEUIL_GPS_HORS_LIGNE",
+                                         SEUIL_SILENCE_MUET_S)))
+    if est_jour_passe:
         for lg in journee.lignes:
             lg.etat = ETAT_OFFICIEL
     return journee
@@ -159,6 +200,8 @@ def s_ligne(lg: LigneJournee, numero: int):
         "source_plateforme": getattr(ref, "source_plateforme", None),
         "distance_km": lg.distance_km,
         "statut_validation": "VALIDE" if officielle else "EN_ATTENTE",
+        "conducteur_badge": getattr(ref, "conducteur_badge", None),
+        "conducteur_badge_id": getattr(ref, "conducteur_badge_id", None),
         # information de transparence (modale « tous les trajets »)
         "segments": lg.nb_segments,
     }
@@ -175,7 +218,9 @@ def s_ligne(lg: LigneJournee, numero: int):
 # seuils (`SEUIL_FUSION_AFFICHAGE_S`) ; la constante ci-dessous est le repli
 # utilisé aussi pour la relecture des archives (sans session/seuils à portée).
 FUSION_AFFICHAGE_S = 1800.0    # §0tricies decies G1 : rupture < 30 min → UNE ligne
-# Seuil d'affichage des pauses : 30 min, inchangé (`SEUIL_PAUSE_COUPURE_TCC`)
+# Seuil d'affichage des pauses : 30 min — repli de `SEUIL_AFFICHAGE_PAUSE_MIN`
+# (v1.52 : réglage PROPRE à l'affichage, distinct de `SEUIL_PAUSE_COUPURE_TCC`
+# qui coupe le TCC côté moteur ; sert à la relecture d'archives, sans seuils).
 PAUSE_AFFICHAGE_S = 1800.0
 
 
@@ -188,12 +233,24 @@ def _dt_iso(texte) -> datetime | None:
         return None
 
 
+# ============================================================================
+# v1.54/P3 (18/09/2026) — VERSION DE SCHÉMA D'ARCHIVE
+# 0 = archive ANTÉRIEURE (aucune version inscrite, compteurs distincts absents)
+# 1 = v1.53 (compteurs distincts, pas de version inscrite)
+# 2 = v1.54 (version inscrite + garde-fous P1/P3)
+# Une archive sans version n'est JAMAIS lue comme si ses champs absents valaient
+# zéro : la lecture est rétrocompatible, elle DIT ce qu'elle reconstruit et
+# marque l'archive « à recalculer ».
+# ============================================================================
+ARCHIVE_SCHEMA_VERSION = 2
+
+
 def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAGE_S,
                                 seuil_pause_aff_s: float = PAUSE_AFFICHAGE_S) -> list[dict]:
     """§0undecies E1, amendée §0tricies decies G1/G2 (E3 abrogée le 25/08/2026)
     — deux lignes séparées par un arrêt STRICTEMENT < `seuil_fusion_s`
     (désormais 30 min) sont affichées comme UNE seule ligne (« sans bonder
-    les colonnes ») :
+    les colonnes ») pour un MÊME chauffeur :
 
     début = début de la 1re composante ; fin = fin de la dernière (vide si
     en cours) ; statut/couleur = ceux de la dernière composante ; distance =
@@ -210,12 +267,41 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     for t in (trajets or []):
         nt = dict(t)
         deb, fin = _dt_iso(nt.get("heure_debut")), _dt_iso(nt.get("heure_fin"))
+        # Correctif v1.46 (constat 4866TBU du 04/09/2026) : un badge ABSENT d'un
+        # côté ne prouve PAS un changement de chauffeur (trou d'attribution N1) —
+        # il ne doit pas empêcher la fusion G1 (rupture < 30 min → UNE ligne).
+        # Avant : `meme_chauffeur` exigeait l'égalité des deux badges → deux
+        # lignes séparées par une case pause vide, contre la règle G1.
+        b1 = res[-1].get("conducteur_badge_id") if res else None
+        b2 = nt.get("conducteur_badge_id")
+        meme_chauffeur = bool(res and (b1 is None or b2 is None or b1 == b2))
+        # §0undecies E1 FIX v147 — un même camion ne peut pas rouler 2 trajets
+        # en même temps : un chevauchement temporel (début < fin de la ligne
+        # précédente) est fusionné MÊME si le badge chauffeur diffère (le badge
+        # est une attribution, pas une preuve de 2 trajets simultanés).
+        chevauche = bool(
+            res and deb is not None and res[-1]["_fin_dt"] is not None
+            and deb < res[-1]["_fin_dt"]
+        )
         if (res and deb is not None and res[-1]["_fin_dt"] is not None
-                and (deb - res[-1]["_fin_dt"]).total_seconds() < seuil_fusion_s):
-            # rupture courte → absorbée dans la ligne précédente
+                and (chevauche
+                     or (meme_chauffeur
+                         and (deb - res[-1]["_fin_dt"]).total_seconds()
+                         < seuil_fusion_s))):
+            # fusion : rupture courte (même chauffeur) OU chevauchement
+            # temporel (règle AM-6 : un même instant ne peut pas être deux
+            # trajets d'un même camion — on fusionne même si le badge diffère).
             m = res[-1]
-            m["heure_fin"] = nt.get("heure_fin")
-            m["_fin_dt"] = fin
+            # fin = UNION des deux (la plus tardive ; vide si une ligne en
+            # cours) — on conserve la CHAÎNE ISO d'origine, jamais un datetime.
+            if fin is not None and m["_fin_dt"] is not None:
+                if fin > m["_fin_dt"]:
+                    m["_fin_dt"] = fin
+                    m["heure_fin"] = nt.get("heure_fin")
+                # sinon la ligne précédente est déjà la plus tardive → intacte
+            elif fin is None:
+                m["heure_fin"] = None
+                m["_fin_dt"] = None
             m["statut_source"] = nt.get("statut_source")
             m["statut_validation"] = nt.get("statut_validation")
             d1, d2 = m.get("distance_km"), nt.get("distance_km")
@@ -241,21 +327,91 @@ def fusionner_trajets_affichage(trajets, seuil_fusion_s: float = FUSION_AFFICHAG
     return res
 
 
-def fusionner_snapshot(donnees: dict | None) -> dict:
+def snapshot_canonique(s: SuiviJournalier, seuils: dict | None = None) -> dict:
+    """Snapshot d'archive CANONIQUE (v1.53, 18/09/2026) — FABRIQUE UNIQUE des
+    trois chemins d'écriture (`daily.archiver_jour`,
+    `daily.recalculer_archives_journee`, `reconciliation._synchroniser_archive`).
+
+    Contrat unique, vérifié par `test_coherence_archives_v153.py` :
+      • `trajets` = trajets valides BRUTS, **individuellement** conservés
+        (le regroupement est une projection d'affichage, jamais une écriture) ;
+      • `nb_trajets_valides_reels` = nombre de trajets valides en base ;
+      • `nb_sequences_affichees` = `nb_trajets` = lignes réellement rendues ;
+      • `nb_trajets_fusionnes` = trajets absorbés par le regroupement.
+    Les compteurs viennent de la vue d'affichage (`s_suivi`) et les trajets de
+    la journée chaînée : une seule source, deux projections explicites.
+    """
+    seuils = seuils or {}
+    d = s_suivi(s, seuils)                       # vue d'affichage (fusionnée)
+    nb_sequences = int(d.get("nb_sequences_affichees")
+                       or len(d.get("trajets") or []))
+    journee = journee_suivi(s, seuils)
+    bruts = [s_ligne(lg, i) for i, lg in enumerate(journee.lignes, start=1)]
+    d["trajets"] = bruts                          # BRUTS, jamais fusionnés
+    d["nb_trajets_valides_reels"] = len(bruts)
+    d["nb_sequences_affichees"] = nb_sequences
+    d["nb_trajets"] = nb_sequences
+    d["nb_trajets_fusionnes"] = max(0, len(bruts) - nb_sequences)
+    d["schema_version"] = ARCHIVE_SCHEMA_VERSION     # v1.54/P3 — traçabilité
+    return d
+
+
+def compter_trajets_reels(trajets: list[dict] | None) -> int:
+    """Nombre de trajets valides RÉELS représentés par une liste de lignes —
+    fusionnée ou non (v1.53, 18/09/2026).
+
+    `fusionner_trajets_affichage` pose sur chaque séquence la clé `segments` =
+    nombre de trajets valides absorbés ; une ligne non fusionnée vaut 1. Cette
+    fonction est la SEULE façon de retrouver le réel à partir de la vue
+    d'affichage — y compris pour les archives écrites avant v1.53 (dont le
+    snapshot ne porte pas encore `nb_trajets_valides_reels`)."""
+    return sum(max(1, int(t.get("segments") or 1)) for t in (trajets or []))
+
+
+def fusionner_snapshot(donnees: dict | None, seuils: dict | None = None) -> dict:
     """Copie d'un snapshot (s_suivi / archive) avec trajets fusionnés E1 —
     jamais de mutation de `donnees` (les archives ne sont pas réécrites).
-    §0vicies decies N1 (31/08/2026) : un snapshot est par construction une
-    journée TERMINÉE → le TCC y est masqué (« 0:00 » ; chrono temps réel sans
-    sens une fois la journée closes). Copie seulement : la valeur interne
-    reste stockée dans l'archive pour la contre-vérification (§A.2 respecté,
-    jamais de réécriture)."""
+
+    v1.52 (18/09/2026) — CORRECTIF : cette fonction REMETTAIT `tcc_s` à zéro
+    (règle N1 « TCC masqué hors temps réel »). Un sérialiseur ne doit JAMAIS
+    détruire une valeur calculée : le masquage est une décision d'AFFICHAGE.
+    La valeur RÉELLE est désormais conservée et le drapeau `tcc_masque`
+    (journée terminée → cellule « 0:00 » à l'écran) porte l'intention
+    d'affichage. Export, contre-vérification et audit gardent la vraie valeur.
+
+    `seuils` (optionnel) : réglages courants pour la fusion d'affichage ;
+    sans eux, les constantes de repli s'appliquent (relecture d'archive)."""
     d = dict(donnees or {})
+    seuils = seuils or {}
     bruts = d.get("trajets") or []
     if bruts:
-        fusionnes = fusionner_trajets_affichage(bruts)
+        fusionnes = fusionner_trajets_affichage(
+            bruts,
+            seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S",
+                                            FUSION_AFFICHAGE_S)),
+            seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN",
+                                               PAUSE_AFFICHAGE_S)))
         d["trajets"] = fusionnes
+        # v1.53 (18/09/2026) — TROIS COMPTEURS DISTINCTS (arbitrage LSS) :
+        # `nb_trajets` ne porte plus qu'UNE signification, partout (écran,
+        # export, archive) = le nombre de SÉQUENCES affichées ; le réel et les
+        # absorbés sont exposés séparément. Recalculés ici depuis `segments`,
+        # ils sont donc corrects même pour les archives antérieures à v1.53.
+        _reels = compter_trajets_reels(fusionnes)
         d["nb_trajets"] = len(fusionnes)
-    d["tcc_s"] = 0   # N1 — TCC masqué hors temps réel (cellule « 0:00 »)
+        d["nb_sequences_affichees"] = len(fusionnes)
+        d["nb_trajets_valides_reels"] = _reels
+        d["nb_trajets_fusionnes"] = max(0, _reels - len(fusionnes))
+    else:
+        # v1.54/P3 — aucune ligne exploitable (archive ancienne ou journée sans
+        # trajet) : on ne complète QUE ce qui est connu. Un champ ABSENT reste
+        # ABSENT (None), jamais 0 : « je ne sais pas » n'est pas « zéro trajet ».
+        if d.get("nb_trajets") is not None:
+            d.setdefault("nb_sequences_affichees", d.get("nb_trajets"))
+        d.setdefault("nb_trajets_valides_reels", None)
+        d.setdefault("nb_trajets_fusionnes", None)
+    # N1 — l'affichage masque le TCC d'une journée close, la DONNÉE reste intacte.
+    d["tcc_masque"] = True
     return d
 
 
@@ -270,23 +426,41 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         [s_ligne(lg, i) for i, lg in enumerate(journee.lignes, start=1)],
         seuil_fusion_s=float(seuils.get("SEUIL_FUSION_AFFICHAGE_S",
                                         FUSION_AFFICHAGE_S)),
-        seuil_pause_aff_s=float(seuils.get("SEUIL_PAUSE_COUPURE_TCC",
+        seuil_pause_aff_s=float(seuils.get("SEUIL_AFFICHAGE_PAUSE_MIN",
                                            PAUSE_AFFICHAGE_S)))
-    tcc_max = seuils.get("SEUIL_TCC_MAX", 16200)
-    tcj_max = seuils.get("SEUIL_TCJ_MAX", 36000)
-    ttj_max = seuils.get("SEUIL_TTJ_MAX", 43200)
+    tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+    if tcc_max <= 24:
+        tcc_max *= 3600
+    tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+    if tcj_max <= 24:
+        tcj_max *= 3600
+    ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+    if ttj_max <= 24:
+        ttj_max *= 3600
+
+    tcj_val = min(86400, max(0, journee.tcj_s if (journee and journee.tcj_s is not None) else (s.tcj_s or 0)))
+    ttj_val = min(86400, max(0, journee.ttj_s if (journee and journee.ttj_s is not None) else (s.ttj_s or 0)))
+    if ttj_val < tcj_val:
+        ttj_val = tcj_val
+    tcc_val = min(86400, max(0, s.tcc_s or 0))
+    pause_val = max(0, ttj_val - tcj_val)
+
     return {
         "id": s.id,
         "date_jour": s.date_jour.isoformat(),
         # Partie A
         "vehicule_id": s.vehicule_id,
         "plaque": s.vehicule.plaque if s.vehicule else None,
+        # v1.48 — portail d'appartenance : l'écran distingue ainsi « boîtier
+        # muet » (données en transit) d'une SOURCE EN PANNE (cf. /api/sante).
+        "plateforme_gps": (s.vehicule.plateforme_gps if s.vehicule else None),
         "description": s.vehicule.description if s.vehicule else None,
         "conducteur_id": s.conducteur_id,
         "conducteur": s_conducteur(s.conducteur, court=True),
+        "conducteur_origine": getattr(s, "conducteur_origine", None),
         # Partie B
         "situation": s.situation,
-        "statut_camion": s.statut_camion.value if s.statut_camion else None,
+        "statut_camion": _enum_val(s.statut_camion),
         "depot_recepteur": s.depot_recepteur,
         "distributeur": s.distributeur,
         "produit": s.produit,
@@ -310,44 +484,113 @@ def s_suivi(s: SuiviJournalier, seuils: dict | None = None):
         # Addendum v1.9 §4.2 — colonne « Lieu Arrêt » : lieu du dernier arrêt
         # (journée en cours = dernière position connue ; figée à l'archivage)
         "lieu_arret": (s.vehicule.last_adresse if s.vehicule else None),
-        "tcc_s": s.tcc_s, "tcj_s": s.tcj_s, "ttj_s": s.ttj_s,
-        "total_pause_s": s.total_pause_s,
+        "tcc_s": tcc_val, "tcj_s": tcj_val, "ttj_s": ttj_val,
+        "total_pause_s": pause_val,
         "km_parcourus": round(s.km_parcourus or 0, 1),
         # v1.13 — CONTRAT GRILLE STRICT : la grille affiche les LIGNES de la
         # journée chaînée — écran = export = archive, une seule source.
         # §0undecies E1 (24/08/2026) : fusion d'AFFICHAGE des ruptures < 20 min
         # (« sans bonder les colonnes » ; compteurs AM-1/TCC intacts, E2).
         "trajets": lignes_json,
+        # v1.53 (18/09/2026) — compteurs DISTINCTS (arbitrage LSS du 18/09) :
+        #   nb_trajets_valides_reels = trajets valides en BASE (distance ≥ 0,3 km)
+        #   nb_sequences_affichees   = lignes réellement rendues (après regroupement)
+        #   nb_trajets_fusionnes     = trajets valides absorbés par le regroupement
+        # `nb_trajets` garde UN SEUL sens : c'est le nombre de séquences
+        # affichées (identique à `nb_sequences_affichees`), donc identique en
+        # base, à l'écran et à l'export.
         "nb_trajets": len(lignes_json),
+        "nb_sequences_affichees": len(lignes_json),
+        "nb_trajets_valides_reels": compter_trajets_reels(lignes_json),
+        "nb_trajets_fusionnes": max(
+            0, compter_trajets_reels(lignes_json) - len(lignes_json)),
         "mission_id": s.mission_id,
         # drapeaux de dépassement (pour coloration frontend)
-        "flag_tcc": bool(s.tcc_s and s.tcc_s > tcc_max),
-        "flag_tcj": bool(s.tcj_s and s.tcj_s > tcj_max),
-        "flag_ttj": bool(s.ttj_s and s.ttj_s > ttj_max),
+        "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
+        "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
+        # v1.53 — seuil TTJ INCLUSIF (clarification 18/09 : « TTJ >= 12:00 ») :
+        # 12:00:00 PILE est signalé. TTJ_MAX reste un SEUIL, jamais un plafond.
+        "flag_ttj": bool(ttj_val is not None and ttj_val >= ttj_max),
         "updated_at": iso(s.updated_at),
     }
 
 
-def s_mission(m: Mission):
+def s_mission(m: Mission, nb_infractions: int | None = None):
+    code = getattr(m, "code_mission", None)
+    if not code:
+        if m.numero_ot and m.numero_ot.strip():
+            ot = m.numero_ot.strip()
+            if ot.upper().startswith("OT-") or ot.upper().startswith("OT_"):
+                code = f"MIS-{ot.upper()}"
+            elif ot.upper().startswith("MIS-"):
+                code = ot.upper()
+            else:
+                code = f"MIS-OT-{ot}"
+        else:
+            d_str = m.date_jour.strftime("%Y%m%d") if m.date_jour else "20260903"
+            code = f"MIS-{d_str}-{m.numero_mission_du_jour:02d}"
+
+    km_v = getattr(m, "km_vide", 0.0) or 0.0
+    km_c = getattr(m, "km_charge", 0.0) or 0.0
+    km_tot = getattr(m, "kilometrage_total", 0.0) or (m.kilometrage or 0.0) or (km_v + km_c)
+    if km_tot > 0 and km_v == 0.0 and km_c == 0.0:
+        if getattr(m, "statut_camion_actuel", "VIDE") == "CHARGE":
+            km_c = km_tot
+        else:
+            km_v = km_tot
+
+    if nb_infractions is None:
+        if hasattr(m, "infractions") and m.infractions:
+            nb_infractions = len([i for i in m.infractions if getattr(i, "validation", "") != "INVALIDE"])
+        else:
+            nb_infractions = 0
+
+    depot_prev = getattr(m, "depot_prevu", None) or m.depot
+    depot_eff = getattr(m, "depot_effectif", None) or depot_prev
+
+    duree = m.duree_s or 0
+    if duree == 0 and m.heure_debut and not m.heure_fin and m.statut in (StatutMission.EN_COURS, StatutMission.DEVIEE, StatutMission.RETARDEE):
+        duree = max(0, int((now_local() - m.heure_debut).total_seconds()))
+
     return {
         "id": m.id,
-        "date_jour": m.date_jour.isoformat(),
+        "code_mission": code,
+        "date_jour": m.date_jour.isoformat() if m.date_jour else None,
         "conducteur_id": m.conducteur_id,
-        "conducteur": s_conducteur(m.conducteur, court=True),
+        "conducteur": s_conducteur(m.conducteur, court=True) if m.conducteur else None,
         "vehicule_id": m.vehicule_id,
         "plaque": m.vehicule.plaque if m.vehicule else None,
         "numero_mission_du_jour": m.numero_mission_du_jour,
-        "statut": m.statut.value if m.statut else None,
+        "statut": m.statut.value if hasattr(m.statut, "value") else str(m.statut),
+        "statut_camion_actuel": getattr(m, "statut_camion_actuel", "LIBRE") or "LIBRE",
         "heure_debut": iso(m.heure_debut),
+        "date_debut": iso(m.heure_debut),
+        "heure_chargement": iso(getattr(m, "heure_chargement", None)),
+        "date_chargement": iso(getattr(m, "heure_chargement", None)),
         "heure_fin": iso(m.heure_fin),
-        "duree_s": m.duree_s,
+        "date_fin": iso(m.heure_fin),
+        "duree_s": duree,
         "numero_ot": m.numero_ot,
         "produit": m.produit,
-        "depot": m.depot,
+        "depot": depot_prev,
+        "depot_prevu": depot_prev,
+        "depot_effectif": depot_eff,
+        "est_deviee": bool(getattr(m, "est_deviee", False)),
+        "motif_deviation": getattr(m, "motif_deviation", None),
+        "validation_chargement": getattr(m, "validation_chargement", "EN_ATTENTE") or "EN_ATTENTE",
+        "validation_dechargement": getattr(m, "validation_dechargement", "EN_ATTENTE") or "EN_ATTENTE",
+        "motif_invalidation": getattr(m, "motif_invalidation", None),
+        "est_repositionnement": bool(getattr(m, "est_repositionnement", False)),
         "distributeur": m.distributeur,
-        "kilometrage": round(m.kilometrage or 0, 1),
+        "km_vide": round(km_v, 1),
+        "km_charge": round(km_c, 1),
+        "kilometrage": round(km_tot, 1),
+        "kilometrage_total": round(km_tot, 1),
+        "nb_infractions": nb_infractions,
         "origine": m.origine,
         "etapes": m.etapes or [],
+        "created_at": iso(m.created_at),
+        "updated_at": iso(m.updated_at),
     }
 
 
@@ -405,12 +648,12 @@ def s_infraction(i: Infraction):
         "vehicule_id": i.vehicule_id,
         "plaque": i.vehicule.plaque if i.vehicule else None,
         "type": type_v,
-        "gravite": i.gravite.value if i.gravite else None,
+        "gravite": _enum_val(i.gravite),
         "duree_s": i.duree_s,
         "valeur_mesuree": i.valeur_mesuree,
         "seuil_reference": i.seuil_reference,
         "mission_id": i.mission_id,
-        "source": i.source.value if i.source else None,
+        "source": _enum_val(i.source),
         "latitude": i.latitude, "longitude": i.longitude,
         "adresse": i.adresse,
         # --- I3/I4 (v1.35)
@@ -432,24 +675,78 @@ def s_alerte(a: Alerte):
     return {
         "id": a.id,
         "date_heure": iso(a.date_heure),
-        "type": a.type.value if a.type else None,
-        "gravite": a.gravite.value if a.gravite else None,
+        "type": _enum_val(a.type),
+        "gravite": _enum_val(a.gravite),
         "vehicule_id": a.vehicule_id,
         "plaque": a.vehicule.plaque if a.vehicule else None,
         "conducteur_id": a.conducteur_id,
         "conducteur": s_conducteur(a.conducteur, court=True),
         "message": a.message,
-        "statut": a.statut.value if a.statut else None,
+        "statut": _enum_val(a.statut),
         "lien_module": a.lien_module,
         "infraction_id": a.infraction_id,
     }
 
 
-def s_historique(h: HistoriqueJournalier, detail=False):
+def s_historique(h: HistoriqueJournalier, detail=False, seuils: dict | None = None):
     # §0undecies E1 — la MÊME fusion d'affichage s'applique aux snapshots
     # d'archive (dont ceux d'avant v1.31, stockés non fusionnés) : copie,
     # jamais de mutation ; aucune archive n'est réécrite (§A.2).
-    d = fusionner_snapshot(h.donnees)
+    # v1.52 (18/09/2026) : `seuils` transmet les réglages COURANTS (fusion et
+    # pause d'affichage) au lieu des constantes de repli pour la relecture
+    # d'archive (règles 5 et 6 : un seuil d'AFFICHAGE ne se fige pas dans le code).
+    d = fusionner_snapshot(h.donnees, seuils)
+    seuils = seuils or {}
+    tcj_max = float(seuils.get("SEUIL_TCJ_MAX", 36000))
+    ttj_max = float(seuils.get("SEUIL_TTJ_MAX", 43200))
+    tcc_max = float(seuils.get("SEUIL_TCC_MAX", 16200))
+    tcc_val = min(86400, max(0, int(d.get("tcc_s") or d.get("tcc_secondes") or 0)))
+    # v1.53 — PLAFOND TECHNIQUE 24 h, RENDU VISIBLE : une valeur d'archive
+    # supérieure à 86 400 s est anormale (aucune journée civile ne peut la
+    # produire). Elle est ramenée à la borne pour l'affichage — sans jamais
+    # réécrire l'archive — et le fait est DÉCLARÉ au client pour que
+    # l'anomalie ne disparaisse pas silencieusement d'un rapport.
+    # ── v1.54/P3 — compteurs d'archive : source, reconstruction, statut ──
+    _brut = dict(h.donnees or {})            # archive TELLE QU'ÉCRITE
+    _schema_archive = int(_brut.get("schema_version") or 0)
+    _trajets_arch = list(_brut.get("trajets") or [])
+    _reels_stocke = _brut.get("nb_trajets_valides_reels")
+    _seq_stockee = _brut.get("nb_sequences_affichees")
+    _source_compteurs, _a_recalculer = "ARCHIVE", False
+    if _reels_stocke is not None or _seq_stockee is not None:
+        _reels_compteurs = (_reels_stocke if _reels_stocke is not None
+                            else compter_trajets_reels(_trajets_arch))
+        _seq_compteurs = (_seq_stockee if _seq_stockee is not None
+                          else (_brut.get("nb_trajets")
+                                if _brut.get("nb_trajets") is not None
+                                else len(_trajets_arch)))
+        _a_recalculer = _schema_archive < ARCHIVE_SCHEMA_VERSION
+    elif _trajets_arch:
+        _source_compteurs = "RECONSTRUIT"
+        _a_recalculer = True                    # archive antérieure à la v1.53
+        _reels_compteurs = compter_trajets_reels(_trajets_arch)
+        _seq_compteurs = len(fusionner_trajets_affichage(
+            _trajets_arch,
+            seuil_fusion_s=float((seuils or {}).get("SEUIL_FUSION_AFFICHAGE_S",
+                                                    FUSION_AFFICHAGE_S)),
+            seuil_pause_aff_s=float((seuils or {}).get("SEUIL_AFFICHAGE_PAUSE_MIN",
+                                                       PAUSE_AFFICHAGE_S))))
+    else:
+        # Aucune donnée : on PRÉTEND ne rien savoir — jamais « zéro trajet ».
+        _source_compteurs = "INDISPONIBLE"
+        _a_recalculer = True
+        _reels_compteurs = _seq_compteurs = None
+    _fusionnes_compteurs = (max(0, _reels_compteurs - _seq_compteurs)
+                            if (_reels_compteurs is not None
+                                and _seq_compteurs is not None) else None)
+
+    _tcj_brut = int(d.get("tcj_s") or d.get("tcj_secondes") or 0)
+    _ttj_brut = int(d.get("ttj_s") or d.get("ttj_secondes") or _tcj_brut)
+    tcj_val = min(86400, max(0, _tcj_brut))
+    ttj_val = min(86400, max(0, _ttj_brut))
+    if ttj_val < tcj_val:
+        ttj_val = tcj_val
+    pause_val = max(0, min(86400, int(d.get("total_pause_s") or d.get("pauses_secondes") or (ttj_val - tcj_val))))
     out = {
         "id": h.id,
         "date_jour": h.date_jour.isoformat(),
@@ -464,13 +761,61 @@ def s_historique(h: HistoriqueJournalier, detail=False):
         "numero_ot": d.get("numero_ot"),
         "heure_depart": d.get("heure_depart"),
         "arret_final": d.get("arret_final"),
-        "km_parcourus": d.get("km_parcourus"),
-        "tcc_s": d.get("tcc_s"), "tcj_s": d.get("tcj_s"), "ttj_s": d.get("ttj_s"),
-        "nb_trajets": d.get("nb_trajets"),
+        "km_parcourus": round(d.get("km_parcourus") or 0, 1),
+        # v1.52 (18/09/2026) — CORRECTIF : ce sérialiseur REMETTAIT `tcc_s`
+        # à zéro (règle N1 du 31/08/2026). Un sérialiseur ne détruit JAMAIS une
+        # valeur calculée : la donnée (contre-vérification, audit) est conservée
+        # et le masquage « 0:00 » devient un DRAPEAU de rendu (`tcc_masque`),
+        # appliqué par l'écran (Historique.tsx / GrilleSuivi) et par l'export.
+        "tcc_s": tcc_val,
+        "tcc_secondes": tcc_val,
+        "tcc_masque": True,
+        "tcj_s": tcj_val,
+        "tcj_secondes": tcj_val,
+        "tcj_str": fmt_hms_journee(tcj_val),
+        "ttj_s": ttj_val,
+        "ttj_secondes": ttj_val,
+        "ttj_str": fmt_hms_journee(ttj_val),
+        "total_pause_s": pause_val,
+        "total_pause_str": fmt_hms_journee(pause_val),
+        "trajets": d.get("trajets") or [],
+        # v1.53 — mêmes compteurs distincts qu'au suivi (un seul sens partagé)
+        # v1.54/P3 — LECTURE RÉTROCOMPATIBLE : un champ ABSENT n'est JAMAIS
+        # interprété comme zéro. `compteurs_source` dit d'où vient le chiffre
+        # (ARCHIVE = écrit par la v1.53+ ; RECONSTRUIT = recalculé à la lecture
+        # depuis les lignes stockées ; INDISPONIBLE = aucune donnée, donc None
+        # et non 0) et `a_recalculer` signale les archives à reprendre — sans
+        # jamais les réécrire (aucun mode apply automatique, P3).
+        "nb_trajets": _seq_compteurs,
+        "nb_sequences_affichees": _seq_compteurs,
+        "nb_trajets_valides_reels": _reels_compteurs,
+        "nb_trajets_fusionnes": _fusionnes_compteurs,
+        "schema_version": _schema_archive,
+        "compteurs_source": _source_compteurs,
+        "a_recalculer": _a_recalculer,
         "nb_infractions": h.nb_infractions,
         "nb_alertes": h.nb_alertes,
+        # drapeaux de dépassement (v1.52 : calculés sur la valeur RÉELLE,
+        # comme s_suivi — un drapeau n'a de sens que si la valeur existe)
+        # v1.53 — signale qu'une valeur > 24 h a été ramenée à la borne
+        # technique (donnée anormale ; l'archive n'est PAS réécrite).
+        "plafond_24h_applique": bool(_tcj_brut > 86400 or _ttj_brut > 86400),
+        "flag_tcj": bool(tcj_val and tcj_val > tcj_max),
+        # v1.53 — seuil TTJ INCLUSIF (clarification 18/09 : « TTJ >= 12:00 ») :
+        # 12:00:00 PILE est signalé. TTJ_MAX reste un SEUIL, jamais un plafond.
+        "flag_ttj": bool(ttj_val is not None and ttj_val >= ttj_max),
+        "flag_tcc": bool(tcc_val and tcc_val > tcc_max),
         "archive_le": iso(h.archive_le),
     }
     if detail:
-        out["donnees"] = d
+        d_out = dict(d)
+        d_out["tcj_s"] = tcj_val
+        d_out["tcj_secondes"] = tcj_val
+        d_out["tcj_str"] = fmt_hms_journee(tcj_val)
+        d_out["ttj_s"] = ttj_val
+        d_out["ttj_secondes"] = ttj_val
+        d_out["ttj_str"] = fmt_hms_journee(ttj_val)
+        d_out["total_pause_s"] = pause_val
+        d_out["total_pause_str"] = fmt_hms_journee(pause_val)
+        out["donnees"] = d_out
     return out

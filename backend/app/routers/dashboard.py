@@ -1,4 +1,5 @@
 """Module 1 — Dashboard : KPI, cartes, graphiques (lecture agrégée §6.1)."""
+import logging
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 
@@ -8,11 +9,12 @@ from sqlalchemy.orm import Session
 
 from ..config import now_local
 from ..database import get_db
-from ..models import (Alerte, Conducteur, HistoriqueJournalier, Infraction,
+from ..models import (Alerte, Conducteur, EvenementGPS, HistoriqueJournalier, Infraction,
                       Mission, StatutAlerte, StatutCamion, StatutMission,
                       StatutVehicule, SuiviJournalier, Vehicule)
 from ..security import TOUS, require_roles
 
+log = logging.getLogger("lss.dashboard")
 router = APIRouter(prefix="/api", tags=["dashboard"])
 
 
@@ -32,8 +34,11 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
                                .where(Vehicule.statut == StatutVehicule.ACTIF)) or 0
     missions_jour = db.scalars(select(Mission).where(Mission.date_jour == aujourd)).all()
     missions_en_cours = sum(1 for m in missions_jour if m.statut == StatutMission.EN_COURS)
+    missions_deviees = sum(1 for m in missions_jour if m.statut == StatutMission.DEVIEE or getattr(m, "est_deviee", False))
     missions_retardees = sum(1 for m in missions_jour if m.statut == StatutMission.RETARDEE)
     missions_terminees = sum(1 for m in missions_jour if m.statut == StatutMission.TERMINEE)
+    km_vide_jour = round(sum(getattr(m, "km_vide", 0.0) or 0.0 for m in missions_jour), 1)
+    km_charge_jour = round(sum(getattr(m, "km_charge", 0.0) or 0.0 for m in missions_jour), 1)
 
     # v3 AM-5/C3 (22/08/2026) : seules les infractions d'une plateforme EXTERNE
     # comptent — comme l'onglet Infractions (vitre en attente de source : 0)
@@ -129,13 +134,48 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
                            for s in suivis}
     conducteur_par_vehicule = {s.vehicule_id: s.conducteur.prenom_usuel if s.conducteur else None
                                for s in suivis}
-    for v in db.scalars(select(Vehicule).where(Vehicule.last_lat.isnot(None))).all():
+    for v in db.scalars(select(Vehicule).where(Vehicule.statut == StatutVehicule.ACTIF)).all():
+        lat = v.last_lat
+        lng = v.last_lng
+        adresse = v.last_adresse
+        maj = v.last_event_at
+        vitesse = v.last_vitesse or 0.0
+        moteur = v.moteur_on
+
+        if lat is None or lng is None:
+            # Fallback vers le dernier événement GPS connu historique
+            try:
+                dernier_ev = db.execute(
+                    select(EvenementGPS.latitude, EvenementGPS.longitude, EvenementGPS.adresse,
+                           EvenementGPS.horodatage, EvenementGPS.vitesse)
+                    .where(EvenementGPS.vehicule_id == v.id, EvenementGPS.latitude.isnot(None))
+                    .order_by(EvenementGPS.horodatage.desc())
+                    .limit(1)
+                ).first()
+                if dernier_ev:
+                    lat = dernier_ev.latitude
+                    lng = dernier_ev.longitude
+                    adresse = dernier_ev.adresse or v.last_adresse
+                    maj = dernier_ev.horodatage
+                    vitesse = dernier_ev.vitesse or 0.0
+                    moteur = False if (vitesse or 0.0) <= 1 else bool(v.moteur_on)
+            except Exception:
+                log.debug("Fallback position pour %s ignoré", v.plaque)
+
+        # Si toujours None, positionner par défaut à la Base Tana LSS (stationné)
+        if lat is None or lng is None:
+            lat = -18.9537
+            lng = 47.5449
+            adresse = "Base LSS Antananarivo (Stationné)"
+            vitesse = 0.0
+            moteur = False
+
         positions.append({
             "vehicule_id": v.id, "plaque": v.plaque,
-            "lat": v.last_lat, "lng": v.last_lng,
-            "vitesse": v.last_vitesse, "adresse": v.last_adresse,
-            "moteur": v.moteur_on, "maj": v.last_event_at.isoformat() if v.last_event_at else None,
-            "statut_camion": statut_par_vehicule.get(v.id),
+            "lat": lat, "lng": lng,
+            "vitesse": vitesse, "adresse": adresse or "Position enregistrée",
+            "moteur": moteur, "maj": maj.isoformat() if maj else None,
+            "statut_camion": statut_par_vehicule.get(v.id) or "LIBRE",
             "conducteur": conducteur_par_vehicule.get(v.id),
         })
 
@@ -148,8 +188,11 @@ def dashboard(db: Session = Depends(get_db), _=Depends(require_roles(*TOUS))):
             "charges": par_statut.get("CHARGÉ", 0),
             "non_renseignes": par_statut.get("NON_RENSEIGNÉ", 0),
             "missions_en_cours": missions_en_cours,
+            "missions_deviees": missions_deviees,
             "missions_retardees": missions_retardees,
             "missions_terminees": missions_terminees,
+            "km_vide_jour": km_vide_jour,
+            "km_charge_jour": km_charge_jour,
             "infractions_jour": infractions_jour,
             "infractions_mois": infractions_mois,
             "alertes_non_vues": alertes_non_vues,

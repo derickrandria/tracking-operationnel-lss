@@ -16,6 +16,7 @@ Exécution (TOUJOURS sur une base de test !) :
   DATABASE_URL="sqlite:////tmp/test_v130.db" SIM_ENABLE=0 python3 test_reparation_v130.py
 La base est SUPPRIMÉE à la fin (protection des données production).
 """
+import json
 import os
 os.environ.setdefault("SIM_ENABLE", "0")
 import sys
@@ -23,8 +24,10 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 
+from app.serializers import s_historique
 from app.database import SessionLocal
 from app import daily, engine, reparation
+from app.engine import get_seuils
 from app.models import (Alerte, AuditLog, EvenementGPS, HistoriqueJournalier,
                         Infraction, Mission, StatutSourceTrajet,
                         StatutValidationTrajet, SuiviJournalier, Trajet,
@@ -208,10 +211,16 @@ def _pannes(jour):
 
 daily._trajets_reels_du_jour = _pannes
 daily.executer_cycle_quotidien(J3, J3 + timedelta(days=1))
+# v1.51 (exigence 5) — la dérogation D4 « minuit n'attend pas » est REMPLACÉE :
+# la journée se ferme (23:59:59) mais l'archive est DIFFÉRÉE tant qu'une source
+# bloquante n'a pas répondu. L'audit porte le nouveau nom.
 note = db.scalar(select(func.count(AuditLog.id)).where(
+    AuditLog.action == "cycle_minuit.archive_differee")) or 0
+ancien = db.scalar(select(func.count(AuditLog.id)).where(
     AuditLog.action == "cycle_minuit.relecture_partielle")) or 0
-check("D4-3 : portails en panne → consolidation sur la base + audit explicite",
-      note >= 1, f"audits={note}")
+check("D4-3 : portails en panne → consolidation sur la base, archive DIFFÉRÉE "
+      "+ audit explicite (v1.51 exigence 5)",
+      note >= 1 and ancien == 0, f"audits={note} anciens={ancien}")
 
 # fermeture propre du 23/08 → 24/08 (miroir de la production : suivis du 23
 # créés par le cycle précédent ; ici journée vide des deux côtés)
@@ -229,7 +238,7 @@ def _rel1(jour):            # passage 1 : le 20/08 est injoignable (R5)
 
 
 reparation._relecture_portails = _rel1
-reparation.executer_reparation_v130()
+reparation.executer_reparation_v130(autoriser_reecriture=True)
 
 # --- J0 sain : intact ------------------------------------------------------------
 arch_j0_apres = {h.id: dict(h.donnees or {}) for h in db.scalars(
@@ -307,24 +316,43 @@ check("R3g : audits de masquage ET de guérison présents",
 arch_j2 = {h.vehicule_id: dict(h.donnees or {}) for h in db.scalars(
     select(HistoriqueJournalier).where(HistoriqueJournalier.date_jour == J2))}
 a4876 = arch_j2.get(v4876.id, {})
-fins_archives = [t.get("heure_fin") for t in (a4876.get("trajets") or [])]
+# v1.53 (18/09/2026) — OÙ LIRE LES « 3 LIGNES FUSIONNÉES » : l'archive STOCKÉE
+# conserve désormais les trajets BRUTS (arbitrage LSS « tous les trajets valides
+# restent conservés individuellement en base ; les séquences d'affichage sont
+# calculées séparément ») et la projection d'affichage (3 lignes) est produite à
+# la LECTURE. L'intention de R3h est inchangée : plus aucune fin « 01:00 », les
+# fins réelles apparaissent sur la vue d'écran ; on lit donc la vue d'affichage
+# — et on vérifie EN PLUS que la base en garde bien 5 (aucun trajet perdu).
+_h4876 = db.scalar(select(HistoriqueJournalier).where(
+    HistoriqueJournalier.date_jour == J2,
+    HistoriqueJournalier.vehicule_id == v4876.id))
+fins_stockees = [t.get("heure_fin") for t in (a4876.get("trajets") or [])]
+fins_archives = [t.get("heure_fin")
+                 for t in (s_historique(_h4876, detail=True, seuils=get_seuils(db))
+                           ["donnees"]["trajets"] or [])]
 # Réalignement v1.31 (§0undecies E1, 24/08/2026 — prime sur AM-2 pour les
 # arrêts < 20 min) : les pauses 13:30:39→13:47:55 (17 min) et 16:41:20→
-# 16:57:11 (16 min) sont < 20 min → la grille/archive affichent 3 LIGNES
-# fusionnées ; la BASE garde les 5 trajets réels (vérifié par R3c/R3f).
+# 16:57:11 (16 min) sont < 20 min → l'écran affiche 3 LIGNES fusionnées ;
+# la BASE garde les 5 trajets réels (vérifié par R3c/R3f).
 check("R3h : archive du 21/08 régénérée — plus AUCUNE fin « 01:00 », fins "
       "réelles (E1 v1.31 : 3 lignes fusionnées, fins 14:00:01 / 18:58:06 / "
       "20:38:36)", len(fins_archives) == 3
       and fins_archives == ["2026-08-21T14:00:01", "2026-08-21T18:58:06",
                             "2026-08-21T20:38:36"],
-      f"{fins_archives}")
+      f"affichage={fins_archives}")
+check("R3h bis v1.53 — la BASE conserve bien les 5 trajets réels (aucune "
+      "fusion stockée) et aucune fin « 01:00 »",
+      len(fins_stockees) == 5
+      and not any((f or "").endswith("T01:00:00") or (f or "").endswith("T01:00")
+                  for f in fins_stockees),
+      f"bruts={fins_stockees}")
 reecr = db.scalar(select(func.count(AuditLog.id)).where(
     AuditLog.action == "jour.archive_reecrite_v130")) or 0
 check("R3i : journal AVANT/APRÈS de la réécriture d'archive présent", reecr >= 1)
 
 # --- passage 2 : le 20/08 redevient joignable → réparé, marqueur global ---------
 reparation._relecture_portails = relire
-reparation.executer_reparation_v130()
+reparation.executer_reparation_v130(autoriser_reecriture=True)
 l0906 = lignes_affichees(v0906, J1)
 check("R4a : 0906TBV 20/08 — le trajet perdu 10:19→13:44 est REINSÉRÉ (3 lignes)",
       len(l0906) == 3 and l0906[1].heure_debut == dt(J1, 10, 19, 6)
@@ -365,12 +393,24 @@ check("R4f : alertes récapitulatives visibles dans l'onglet Alertes (par journ�
 nb_trajets = db.scalar(select(func.count(Trajet.id))) or 0
 nb_audits = db.scalar(select(func.count(AuditLog.id))) or 0
 nb_alertes = db.scalar(select(func.count(Alerte.id))) or 0
-rep_c = reparation.executer_reparation_v130()
+rep_c = reparation.executer_reparation_v130(autoriser_reecriture=True)
 check("R5a : 3ᵉ passage = statut « deja_faite », zéro nouvelle écriture",
       rep_c.get("statut") == "deja_faite"
       and nb_trajets == (db.scalar(select(func.count(Trajet.id))) or 0)
       and nb_audits == (db.scalar(select(func.count(AuditLog.id))) or 0)
       and nb_alertes == (db.scalar(select(func.count(Alerte.id))) or 0))
+# --- v1.54/P3 : le passage AUTOMATIQUE (défaut) ne réécrit aucune archive -------
+nb_hists = db.scalar(select(func.count(HistoriqueJournalier.id))) or 0
+_snap_av = {h.id: json.dumps(h.donnees or {}, sort_keys=True, default=str)
+            for h in db.scalars(select(HistoriqueJournalier)).all()}
+reparation.executer_reparation_v130()               # défaut = pas d'autorisation
+_snap_ap = {h.id: json.dumps(h.donnees or {}, sort_keys=True, default=str)
+            for h in db.scalars(select(HistoriqueJournalier)).all()}
+check("P3 : sans autorisation explicite, AUCUNE archive n'est réécrite "
+      "(le boot ne réécrit jamais)",
+      nb_hists == (db.scalar(select(func.count(HistoriqueJournalier.id))) or 0)
+      and _snap_av == _snap_ap)
+
 l4876_bis = lignes_affichees(v4876, J2)
 check("R5b : grille du 21/08 stable après re-exécution",
       [(t.heure_debut, t.heure_fin) for t in l4876_bis] == reelles)

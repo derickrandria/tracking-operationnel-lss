@@ -9,6 +9,7 @@ import random
 
 from sqlalchemy import func, select
 
+from .config import calculer_tokens_set, normaliser_libelle
 from .database import SessionLocal, Base, engine as _engine
 from .engine import SEUILS_DEFAUT
 from .models import (Conducteur, ParametrageSeuil, Role, SituationCamion, User,
@@ -22,7 +23,8 @@ VEHICULES = [
     ("0576TCD", "0576TCD/0797TBP"), ("0616TCD", "0616TCD/0537TBP"),
     ("0826TBS", "0826TBS/9867TBD"), ("0906TBV", "0906TBV/0787TBP"),
     ("0916TBV", "0916TBV/1477TBP"), ("0926TBV", "0926TBV/9907TBD"),
-    ("0936TBV", "0936TBV/4877TBB"), ("2226TBS", "2226TBS/6217TBE"),
+    ("0936TBV", "0936TBV/4877TBB"), ("2066TBP", "2066TBP/0537TBP"),
+    ("2226TBS", "2226TBS/6217TBE"),
     ("2606TBS", "2606TBS/6197TBB"), ("2736TCC", "2736TCC/2737TCC"),
     ("2746TCC", "2746TCC/2907TCC"), ("3046TBS", "3046TBS/6187TBE"),
     ("3056TBS", "3056TBS/1907TBE"), ("3076TBS", "3076TBS/4867TAU"),
@@ -37,8 +39,9 @@ VEHICULES = [
     ("5446TBS", "5446TBS/4047TBH"), ("5506TBS", "5506TBS/0267TBG"),
     ("5616TCE", "5616TCE/5617TCE"), ("5626TCE", "5626TCE/0537TAV"),
     ("5646TCE", "5646TCE/5617TCE"), ("5706TBS", "5706TBS/4657TBH"),
-    ("5716TBS", "5716TBS/3407TBB"), ("6546TCE", "6546TCE/9747TBD"),
-    ("7306TCE", "7306TCE/9737TBD"), ("7936TCB", "7936TCB/5127TCB"),
+    ("5716TBS", "5716TBS/3407TBB"), ("6256TCE", "6256TCE/6257TCE"),
+    ("6546TCE", "6546TCE/9747TBD"), ("7306TCE", "7306TCE/9737TBD"),
+    ("7766TBL", "7766TBL/7767TBL"), ("7936TCB", "7936TCB/5127TCB"),
     ("7946TCB", "7946TCB/5057TCB"), ("8076TCB", "8076TCB/0527TBP"),
     ("8086TCB", "8086TCB/0557TBP"), ("8116TCB", "8116TCB/1247TCC"),
     ("8806TCB", "8806TCB/1287TCC"), ("9176TCC", "9176TCC/6107TCC"),
@@ -146,13 +149,14 @@ CAPACITES = [30000, 33000, 36000, 40000]
 # véhicules visibles sur le portail CamtrackPro « Camtrack SARL » — les autres
 # remontent via MZoneX (« Lss Tracking », groupe LSS (LPSA)).
 VEHICULES_CAMTRACKPRO = {
-    "0826TBS", "0906TBV", "3076TBS", "4296TCC", "5346TBU", "5506TBS",
-    "5616TCE", "5626TCE", "5646TCE", "5716TBS", "6546TCE", "7306TCE",
-    "9176TCC",
+    "0826TBS", "0906TBV", "2066TBP", "3076TBS", "4296TCC", "5346TBU", "5506TBS",
+    "5616TCE", "5626TCE", "5646TCE", "5716TBS", "6256TCE", "6546TCE",
+    "7306TCE", "7766TBL", "9176TCC",
 }
 
 
 def seed_si_vide():
+    from datetime import date, datetime, timedelta
     Base.metadata.create_all(bind=_engine)
     db = SessionLocal()
     try:
@@ -192,7 +196,10 @@ def seed_si_vide():
                 elif i == 54:
                     statut = "SUSPENDU"
                 c = Conducteur(nom_prenom=nom, prenom_usuel=usuel,
-                               matricule=f"CH{i:03d}", telephone=tel, statut=statut)
+                               matricule=None, code_badge_mzonex=None,
+                               nom_normalise=normaliser_libelle(nom),
+                               tokens_set=calculer_tokens_set(nom),
+                               telephone=tel, statut=statut)
                 db.add(c)
                 conducteurs.append(c)
             db.flush()
@@ -203,15 +210,42 @@ def seed_si_vide():
                 if plaque in ("0926TBV", "5716TBS"):
                     statut = "MAINTENANCE"
                 conducteur = disponibles[i] if i < len(disponibles) else None
+                est_camtrack = plaque in VEHICULES_CAMTRACKPRO
+                plateforme_gps = "CAMTRACKPRO" if est_camtrack else "MZONEX"
+                if conducteur:
+                    if not est_camtrack:
+                        # Flotte MZoneX : driverKeyCode officiel (numérique)
+                        badge_code = 10000 + i
+                        conducteur.code_badge_mzonex = badge_code
+                        conducteur.matricule = str(badge_code)
+                    else:
+                        # Flotte CamtrackPro : code vide
+                        conducteur.code_badge_mzonex = None
+                        conducteur.matricule = None
+
                 db.add(Vehicule(
                     plaque=plaque, description=desc, marque=MARQUES[i % len(MARQUES)],
                     capacite=CAPACITES[i % len(CAPACITES)], statut=statut,
                     gps_associe=f"OBC-{plaque}",
-                    plateforme_gps=("CAMTRACKPRO" if plaque in VEHICULES_CAMTRACKPRO
-                                    else "MZONEX"),
+                    plateforme_gps=plateforme_gps,
                     conducteur_actuel_id=conducteur.id if conducteur else None))
-            log.info("Référentiels seedés : %d véhicules, %d chauffeurs, %d situations",
-                     len(VEHICULES), len(CHAUFFEURS), len(SITUATIONS))
+            db.flush()
+        else:
+            # Complétion des véhicules manquants sur une base existante
+            plaques_existantes = {v.plaque for v in db.scalars(select(Vehicule))}
+            for i, (plaque, desc) in enumerate(VEHICULES):
+                if plaque not in plaques_existantes:
+                    est_camtrack = plaque in VEHICULES_CAMTRACKPRO
+                    plateforme_gps = "CAMTRACKPRO" if est_camtrack else "MZONEX"
+                    v_new = Vehicule(
+                        plaque=plaque, description=desc,
+                        marque="MERCEDES ATEGO",
+                        capacite=36000, statut="ACTIF",
+                        gps_associe=f"OBC-{plaque}",
+                        plateforme_gps=plateforme_gps
+                    )
+                    db.add(v_new)
+            db.flush()
 
         # Historique de démonstration : quelques jours archivés réalistes afin
         # que le module Historique et les courbes 30 jours soient exploitables
@@ -229,13 +263,18 @@ def seed_si_vide():
                      (TypeInfraction.ACCELERATION_BRUSQUE, GraviteInfraction.FAIBLE)]
             for recul in (6, 5, 4, 3, 2, 1):
                 jour = auj - timedelta(days=recul)
+                if jour in (date(2026, 9, 11), date(2026, 9, 12), date(2026, 9, 13)):
+                    continue
                 for v in rng.sample(list(vehicules), k=min(len(vehicules), rng.randint(30, 40))):
                     c = v.conducteur_actuel
                     tcj = rng.randint(3 * 3600, 8 * 3600 + 1800)
                     pauses = rng.randint(1800, 5400)
+                    ttj = min(86400, tcj + pauses)
                     dep = datetime.combine(jour, datetime.min.time()).replace(hour=rng.randint(5, 7))
                     nb_inf = rng.choices([0, 1, 2], weights=[70, 22, 8])[0]
-                    depot = rng.choice(["DMMG", "DABI", "DABE", "DFIA"])
+                    tcj_str = f"{tcj // 3600:02d}:{(tcj % 3600) // 60:02d}"
+                    ttj_str = f"{ttj // 3600:02d}:{(ttj % 3600) // 60:02d}"
+                    pause_str = f"{pauses // 3600:02d}:{(pauses % 3600) // 60:02d}"
                     db.add(HistoriqueJournalier(
                         date_jour=jour, annee=jour.year, mois=jour.month,
                         vehicule_id=v.id, conducteur_id=c.id if c else None,
@@ -243,16 +282,21 @@ def seed_si_vide():
                             "plaque": v.plaque,
                             "conducteur": {"prenom_usuel": c.prenom_usuel, "nom_prenom": c.nom_prenom} if c else None,
                             "situation": "Repos chauffeur", "statut_camion": "LIBRE",
-                            "depot_recepteur": depot,
-                            "distributeur": rng.choice(["GALANA", "VIVO", "JOVENA", "TOTAL"]),
-                            "produit": rng.choice(["SP95", "GO", "PL"]),
-                            "numero_ot": f"OT-{jour:%Y%m%d}-{rng.randint(1, 60):04d}",
+                            "depot_recepteur": None,
+                            "distributeur": None,
+                            "produit": None,
+                            "numero_ot": None,
                             "heure_depart": dep.isoformat(),
                             "arret_final": f"{rng.randint(15, 19):02d}:{rng.randint(0, 59):02d} · Base LSS — Antananarivo",
-                            "tcc_s": rng.randint(3600, 3 * 3600), "tcj_s": tcj,
-                            "ttj_s": tcj + pauses, "total_pause_s": pauses,
+                            "tcc_s": 0, "tcc_secondes": 0, "tcc_str": "00:00",
+                            "tcj_s": tcj, "tcj_secondes": tcj, "tcj_str": tcj_str,
+                            "ttj_s": ttj, "ttj_secondes": ttj, "ttj_str": ttj_str,
+                            "total_pause_s": pauses, "pauses_secondes": pauses, "total_pause_str": pause_str,
                             "km_parcourus": round(rng.uniform(120, 480), 1),
                             "nb_trajets": rng.randint(3, 7), "trajets": [],
+                            "flag_tcj": bool(tcj > 36000),
+                            "flag_ttj": bool(ttj >= 43200),   # v1.53 : inclusif
+                            "flag_tcc": False,
                         },
                         nb_infractions=nb_inf, nb_alertes=rng.randint(0, 3)))
                     for _ in range(nb_inf):
@@ -267,7 +311,8 @@ def seed_si_vide():
                             source=SourceEvenement.SIMULATEUR,
                             adresse=rng.choice(["RN2 · PK 74 (avant Moramanga)", "RN2 · PK 201 (après Beforona)",
                                                 "RN7 · PK 96 (avant Antsirabe)"])))
-            log.info("Historique de démonstration généré (6 jours archivés)")
+            log.info("Historique de démonstration généré (jours passés archivés)")
+
         db.commit()
     finally:
         db.close()

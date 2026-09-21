@@ -6,11 +6,14 @@ déduits (AM-1) ; TTJ = amplitude brute (T1). Les scénarios des captures du
 04/08 sont INCHANGÉS — seules les attentes des règles supplantées bougent.
 Attendus recalés v1.29 ci-dessous, marqués « v3 ».
 
-⚠️ PIÈGE HARNESS (v1.18.2) : ces cas sont ancrés à des HEURES FIXES du jour
-courant (05:56 → 10:45). Les checks « en cours / orange / noir » ne sont
-véridiques que si le test tourne l'APRÈS-MIDI (heure de la plateforme). Le
-matin, 10 checks temporels échouent artificiellement. Relance matinale :
-APP_TZ="Etc/GMT-12" python3 test_chaines_v113.py   (simule ~17h locales).
+⚠️ PIÈGE HARNESS (v1.18.2) — RÉSOLU le 21/09/2026 (v1.54) : ces cas sont
+ancrés à des HEURES FIXES (05:56 → 10:45) et la plateforme lit l'horloge
+système. Le verdict dépendait donc de l'HEURE D'EXÉCUTION (10 checks
+« en cours / orange / noir » échouaient artificiellement le matin) et de la
+DATE du jour. L'horloge est désormais FIGÉE au 18/09/2026 à 17:30 (après-midi,
+donc tous les états sont constatables) : le verdict est IDENTIQUE à toute heure
+et à toute date, sans qu'aucune assertion métier n'ait été modifiée.
+(Ancienne rustine : APP_TZ="Etc/GMT-12" … pour simuler ~17h locales.)
 
 Rejoue EXACTEMENT les 4 cas des captures métier du 04/08 (~10h13-10h19) avec
 les données réelles du portail relues le jour même. ATTENDUS v1.18 (arbitrages
@@ -42,15 +45,33 @@ D) 0916TBV — manœuvre 0 km EN TÊTE puis 3 trajets valides séparés de pause
 Exécution (TOUJOURS sur une base de test !) :
   DATABASE_URL="sqlite:////tmp/test_v113.db" python3 test_chaines_v113.py
 La base est SUPPRIMÉE à la fin (protection des données production).
+Horloge FIGÉE depuis la v1.54 (21/09/2026) : verdict indépendant de l'heure.
 """
 import os
 os.environ.setdefault("SIM_ENABLE", "0")
 import sys
 from datetime import datetime, timedelta
 
-from sqlalchemy import delete, select
+# ── HORLOGE FIGÉE (v1.54, 21/09/2026) — DÉTERMINISME DU TEST ────────────────
+# Le scénario est ancré à des heures fixes (05:56 → 10:45). Sans horloge figée,
+# le verdict dépend de l'heure et de la date d'exécution. On fige l'instant
+# APRÈS-MIDI du 18/09/2026, AVANT d'importer les modules applicatifs : tous ceux
+# qui font `from .config import now_local` reçoivent alors CETTE horloge.
+# AUCUNE attente métier n'est modifiée — seul le temps est injecté.
+HEURE_FIGEE = datetime(2026, 9, 18, 17, 30, 0)
+HEURE_FIGEE_S = HEURE_FIGEE.isoformat(sep=" ")
 
-from app.config import now_local
+
+def _horloge_figee():
+    return HEURE_FIGEE
+
+
+import app.config as _config  # noqa: E402  — importé EN PREMIER, exprès
+_config.now_local = _horloge_figee
+
+from sqlalchemy import delete, select  # noqa: E402
+
+from app.config import now_local  # noqa: E402  (= _horloge_figee)
 from app.database import SessionLocal
 from app import engine
 from app.models import (StatutSourceTrajet, StatutValidationTrajet,
@@ -82,7 +103,7 @@ engine.PUBLISH_ENABLED["on"] = False
 seed_si_vide()
 migrer_schema()
 db = SessionLocal()
-jour = datetime.now().date()
+jour = HEURE_FIGEE.date()      # v1.54 — ancré à l'horloge figée
 base = datetime.combine(jour, datetime.min.time())
 
 mzx = db.scalars(select(Vehicule).where(

@@ -6,13 +6,15 @@ __pycache__/
 # Données locales
 backend/data/
 sauvegardes/
+archive/
 
-# Node
+# Node (garder frontend/dist pour le déploiement direct sans compilation)
 node_modules/
-frontend/dist/
+frontend/node_modules/
 
 # Divers
 .env
 *.log
 .DS_Store
 backend/.env
+pylib/

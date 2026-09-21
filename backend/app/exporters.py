@@ -33,7 +33,22 @@ def _logo_excel(hauteur_px: int = 30):
         return None
 
 
-def export_excel(titre: str, headers: list[str], rows: list[list]) -> bytes:
+# v1.53 (18/09/2026) — NOTE DE CONVENTION d'affichage. L'interface masque le
+# TCC d'une journée close par « — » ; l'export, lui, porte « 0:00 » : cette
+# convention doit être ÉCRITE dans le fichier, sinon elle se lit comme une
+# donnée (le vrai TCC reste conservé en base et dans les archives).
+NOTE_TCC_CONVENTION = (
+    "Convention d'affichage : dans la colonne TCC, « 0:00 » signale une journée "
+    "clôturée pour laquelle le temps de conduite continue (chrono de session) "
+    "n'est pas applicable. C'est une valeur d'AFFICHAGE : le TCC réellement "
+    "calculé reste conservé en base et dans les archives (audit / "
+    "contre-vérification)." + " Une colonne « Trajets » compte les SÉQUENCES "
+    "affichées : le nombre de trajets valides RÉELS et le nombre de trajets "
+    "regroupés à l'affichage sont indiqués séparément dans la synthèse.")
+
+
+def export_excel(titre: str, headers: list[str], rows: list[list],
+                 note: str | None = None) -> bytes:
     import re
     wb = Workbook()
     ws = wb.active
@@ -66,12 +81,24 @@ def export_excel(titre: str, headers: list[str], rows: list[list]) -> bytes:
     ws.freeze_panes = "A3"
     ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}{len(rows) + 2}"
 
+    # v1.53 — note de convention, sous le tableau (jamais dans une colonne de
+    # données : un lecteur ne peut pas la confondre avec une valeur calculée).
+    if note:
+        ligne = len(rows) + 4
+        ws.merge_cells(start_row=ligne, start_column=1,
+                       end_row=ligne, end_column=len(headers))
+        cell = ws.cell(row=ligne, column=1, value="ⓘ  " + note)
+        cell.font = Font(size=8.5, italic=True, color="5A6B7C")
+        cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        ws.row_dimensions[ligne].height = 42
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
 
 
-def export_pdf(titre: str, headers: list[str], rows: list[list]) -> bytes:
+def export_pdf(titre: str, headers: list[str], rows: list[list],
+               note: str | None = None) -> bytes:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.styles import getSampleStyleSheet
@@ -103,6 +130,11 @@ def export_pdf(titre: str, headers: list[str], rows: list[list]) -> bytes:
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
     ]))
     story.append(table)
+    # v1.53 — note de convention sous le tableau
+    if note:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph(f"<i>ⓘ  {note}</i>",
+                               getSampleStyleSheet()["Normal"]))
     doc.build(story)
     return buf.getvalue()
 
@@ -227,7 +259,12 @@ def _valeurs_suivi(l: dict, detail: bool, excel: bool) -> list:
         # §0vicies decies N2 — Pos. 20h/22h (relevés automatiques du soir)
         l.get("position_20h") or "—", l.get("position_22h") or "—",
         # Addendum v1.9 §4 — TCC/TCJ/TTJ en premier (alerte en priorité)
-        duree(l.get("tcc_s")), duree(l.get("tcj_s")), duree(l.get("ttj_s")),
+        # v1.53 (18/09/2026) — convention d'AFFICHAGE à l'export : une journée
+        # close porte « 0:00 » (l'interface affiche « — ») et la note
+        # NOTE_TCC_CONVENTION accompagne le fichier. La valeur `tcc_s` n'est
+        # jamais détruite : elle reste en base, contrôlable et exportable.
+        duree(0 if l.get("tcc_masque") else l.get("tcc_s")),
+        duree(l.get("tcj_s")), duree(l.get("ttj_s")),
         _hhmm(l.get("heure_depart")),
     ]
     if detail:
@@ -373,6 +410,18 @@ def _ecrire_feuille_suivi(wb: Workbook, nom: str, ligne_titre: str,
         note.font = Font(size=8.5, italic=True, color=COULEUR_PROVISOIRE)
         note.alignment = Alignment(horizontal="left")
 
+    # --- v1.53 (18/09/2026) — note de CONVENTION TCC, dans les DEUX modes :
+    # l'export porte « 0:00 » là où l'interface affiche « — » pour une journée
+    # close. Sans cette note, « 0:00 » se lirait comme une donnée alors que le
+    # TCC réel reste conservé en base et dans les archives (arbitrage LSS).
+    ligne_tcc = len(lignes) + 4 + (2 if detail else 0)
+    ws.merge_cells(start_row=ligne_tcc, start_column=1,
+                   end_row=ligne_tcc, end_column=ncols)
+    cell_tcc = ws.cell(row=ligne_tcc, column=1, value="ⓘ  " + NOTE_TCC_CONVENTION)
+    cell_tcc.font = Font(size=8.5, italic=True, color="5A6B7C")
+    cell_tcc.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    ws.row_dimensions[ligne_tcc].height = 42
+
     # --- finitions : largeurs auto, figeage, filtres (§3.4)
     echantillon_txt = [_valeurs_suivi(l, detail, excel=False) for l in lignes[:120]]
     for j, h in enumerate(entetes, start=1):
@@ -497,6 +546,9 @@ def _note_provisoire_pdf():
 
 def export_suivi_pdf(jour_label: str, lignes: list[dict], detail: bool,
                      utilisateur: str = "") -> bytes:
+    # v1.53 — l'export porte « 0:00 » (convention) sur une journée close là où
+    # l'interface affiche « — » : la note de convention accompagne le fichier
+    # (cf. NOTE_TCC_CONVENTION) et la donnée réelle reste en base.
     """Addendum v1.1 §3.5 — Export PDF du Suivi Journalier : paysage, A3 en
     mode détaillé / A4 en compact, en-tête + pied de page numéroté."""
     from reportlab.lib.pagesizes import A3, A4, landscape
@@ -518,6 +570,10 @@ def export_suivi_pdf(jour_label: str, lignes: list[dict], detail: bool,
     ]
     if detail:
         story += _note_provisoire_pdf()
+    # v1.53 — note de convention TCC : l'export porte « 0:00 » là où l'écran
+    # affiche « — » ; la donnée réelle reste en base (jamais détruite).
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"<i>ⓘ  {NOTE_TCC_CONVENTION}</i>", petit))
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()
@@ -647,9 +703,176 @@ def export_historique_pdf(du, au, jours: list, synthese: list[dict],
                                f"{len(lignes)} camions", styles["Title"]))
         story.append(Spacer(1, 4))
         story.append(_table_suivi_pdf(lignes, detail))
-        if detail:
-            story += _note_provisoire_pdf()
+    # v1.53 — même note de convention que le Suivi : « 0:00 » est un rendu,
+    # la valeur TCC réelle reste en base et dans les archives.
+    story.append(Spacer(1, 8))
+    story.append(Paragraph(f"<i>ⓘ  {NOTE_TCC_CONVENTION}</i>", petit))
+    doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
+              onLaterPages=_pied_page(titre, utilisateur))
+    return buf.getvalue()
 
+
+# =============================================================================
+# EXPORTS MISSIONS (Module 3 — Reconstitution & Suivi Logistique)
+# =============================================================================
+def _fmt_dt_complet(iso_val: str | None) -> str:
+    if not iso_val:
+        return ""
+    try:
+        dt = datetime.fromisoformat(str(iso_val))
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(iso_val)[:16].replace("T", " ")
+
+
+def export_missions_excel(titre_periode: str, missions: list[dict],
+                          utilisateur: str = "") -> bytes:
+    """Export Excel de l'onglet Missions avec les 3 colonnes d'horodatages distinctes."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Missions"
+
+    headers = [
+        "N° Mission", "Date", "Chauffeur", "Immatriculation",
+        "N° OT", "Distributeur", "Produit", "Dépôt Prévu", "Destination Réelle",
+        "Statut Camion", "Statut Mission",
+        "Début Mission", "Date Chargement", "Date Déchargement",
+        "Durée", "Km Vide", "Km Chargé", "Km Total", "Nb Infractions"
+    ]
+
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+    c = ws.cell(row=1, column=1,
+                value=f"LSS — Registre des Missions — {titre_periode} · {len(missions)} missions"
+                      f" · exporté le {datetime.now():%d/%m/%Y %H:%M}"
+                      + (f" par {utilisateur}" if utilisateur else ""))
+    c.font = Font(bold=True, size=13, color="FFFFFF")
+    for k in range(1, len(headers) + 1):
+        ws.cell(row=1, column=k).fill = PatternFill("solid", fgColor="1F4E79")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+    logo = _logo_excel(30)
+    if logo is not None:
+        ws.add_image(logo, "A1")
+
+    for j, h in enumerate(headers, start=1):
+        cell = ws.cell(row=2, column=j, value=h)
+        cell.font = Font(bold=True, size=10)
+        cell.fill = PatternFill("solid", fgColor="EDF1F6")
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, m in enumerate(missions, start=3):
+        cond = m.get("conducteur") or {}
+        chauffeur_nom = cond.get("nom_prenom") or cond.get("prenom_usuel") or "—"
+        depot_eff = m.get("depot_effectif") or m.get("depot_prevu") or "—"
+        if m.get("est_deviee"):
+            depot_eff = f"{depot_eff} (DÉVIÉE)"
+
+        deb_str = _fmt_dt_complet(m.get("heure_debut") or m.get("date_debut")) or "En attente"
+        chg_str = _fmt_dt_complet(m.get("heure_chargement") or m.get("date_chargement")) or "—"
+        fin_str = _fmt_dt_complet(m.get("heure_fin") or m.get("date_fin")) if m.get("statut") == "TERMINÉE" else "En cours"
+
+        vals = [
+            m.get("code_mission") or f"MIS-{m.get('id', '')[:8]}",
+            m.get("date_jour") or "—",
+            chauffeur_nom,
+            m.get("plaque") or "—",
+            m.get("numero_ot") or "—",
+            m.get("distributeur") or "—",
+            m.get("produit") or "—",
+            m.get("depot_prevu") or m.get("depot") or "—",
+            depot_eff,
+            m.get("statut_camion_actuel") or "—",
+            m.get("statut") or "—",
+            deb_str,
+            chg_str,
+            fin_str,
+            _fmt_duree_txt(m.get("duree_s")),
+            round(m.get("km_vide") or 0.0, 1),
+            round(m.get("km_charge") or 0.0, 1),
+            round(m.get("kilometrage_total") or m.get("kilometrage") or 0.0, 1),
+            m.get("nb_infractions") or 0,
+        ]
+        for j, val in enumerate(vals, start=1):
+            cell = ws.cell(row=i, column=j, value=val)
+            cell.font = Font(size=9)
+            if j in (1, 2, 4, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19):
+                cell.alignment = Alignment(horizontal="center")
+
+    for j, h in enumerate(headers, start=1):
+        ws.column_dimensions[get_column_letter(j)].width = max(12, len(h) + 3)
+    ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}{len(missions) + 2}"
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def export_missions_pdf(titre_periode: str, missions: list[dict],
+                        utilisateur: str = "") -> bytes:
+    """Export PDF du registre des missions (Format A4 Paysage)."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Spacer, Paragraph, Table, TableStyle
+
+    titre = f"Registre des Missions — {titre_periode}"
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=8 * mm, rightMargin=8 * mm,
+                            topMargin=14 * mm, bottomMargin=11 * mm, title=titre,
+                            author="LSS Tracking")
+    styles, petit = _styles_pdf()
+    story = [
+        Paragraph(f"<b>{titre}</b> — {len(missions)} mission(s)", styles["Title"]),
+        Spacer(1, 4),
+    ]
+
+    headers = ["N° Mission", "Chauffeur", "Camion", "N° OT", "Produit",
+               "Dépôt Prévu", "Destination", "Statut", "Début", "Chargement", "Déchargement",
+               "Km Tot.", "Infr."]
+
+    data = [headers]
+    for m in missions:
+        cond = m.get("conducteur") or {}
+        chauffeur_nom = cond.get("nom_prenom") or cond.get("prenom_usuel") or "—"
+        depot_eff = m.get("depot_effectif") or m.get("depot_prevu") or "—"
+        if m.get("est_deviee"):
+            depot_eff = f"{depot_eff}*"
+
+        deb_str = _hhmm(m.get("heure_debut") or m.get("date_debut")) or "Attente"
+        chg_str = _hhmm(m.get("heure_chargement") or m.get("date_chargement")) or "—"
+        fin_str = _hhmm(m.get("heure_fin") or m.get("date_fin")) if m.get("statut") == "TERMINÉE" else "En cours"
+
+        row = [
+            m.get("code_mission") or f"MIS-{m.get('id', '')[:6]}",
+            chauffeur_nom,
+            m.get("plaque") or "—",
+            m.get("numero_ot") or "—",
+            m.get("produit") or "—",
+            m.get("depot_prevu") or m.get("depot") or "—",
+            depot_eff,
+            m.get("statut") or "—",
+            deb_str,
+            chg_str,
+            fin_str,
+            f"{round(m.get('kilometrage_total') or m.get('kilometrage') or 0.0, 0):.0f} km",
+            str(m.get("nb_infractions") or 0),
+        ]
+        data.append(row)
+
+    t = Table(data, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F4E79")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F5F7FA")]),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#C9D2DC")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN", (1, 1), (1, -1), "LEFT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(t)
     doc.build(story, onFirstPage=_pied_page(titre, utilisateur),
               onLaterPages=_pied_page(titre, utilisateur))
     return buf.getvalue()

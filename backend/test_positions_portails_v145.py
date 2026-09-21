@@ -24,6 +24,7 @@ Exécution (TOUJOURS sur une base de test !) :
 La base est SUPPRIMÉE à la fin (protection des données production).
 """
 import os
+import re
 os.environ.setdefault("SIM_ENABLE", "0")
 os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/test_v145.db")
 import sys
@@ -123,7 +124,11 @@ check("A1 loi §0unvicies decies inscrite (O1 positions portails)",
 check("A2 loi : O2 réparation signature + O3 nomenclature + O4 inchangé",
       "position_reparee" in loi and "-TOWN" in loi
       and "INCHANGÉE" in loi.upper())
-check("A3 version : APP_VERSION 1.45", APP_VERSION == "1.45")
+# v1.50 — la version est publiée par l'application : on vérifie qu'elle est
+# EXPOSÉE et cohérente (le test figeait « 1.45 », ce qui cassait à chaque
+# montée de version sans rien prouver de plus).
+check(f"A3 version : APP_VERSION {APP_VERSION} publiée",
+      bool(re.fullmatch(r"\d+\.\d+", APP_VERSION)), APP_VERSION)
 login_src = open("/home/user/frontend/src/pages/Login.tsx",
                  encoding="utf-8").read()
 check("A4 version visible en v1.45 dans la page de connexion",

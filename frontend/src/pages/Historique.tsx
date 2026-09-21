@@ -17,7 +17,7 @@ import { Badge, Btn, Card, Spinner, Vide } from "../components/ui";
 import { addToast } from "../components/toast";
 import Infractions from "./Infractions";
 import Alertes from "./Alertes";
-import { cls, fmtDateFr, fmtDuree, fmtHeure, todayISO } from "../utils";
+import { cls, fmtDateFr, fmtDuree, fmtHeure, parseDureeEnSecondes, todayISO } from "../utils";
 
 const CLE_MODE = "lss_suivi_mode_detail";
 
@@ -28,13 +28,15 @@ const iso = (d: Date) =>
 function presets() {
   const maintenant = new Date();
   const auj = iso(maintenant);
+  const j31 = new Date(maintenant); j31.setDate(j31.getDate() - 30);
   const j7 = new Date(maintenant); j7.setDate(j7.getDate() - 6);
   const debutMois = new Date(maintenant.getFullYear(), maintenant.getMonth(), 1);
   const debutMoisPrec = new Date(maintenant.getFullYear(), maintenant.getMonth() - 1, 1);
   const finMoisPrec = new Date(maintenant.getFullYear(), maintenant.getMonth(), 0);
   return [
-    { id: "jour", label: "Aujourd'hui", du: auj, au: auj },
+    { id: "31j", label: "31 derniers jours (Défaut)", du: iso(j31), au: auj },
     { id: "7j", label: "7 derniers jours", du: iso(j7), au: auj },
+    { id: "jour", label: "Aujourd'hui", du: auj, au: auj },
     { id: "mois", label: "Ce mois-ci", du: iso(debutMois), au: auj },
     { id: "mois_prec", label: "Mois dernier", du: iso(debutMoisPrec), au: iso(finMoisPrec) },
   ];
@@ -42,12 +44,40 @@ function presets() {
 
 type Onglet = "suivi" | "infractions" | "alertes";
 
+function extraireConducteursRelaisHist(h: any): Array<{ nom: string; duree_s: number }> {
+  const trajets = h.trajets || h.donnees?.trajets || [];
+  if (!trajets || trajets.length === 0) return [];
+  const mapRelais = new Map<string, number>();
+  const nomPrincipal = (h.conducteur?.nom_prenom || "").toLowerCase().trim();
+  const prenomPrincipal = (h.conducteur?.prenom_usuel || "").toLowerCase().trim();
+
+  for (const t of trajets) {
+    const badge = (t.conducteur_badge || "").trim();
+    if (!badge) continue;
+    const badgeNorm = badge.toLowerCase();
+    if (nomPrincipal && (badgeNorm === nomPrincipal || nomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    if (prenomPrincipal && (badgeNorm === prenomPrincipal || prenomPrincipal.includes(badgeNorm))) {
+      continue;
+    }
+    let sec = 0;
+    if (t.heure_debut && t.heure_fin) {
+      const d1 = new Date(t.heure_debut).getTime();
+      const d2 = new Date(t.heure_fin).getTime();
+      if (d2 > d1) sec = Math.round((d2 - d1) / 1000);
+    }
+    mapRelais.set(badge, (mapRelais.get(badge) || 0) + sec);
+  }
+  return Array.from(mapRelais.entries()).map(([nom, duree_s]) => ({ nom, duree_s }));
+}
+
 export default function Historique() {
   const [onglet, setOnglet] = useState<Onglet>("suivi");
   const [params, setParams] = useSearchParams();
   const P = useMemo(presets, []);
-  const [du, setDu] = useState(params.get("du") || P[2].du);   // défaut : ce mois-ci
-  const [au, setAu] = useState(params.get("au") || P[2].au);
+  const [du, setDu] = useState(params.get("du") || P[0].du);   // défaut : 31 jours glissants (P[0])
+  const [au, setAu] = useState(params.get("au") || P[0].au);
   const [q, setQ] = useState("");
   const [data, setData] = useState<any | null>(null);
   const [stats, setStats] = useState<any | null>(null);
@@ -75,8 +105,18 @@ export default function Historique() {
   useEffect(() => {
     if (onglet !== "suivi" || !du || !au || au < du) return;
     setData(null);
-    api(`/api/historique/suivi?du=${du}&au=${au}&q=${encodeURIComponent(q)}`).then(setData);
-    api(`/api/historique/stats?du=${du}&au=${au}`).then(setStats);
+    api(`/api/historique/suivi?du=${du}&au=${au}&q=${encodeURIComponent(q)}`)
+      .then(setData)
+      .catch((e) => {
+        console.error("Erreur historique suivi:", e);
+        setData({ total: 0, items: [] });
+      });
+    api(`/api/historique/stats?du=${du}&au=${au}`)
+      .then(setStats)
+      .catch((e) => {
+        console.error("Erreur historique stats:", e);
+        setStats(null);
+      });
   }, [onglet, du, au, q]);
 
   /** Charge la grille complète (snapshot archivé, trajets compris) de la journée. */
@@ -155,40 +195,82 @@ export default function Historique() {
       {onglet === "suivi" && (
         <>
           {/* ------- sélecteur de plage de dates (§4.3) ------- */}
-          <Card className="!p-3" titre="">
-            <div className="flex flex-wrap items-center gap-2">
-              <Icon nom="calendrier" className="h-4 w-4 text-slate-400" />
-              <span className="text-[12px] font-semibold text-slate-400">Du</span>
-              <input type="date" value={du} max={todayISO()} className={inputDate}
-                onChange={(e) => changerPlage(e.target.value, au)} />
-              <span className="text-[12px] font-semibold text-slate-400">Au</span>
-              <input type="date" value={au} max={todayISO()} className={inputDate}
-                onChange={(e) => changerPlage(du, e.target.value)} />
-              <div className="mx-1 h-5 w-px bg-slate-200 dark:bg-slate-700" />
-              {P.map((p) => (
-                <button key={p.id} onClick={() => changerPlage(p.du, p.au)}
-                  className={cls("rounded-full border px-3 py-1 text-[12px] font-medium transition-colors",
-                    raccourciActif === p.id
-                      ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                      : "border-slate-200 dark:border-slate-700 text-slate-400 hover:border-slate-400")}>
-                  {p.label}
-                </button>
-              ))}
-              {raccourciActif === "custom" && (
-                <span className="rounded-full border border-violet-500 bg-violet-500/10 px-3 py-1 text-[12px] font-medium text-violet-500">
-                  Personnalisé
-                </span>
-              )}
-              <div className="ml-auto flex items-center gap-2">
-                <input value={q} onChange={(e) => setQ(e.target.value)}
+          <Card className="!p-3 bg-slate-50/50 dark:bg-slate-900/40" titre="">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* Sélecteurs Début & Fin distincts et labellisés */}
+                <div className="flex items-center gap-2 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded-lg px-2.5 py-1 shadow-sm">
+                  <Icon nom="calendrier" className="h-4 w-4 text-blue-500" />
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Date début :</span>
+                    <input
+                      type="date"
+                      value={du}
+                      max={au || todayISO()}
+                      className="bg-transparent text-[13px] font-medium text-slate-800 dark:text-slate-100 outline-none cursor-pointer"
+                      onChange={(e) => changerPlage(e.target.value, au)}
+                    />
+                  </div>
+                  <span className="text-slate-300 dark:text-slate-600 font-bold px-0.5">➔</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">Date fin :</span>
+                    <input
+                      type="date"
+                      value={au}
+                      min={du}
+                      max={todayISO()}
+                      className="bg-transparent text-[13px] font-medium text-slate-800 dark:text-slate-100 outline-none cursor-pointer"
+                      onChange={(e) => changerPlage(du, e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="mx-0.5 h-6 w-px bg-slate-200 dark:bg-slate-700 hidden sm:block" />
+
+                {/* Raccourcis rapides */}
+                <div className="flex flex-wrap items-center gap-1">
+                  {P.map((p) => (
+                    <button
+                      key={p.id}
+                      onClick={() => changerPlage(p.du, p.au)}
+                      className={cls(
+                        "rounded-md border px-2.5 py-1 text-[12px] font-medium transition-colors",
+                        raccourciActif === p.id
+                          ? "border-blue-500 bg-blue-500/10 text-blue-600 dark:text-blue-400 font-semibold"
+                          : "border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-600 dark:text-slate-400 hover:border-slate-400"
+                      )}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                  {raccourciActif === "custom" && (
+                    <span className="rounded-md border border-violet-500 bg-violet-500/10 px-2.5 py-1 text-[12px] font-semibold text-violet-500">
+                      Plage personnalisée
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {/* Recherche et exports */}
+              <div className="flex items-center gap-2">
+                <input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
                   placeholder="Rechercher (chauffeur, plaque)…"
-                  className="w-52 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px]" />
-                <Btn variante="secondaire" onClick={() => exporter("xlsx")}
-                  title="§4.4 — une feuille par jour (JJ-MM-AAAA) + feuille Synthèse, format identique au Suivi Journalier">
+                  className="w-52 rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 px-3 py-1.5 text-[13px] shadow-sm"
+                />
+                <Btn
+                  variante="secondaire"
+                  onClick={() => exporter("xlsx")}
+                  title="§4.4 — une feuille par jour (JJ-MM-AAAA) + feuille Synthèse, format identique au Suivi Journalier"
+                >
                   <Icon nom="telecharger" /> Excel
                 </Btn>
-                <Btn variante="secondaire" onClick={() => exporter("pdf")}
-                  title="§4.4 — page de garde + une section par jour, format identique au Suivi Journalier">
+                <Btn
+                  variante="secondaire"
+                  onClick={() => exporter("pdf")}
+                  title="§4.4 — page de garde + une section par jour, format identique au Suivi Journalier"
+                >
                   <Icon nom="telecharger" /> PDF
                 </Btn>
               </div>
@@ -289,22 +371,55 @@ export default function Historique() {
                     <th>Trajets</th><th>Km</th><th>Infractions</th><th>Alertes</th>
                   </tr></thead>
                   <tbody>
-                    {data.items.map((h: any) => (
+                    {data.items.map((h: any) => {
+                      const relais = extraireConducteursRelaisHist(h);
+                      const nomPrincipal = h.conducteur?.prenom_usuel || h.conducteur?.nom_prenom;
+                      const tcjSec = parseDureeEnSecondes(h.tcj_s ?? h.donnees?.tcj_s);
+                      const ttjSec = parseDureeEnSecondes(h.ttj_s ?? h.donnees?.ttj_s);
+                      // v1.53 — les seuils viennent du BACK (`flag_tcj` / `flag_ttj`,
+                      // seuils PARAMÉTRÉS) ; plus de seuil figé dans l'affichage.
+                      const depasseTcj = Boolean(h.flag_tcj);
+                      const depasseTtj = Boolean(h.flag_ttj);
+                      return (
                       <tr key={h.id} className="cursor-pointer"
                         title="Voir la grille complète de cette journée (identique au Suivi Journalier)"
                         onClick={() => setJourGrille(h.date_jour)}>
                         <td className="whitespace-nowrap font-medium">{h.date_jour.split("-").reverse().join("/")}</td>
                         <td className="font-bold whitespace-nowrap">{h.plaque}</td>
-                        <td className="whitespace-nowrap">{h.conducteur?.prenom_usuel || "—"}</td>
+                        <td className="whitespace-nowrap">
+                          <div className="flex flex-col py-0.5">
+                            {nomPrincipal ? (
+                              <span className="font-bold text-slate-900 dark:text-slate-100">
+                                {nomPrincipal}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                            {relais.map((r) => (
+                              <span key={r.nom} className="text-[11px] font-normal text-slate-600 dark:text-slate-400">
+                                {r.nom}{r.duree_s > 0 ? ` (${fmtDuree(r.duree_s)})` : ""}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
                         <td className="max-w-[220px] truncate text-[12px]">{h.situation || "—"}</td>
                         <td><Badge>{h.statut_camion || "—"}</Badge></td>
                         <td>{h.depot_recepteur || "—"}</td>
                         <td>{h.produit || "—"}</td>
                         <td className="tabular-nums">{fmtHeure(h.heure_depart)}</td>
-                        <td className="tabular-nums">{fmtDuree(h.tcj_s)}</td>
-                        <td className="tabular-nums">{fmtDuree(h.ttj_s)}</td>
+                        <td className={cls("tabular-nums font-semibold", depasseTcj ? "text-red-600 dark:text-red-400 font-bold" : "")}>
+                          {fmtDuree(tcjSec, true)}
+                        </td>
+                        <td className={cls("tabular-nums font-semibold", depasseTtj ? "text-red-600 dark:text-red-400 font-bold" : "")}>
+                          {fmtDuree(ttjSec, true)}
+                        </td>
                         <td className="tabular-nums">
-                          {h.nb_trajets || "—"}
+                          <span title={h.nb_trajets_valides_reels != null
+                            ? `${h.nb_trajets_valides_reels} trajet(s) valide(s) en base · `
+                              + `${h.nb_trajets_fusionnes ?? 0} regroupé(s) à l'affichage`
+                            : "Trajets affichés (séquences)"}>
+                            {h.nb_trajets || "—"}
+                          </span>
                           {h.nb_trajets > 9 && (
                             <span title="Trajets 10+ stockés (alerte « nombre exceptionnel »)"
                               className="ml-1 rounded bg-sky-500/15 px-1 text-[10px] font-bold text-sky-500">+{h.nb_trajets - 9}</span>
@@ -318,7 +433,7 @@ export default function Historique() {
                         </td>
                         <td><Badge>{h.nb_alertes}</Badge></td>
                       </tr>
-                    ))}
+                    );})}
                   </tbody>
                 </table>
               </div>

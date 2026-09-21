@@ -1,0 +1,619 @@
+"""v1.54 (21/09/2026) — CONCURRENCE DE COLLECTE : possession, budget, métriques.
+
+Module AUTONOME (stdlib uniquement) : il ne dépend d'aucun autre module de
+l'application, ce qui évite tout import circulaire et permet de le tester seul.
+
+Il corrige trois défauts prouvés le 21/09/2026 sur un incident de collecte :
+
+1. **VERROU À POSSESSION PAR JETON** (`VerrouPossede`).
+   Avant : `_acquerir_verrou_n1()` renvoyait un booléen et le verrou était une
+   RÉFÉRENCE GLOBALE, remplacée à l'auto-libération. La passe périmée continuait
+   de détenir « son » objet et, à sa sortie, appelait la libération globale —
+   c'est-à-dire celle de la passe SUIVANTE. Deux collectes écrivaient alors en
+   même temps (défaut reproduit en isolation : « exclusion mutuelle PERDUE »).
+   Désormais :
+     - l'acquisition renvoie un **jeton de possession** (identifiant unique) ;
+     - la libération **vérifie le jeton ET la génération** : un jeton étranger
+       ne libère jamais le verrou d'une autre tâche ;
+     - l'expiration est **explicite et tracée** (elle ne remplace jamais
+       silencieusement la possession) ;
+     - chaque verrou publie **propriétaire, date de prise, dernière activité,
+       expiration** ;
+     - la libération est TOUJOURS exécutée dans un `finally`.
+
+2. **UN VERROU PAR SOURCE** (`verrou_de`). MZONEX (temps réel), CAMTRACKPRO et
+   MZONEX_RELECTURE ne partagent plus un verrou unique : la relecture
+   historique (7 jours) ne peut plus affamer la collecte temps réel.
+
+3. **BUDGET À POINTS D'ARRÊT CONTRÔLÉS** (`PasseCourante`, `BudgetDepasse`).
+   Une passe qui dépasse son budget s'arrête à un point d'arrêt prévu (avant une
+   page, avant un véhicule, avant un lot d'écriture) : elle **n'écrit plus rien
+   après son échéance**, rend son verrou et déclare l'étape qui a consommé le
+   temps (attente HTTP, SQLite, verrou, pagination, écriture, parsing). Le
+   budget n'est jamais « augmenté » pour faire disparaître le symptôme.
+
+Les métriques par étape sont publiées pour `/api/sante` : authentification,
+pagination, par véhicule, parsing, écriture, attente de verrou, durée totale,
+nombre de pages, de véhicules et de lignes.
+"""
+from __future__ import annotations
+
+import logging
+import threading
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import datetime
+
+log = logging.getLogger("lss.concurrence")
+
+
+def _horodatage() -> str:
+    """Libellé lisible local (diagnostic uniquement)."""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 1. VERROU À POSSESSION PAR JETON
+# ════════════════════════════════════════════════════════════════════════════
+@dataclass(frozen=True)
+class Possession:
+    """Jeton de possession d'un verrou — NON interchangeable, NON falsifiable."""
+
+    ressource: str
+    source: str
+    jeton: str
+    generation: int
+    pris_le: str
+    pris_mono: float
+    expire_mono: float
+
+    def duree_s(self, maintenant: float | None = None) -> float:
+        return round((maintenant if maintenant is not None else time.monotonic()) - self.pris_mono, 1)
+
+    def expire_dans_s(self, maintenant: float | None = None) -> float:
+        return round(self.expire_mono - (maintenant if maintenant is not None else time.monotonic()), 1)
+
+    def est_expiree(self, maintenant: float | None = None) -> bool:
+        # `maintenant or ...` retombait sur l'horloge courante quand on passait
+        # 0.0 — un instant explicite doit toujours être respecté.
+        t = time.monotonic() if maintenant is None else maintenant
+        return t >= self.expire_mono
+
+
+class VerrouPossede:
+    """Un verrou par RESSOURCE, à jeton de possession.
+
+    Règles garanties (testées dans `test_concurrence_verrous_v154.py`) :
+      - une seconde acquisition N'ÉCRASE JAMAIS la possession en cours ;
+      - l'expiration est EXPLICITE : elle est journalisée avec le nom du
+        propriétaire sortant, comptée, et invalide son jeton (génération) ;
+      - seule la possession courante (jeton + génération) peut libérer ;
+      - toute tentative de libération par un autre jeton est REFUSÉE et comptée.
+    """
+
+    def __init__(self, ressource: str, duree_defaut_s: float = 30.0) -> None:
+        self.ressource = ressource
+        self.duree_defaut_s = float(duree_defaut_s)
+        self._mutex = threading.RLock()
+        self._possession: Possession | None = None
+        self._generation = 0
+        self._derniere_activite_mono: float | None = None
+        self._expirations = 0
+        self._refus = 0
+        self._liberations_refusees = 0
+        self._expiration_explicite = False
+
+    # ------------------------------------------------------------ acquisition
+    def acquerir(self, source: str, duree_s: float | None = None) -> Possession | None:
+        """Acquiert la ressource. Renvoie le JETON de possession, ou None si
+        une autre tâche la détient (jamais d'écrasement silencieux)."""
+        with self._mutex:
+            maintenant = time.monotonic()
+            if self._possession is not None:
+                if not self._possession.est_expiree(maintenant):
+                    self._refus += 1
+                    return None
+                # Expiration EXPLICITE (jamais silencieuse) : le propriétaire
+                # sortant est nommé et son jeton devient définitivement invalide
+                # (la génération augmente ci-dessous).
+                self._expirations += 1
+                log.warning(
+                    "Verrou « %s » : possession de « %s » EXPIRÉE après %.1fs "
+                    "(jeton %s, génération %d) — reprise explicite par « %s »",
+                    self.ressource, self._possession.source,
+                    self._possession.duree_s(maintenant),
+                    self._possession.jeton[:8], self._possession.generation, source)
+                self._possession = None
+                self._expiration_explicite = True
+            duree = float(duree_s if duree_s is not None else self.duree_defaut_s)
+            self._generation += 1
+            possession = Possession(
+                ressource=self.ressource, source=source,
+                jeton=uuid.uuid4().hex, generation=self._generation,
+                pris_le=_horodatage(), pris_mono=maintenant,
+                expire_mono=maintenant + max(0.05, duree))
+            self._possession = possession
+            self._derniere_activite_mono = maintenant
+            return possession
+
+    # -------------------------------------------------------------- activité
+    def activite(self, possession: Possession, prolonger_s: float | None = None) -> bool:
+        """Signale une activité (santé du verrou) et prolonge l'expiration.
+        Refusé si le jeton n'est pas celui de la possession courante."""
+        with self._mutex:
+            if not self._est_proprietaire(possession):
+                return False
+            maintenant = time.monotonic()
+            self._derniere_activite_mono = maintenant
+            if prolonger_s:
+                self._possession = Possession(
+                    **{**possession.__dict__,
+                       "expire_mono": maintenant + max(0.05, float(prolonger_s))})
+            return True
+
+    # -------------------------------------------------------------- libération
+    def liberer(self, possession: Possession | None) -> bool:
+        """Libère SEULEMENT si `possession` est la possession courante
+        (jeton + génération). Un jeton étranger est refusé et compté."""
+        with self._mutex:
+            if possession is None:
+                return False
+            if not self._est_proprietaire(possession):
+                self._liberations_refusees += 1
+                courant = self._possession
+                log.error(
+                    "Verrou « %s » : libération REFUSÉE — « %s » (jeton %s, gén. %d) "
+                    "n'est pas propriétaire (possession courante : « %s », jeton %s, gén. %s)",
+                    self.ressource, possession.source, possession.jeton[:8],
+                    possession.generation,
+                    courant.source if courant else "aucune",
+                    (courant.jeton[:8] if courant else "—"),
+                    (courant.generation if courant else "—"))
+                return False
+            self._possession = None
+            self._derniere_activite_mono = time.monotonic()
+            self._expiration_explicite = False
+            return True
+
+    def _est_proprietaire(self, possession: Possession | None) -> bool:
+        if possession is None or self._possession is None:
+            return False
+        return (self._possession.jeton == possession.jeton
+                and self._possession.generation == possession.generation
+                and self._possession.ressource == possession.ressource)
+
+    # ---------------------------------------------------- expiration explicite
+    def expirer(self, raison: str = "expiration") -> Possession | None:
+        """Expiration EXPLICITE (surveillance ou administration) : renvoie la
+        possession sortante, invalide son jeton, et NE remplace pas la
+        possession — la prochaine acquisition créera un jeton neuf."""
+        with self._mutex:
+            sortante = self._possession
+            if sortante is None:
+                return None
+            self._expirations += 1
+            self._generation += 1          # tout jeton antérieur devient caduc
+            self._possession = None
+            self._expiration_explicite = True
+            log.warning("Verrou « %s » expiré explicitement (%s) — propriétaire « %s » "
+                        "(%.1fs), jeton %s invalidé",
+                        self.ressource, raison, sortante.source,
+                        sortante.duree_s(), sortante.jeton[:8])
+            return sortante
+
+    def forcer(self, raison: str = "manuel") -> bool:
+        """Alias administratif (API /api/sante/reset-verrou)."""
+        return self.expirer(raison=raison) is not None
+
+    # ------------------------------------------------------------------ état
+    def etat(self) -> dict:
+        with self._mutex:
+            maintenant = time.monotonic()
+            p = self._possession
+            return {
+                "ressource": self.ressource,
+                "occupe": p is not None,
+                "proprietaire": p.source if p else None,
+                "jeton": (p.jeton[:8] if p else None),
+                "generation": self._generation,
+                "pris_le": p.pris_le if p else None,
+                "derniere_activite": (
+                    datetime.fromtimestamp(
+                        time.time() - (maintenant - self._derniere_activite_mono)
+                    ).isoformat(timespec="seconds")
+                    if self._derniere_activite_mono else None),
+                "duree_s": p.duree_s(maintenant) if p else None,
+                "expire_dans_s": p.expire_dans_s(maintenant) if p else None,
+                "expirations": self._expirations,
+                "refus": self._refus,
+                "liberations_refusees": self._liberations_refusees,
+            }
+
+    @property
+    def occupe(self) -> bool:
+        with self._mutex:
+            return self._possession is not None
+
+    @property
+    def proprietaire(self) -> str | None:
+        with self._mutex:
+            return self._possession.source if self._possession else None
+
+
+# ─────────────────────────────────────────────────────────── registre global
+_VERROUS: dict[str, VerrouPossede] = {}
+_VERROUS_MUTEX = threading.Lock()
+N1_RESSOURCES = ("MZONEX", "CAMTRACKPRO", "MZONEX_RELECTURE")
+
+
+def est_n2(ressource: str) -> bool:
+    return ressource.startswith("N2_")
+
+
+def verrou_de(ressource: str, duree_defaut_s: float = 30.0) -> VerrouPossede:
+    """Verrou d'une ressource (créé à la demande, stable ensuite)."""
+    with _VERROUS_MUTEX:
+        v = _VERROUS.get(ressource)
+        if v is None:
+            v = VerrouPossede(ressource, duree_defaut_s=duree_defaut_s)
+            _VERROUS[ressource] = v
+        return v
+
+
+def etat_verrous() -> dict[str, dict]:
+    with _VERROUS_MUTEX:
+        verrous = dict(_VERROUS)
+    return {nom: v.etat() for nom, v in verrous.items()}
+
+
+def etat_famille(n2: bool) -> dict:
+    """État agrégé d'une famille (N1 ou N2) — pour `/api/sante`.
+    `acquis_par` liste les sources qui détiennent un verrou de la famille."""
+    etats = {n: e for n, e in etat_verrous().items() if est_n2(n) == n2}
+    detenteurs = sorted(e["proprietaire"] for e in etats.values() if e["occupe"])
+    durees = [e["duree_s"] for e in etats.values()
+              if e["occupe"] and e["duree_s"] is not None]
+    return {
+        "occupe": bool(detenteurs),
+        "acquis_par": detenteurs,
+        "duree_s": (max(durees) if durees else None),
+        "par_source": etats,
+        "expirations": sum(e["expirations"] for e in etats.values()),
+        "liberations_refusees": sum(e["liberations_refusees"] for e in etats.values()),
+    }
+
+
+def forcer_famille(n2: bool, raison: str = "manuel") -> bool:
+    with _VERROUS_MUTEX:
+        verrous = dict(_VERROUS)
+    touche = False
+    for nom, v in verrous.items():
+        if est_n2(nom) == n2:
+            touche = v.forcer(raison=raison) or touche
+    return touche
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2. BUDGET DE PASSE + POINTS D'ARRÊT CONTRÔLÉS
+# ════════════════════════════════════════════════════════════════════════════
+ETAPES = ("verrou", "authentification", "attente_http", "pagination",
+          "vehicule", "parsing", "ecriture", "inconnue")
+
+
+class BudgetDepasse(Exception):
+    """La passe a atteint son échéance. `etape` dit OÙ le temps a été passé :
+    c'est cette étape (et non un « échec local » générique) qui est publiée."""
+
+    def __init__(self, etape: str, ecoule_s: float, budget_s: float,
+                 source: str | None = None) -> None:
+        self.etape = etape if etape in ETAPES else "inconnue"
+        self.ecoule_s = round(float(ecoule_s), 1)
+        self.budget_s = round(float(budget_s), 1)
+        self.source = source
+        super().__init__(
+            f"Budget de collecte dépassé ({self.budget_s}s, étape « {self.etape} ») "
+            f"— arrêt contrôlé, replanifié au prochain cycle")
+
+
+class VerrouOccupe(Exception):
+    """La passe n'a pas pu démarrer : une autre tâche détient la ressource."""
+
+
+@dataclass
+class Metriques:
+    """Métriques par étape d'une passe (publiées dans /api/sante)."""
+
+    source: str = "?"
+    total_s: float = 0.0
+    auth_s: float = 0.0
+    attente_http_s: float = 0.0
+    pagination_s: float = 0.0
+    vehicule_s: float = 0.0
+    parsing_s: float = 0.0
+    ecriture_s: float = 0.0
+    attente_verrou_s: float = 0.0
+    attente_sqlite_s: float = 0.0
+    nb_pages: int = 0
+    nb_vehicules: int = 0
+    nb_lignes: int = 0
+    nb_points_ecrits: int = 0
+    etape_bloquante: str | None = None
+    issue: str = "EN_COURS"
+
+    def _champ(self, champ: str, suffixe: str = "") -> str | None:
+        """Résout le nom RÉEL du champ : `chrono("auth")` doit alimenter
+        `auth_s`. Sans cette résolution, toute mesure de phase était
+        silencieusement perdue (défaut trouvé par la suite v154)."""
+        for candidat in (champ, f"{champ}{suffixe}"):
+            if candidat and hasattr(self, candidat):
+                return candidat
+        return None
+
+    def ajouter(self, champ: str, secondes: float) -> None:
+        nom = self._champ(champ, "_s")
+        if nom:
+            setattr(self, nom, round(getattr(self, nom) + float(secondes), 3))
+
+    def compter(self, champ: str, n: int = 1) -> None:
+        nom = self._champ(champ)
+        if nom:
+            setattr(self, nom, int(getattr(self, nom)) + int(n))
+
+    def depouiller(self) -> dict:
+        return {c: getattr(self, c) for c in (
+            "source", "total_s", "auth_s", "attente_http_s", "pagination_s",
+            "vehicule_s", "parsing_s", "ecriture_s", "attente_verrou_s",
+            "attente_sqlite_s", "nb_pages", "nb_vehicules", "nb_lignes",
+            "nb_points_ecrits", "etape_bloquante", "issue")}
+
+    def etape_dominante(self) -> str:
+        """Étape qui a le plus consommé de temps — sert à nommer la cause d'un
+        dépassement de budget au lieu de la classer « locale » d'office."""
+        phases = {
+            "authentification": self.auth_s,
+            "attente_http": self.attente_http_s,
+            "pagination": self.pagination_s,
+            "vehicule": self.vehicule_s,
+            "parsing": self.parsing_s,
+            "ecriture": self.ecriture_s,
+            "verrou": self.attente_verrou_s,
+        }
+        nom, valeur = max(phases.items(), key=lambda it: it[1])
+        return nom if valeur > 0 else "inconnue"
+
+
+class PasseCourante:
+    """Budget + métriques de la passe en cours DANS CE FIL D'EXÉCUTION."""
+
+    def __init__(self, source: str, budget_s: float) -> None:
+        self.source = source
+        self.budget_s = float(budget_s)
+        self.debut_mono = time.monotonic()
+        self.metriques = Metriques(source=source)
+        self.annulee = False
+        self.annulee_raison: str | None = None
+        self.etape_courante = "inconnue"
+
+    # ----------------------------------------------------------- échéance
+    def ecoule_s(self) -> float:
+        return time.monotonic() - self.debut_mono
+
+    def restant_s(self) -> float:
+        return self.budget_s - self.ecoule_s()
+
+    def depassee(self) -> bool:
+        return self.annulee or self.restant_s() <= 0
+
+    def verifier(self, etape: str = "inconnue") -> None:
+        """Point d'arrêt contrôlé : lève BudgetDepasse si l'échéance est
+        atteinte. À appeler AVANT chaque travail coûteux (page, véhicule,
+        lot d'écriture) : c'est ce qui garantit qu'aucune écriture n'a lieu
+        après l'échéance."""
+        self.etape_courante = etape
+        if self.depassee():
+            self.annulee = True
+            self.metriques.etape_bloquante = etape
+            raise BudgetDepasse(
+                etape if self.annulee_raison is None else self.annulee_raison,
+                self.ecoule_s(), self.budget_s, source=self.source)
+
+    def annuler(self, raison: str = "annulation") -> None:
+        self.annulee = True
+        self.annulee_raison = raison
+
+    # ----------------------------------------------------------- clôture
+    def terminer(self, issue: str) -> dict:
+        self.metriques.total_s = round(self.ecoule_s(), 3)
+        self.metriques.issue = issue
+        if self.metriques.etape_bloquante is None and self.annulee:
+            self.metriques.etape_bloquante = self.annulee_raison
+        if self.metriques.etape_bloquante is None:
+            self.metriques.etape_bloquante = self.metriques.etape_dominante()
+        return self.metriques.depouiller()
+
+
+# ────────────────────────────────────────────────── passe courante (par fil)
+_COURANT = threading.local()
+_DERNIERES_METRIQUES: dict[str, dict] = {}
+_METRIQUES_MUTEX = threading.Lock()
+
+
+def mesurer(champ: str, depuis_mono: float | None) -> None:
+    """Ajoute au compteur `champ` le temps écoulé depuis `depuis_mono`.
+
+    Utile quand l'entourage d'un bloc par `with chrono(...)` n'est pas possible
+    sans réindenter un long corps de boucle (ex. : traitement par véhicule)."""
+    if depuis_mono is None:
+        return
+    passe = passe_courante()
+    if passe is not None:
+        passe.metriques.ajouter(champ, time.monotonic() - depuis_mono)
+
+
+def passe_courante() -> PasseCourante | None:
+    return getattr(_COURANT, "passe", None)
+
+
+@contextmanager
+def activer_passe(passe: PasseCourante):
+    """Installe la passe pour CE fil (les passes concurrentes ne se mélangent
+    pas : chaque fil a la sienne)."""
+    ancienne = getattr(_COURANT, "passe", None)
+    _COURANT.passe = passe
+    try:
+        yield passe
+    finally:
+        _COURANT.passe = ancienne
+
+
+def publier_metriques(depouillees: dict) -> None:
+    with _METRIQUES_MUTEX:
+        _DERNIERES_METRIQUES[depouillees.get("source", "?")] = depouillees
+
+
+def metriques_publiees() -> dict[str, dict]:
+    with _METRIQUES_MUTEX:
+        return {k: dict(v) for k, v in _DERNIERES_METRIQUES.items()}
+
+
+# ─────────────────── passes en cours (surveillance NON intrusive) ───────────
+# La surveillance ne VOLE JAMAIS un verrou : si une passe dépasse sa limite,
+# elle est ANNULÉE de façon coopérative (elle s'arrête à son prochain point
+# d'arrêt et libère elle-même son jeton). C'est ce qui évite la double écriture
+# qu'occasionnait l'ancienne « auto-libération » par échange d'objet.
+_PASSES: dict[str, PasseCourante] = {}
+_PASSES_MUTEX = threading.Lock()
+
+
+def enregistrer_passe(ressource: str, passe: PasseCourante) -> None:
+    with _PASSES_MUTEX:
+        _PASSES[ressource] = passe
+
+
+def retirer_passe(ressource: str, passe: PasseCourante | None = None) -> None:
+    with _PASSES_MUTEX:
+        courante = _PASSES.get(ressource)
+        if courante is not None and (passe is None or courante is passe):
+            _PASSES.pop(ressource, None)
+
+
+def passe_de(ressource: str) -> PasseCourante | None:
+    with _PASSES_MUTEX:
+        return _PASSES.get(ressource)
+
+
+def passes_en_cours() -> dict[str, dict]:
+    with _PASSES_MUTEX:
+        return {r: {"source": p.source, "ecoule_s": round(p.ecoule_s(), 1),
+                    "budget_s": p.budget_s, "etape": p.etape_courante,
+                    "annulee": p.annulee}
+                for r, p in _PASSES.items()}
+
+
+# ─────────────────────────── aides utilisées par le code instrumenté
+@contextmanager
+def chrono(champ: str):
+    """Mesure une phase (auth, pagination, parsing, écriture…). Sans passe
+    active, ne fait rien (les outils hors collecte restent inchangés)."""
+    passe = passe_courante()
+    if passe is None:
+        yield
+        return
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        passe.metriques.ajouter(champ, time.monotonic() - t0)
+
+
+def compter(champ: str, n: int = 1) -> None:
+    passe = passe_courante()
+    if passe is not None:
+        passe.metriques.compter(champ, n)
+
+
+def verifier_etape(etape: str) -> None:
+    passe = passe_courante()
+    if passe is not None:
+        passe.verifier(etape)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3. CLASSIFICATION FINE DES ÉCHECS (le statut ne doit plus tout confondre)
+# ════════════════════════════════════════════════════════════════════════════
+CLASSE_PORTAIL_INDISPONIBLE = "portail_indisponible"
+CLASSE_PORTAIL_LENT = "portail_lent"
+CLASSE_ATTENTE_SQLITE = "attente_sqlite"
+CLASSE_VERROU_OCCUPE = "verrou_occupe"
+CLASSE_BUDGET_DEPASSE = "budget_depasse"
+CLASSE_CONFIGURATION_ABSENTE = "configuration_absente"
+CLASSE_COLLECTE_EN_COURS = "collecte_en_cours"
+CLASSE_COLLECTE_ECHOUEE = "collecte_echouee"
+
+CLASSES = (CLASSE_PORTAIL_INDISPONIBLE, CLASSE_PORTAIL_LENT, CLASSE_ATTENTE_SQLITE,
+           CLASSE_VERROU_OCCUPE, CLASSE_BUDGET_DEPASSE, CLASSE_CONFIGURATION_ABSENTE,
+           CLASSE_COLLECTE_EN_COURS, CLASSE_COLLECTE_ECHOUEE)
+
+MOTIFS_SQLITE = ("database is locked", "database table is locked", "sqlite_busy",
+                 "database is busy", "disk i/o error", "no space left",
+                 "readonly database", "read-only database",
+                 "attempt to write a readonly", "unable to open database")
+MOTIFS_CONFIGURATION = ("mzonex_user", "mzonex_password", "absents de backend/.env",
+                        "jeton non configuré", "token absent", "non configuré",
+                        "not configured", "aucun groupe de véhicules publié")
+MOTIFS_PORTAIL_INDISPONIBLE = ("httpx.connecterror", "connecterror", "tls/ssl",
+                               "name or service not known", "temporary failure in name resolution",
+                               "connection refused", "connection reset", "http 401", "http 403",
+                               "http 500", "http 502", "http 503", "http 504", "injoignable",
+                               "erreurauth", "erreurapi", "timeout après")
+
+# Étapes d'une passe dont le dépassement n'est PAS un défaut de notre
+# infrastructure : le portail (ou le réseau) est lent. C'est exactement ce que
+# l'ancien code classait « locale » d'office.
+ETAPES_PORTAIL = ("authentification", "attente_http", "pagination", "vehicule")
+ETAPES_LOCALES = ("ecriture", "verrou")
+
+
+def classer_erreur(exc: BaseException) -> dict:
+    """Classe FINE d'un échec + catégorie historique (« locale »/« portail »).
+
+    Le statut de santé s'appuie sur la CLASSE : un dépassement de budget passé
+    à attendre le portail n'est plus annoncé comme un problème local.
+    """
+    texte = f"{type(exc).__name__}: {exc}".lower()
+    etape = getattr(exc, "etape", None)
+
+    if isinstance(exc, VerrouOccupe):
+        return {"classe": CLASSE_VERROU_OCCUPE, "categorie": "locale",
+                "etape": "verrou"}
+    if isinstance(exc, BudgetDepasse):
+        if etape in ETAPES_PORTAIL:
+            return {"classe": CLASSE_PORTAIL_LENT, "categorie": "locale",
+                    "etape": etape}
+        if etape in ETAPES_LOCALES:
+            return {"classe": (CLASSE_ATTENTE_SQLITE if etape == "ecriture"
+                               else CLASSE_VERROU_OCCUPE),
+                    "categorie": "locale", "etape": etape}
+        return {"classe": CLASSE_BUDGET_DEPASSE, "categorie": "locale",
+                "etape": etape}
+    if any(m in texte for m in MOTIFS_SQLITE):
+        return {"classe": CLASSE_ATTENTE_SQLITE, "categorie": "locale",
+                "etape": etape}
+    if any(m in texte for m in MOTIFS_CONFIGURATION):
+        return {"classe": CLASSE_CONFIGURATION_ABSENTE, "categorie": "portail",
+                "etape": etape}
+    if any(m in texte for m in MOTIFS_PORTAIL_INDISPONIBLE):
+        return {"classe": CLASSE_PORTAIL_INDISPONIBLE, "categorie": "portail",
+                "etape": etape}
+    return {"classe": CLASSE_COLLECTE_ECHOUEE, "categorie": "portail",
+            "etape": etape}
+
+
+def distinguer_erreur_locale(texte_erreur: str) -> bool:
+    """Compatibilité : « l'échec vient-il de NOTRE infrastructure ? »"""
+    t = (texte_erreur or "").lower()
+    return (any(m in t for m in MOTIFS_SQLITE)
+            or "budget de collecte" in t
+            or "verrou" in t and "occupe" in t)
