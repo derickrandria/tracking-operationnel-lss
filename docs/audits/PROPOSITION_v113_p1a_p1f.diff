@@ -6,7 +6,7 @@ Vérifiée en copie : 46 OK / 0 KO (2 exécutions). Aucune attente métier modif
 diff --git a/backend/test_chaines_v113.py b/backend/test_chaines_v113.py
 index a46176d..7d326ff 100644
 --- a/backend/test_chaines_v113.py
-+++ b/tmp/prop_v113.py
++++ b/backend/test_chaines_v113.py (PROPOSITION — NON APPLIQUÉE)
 @@ -74,7 +74,7 @@ from sqlalchemy import delete, select  # noqa: E402
  from app.config import now_local  # noqa: E402  (= _horloge_figee)
  from app.database import SessionLocal
