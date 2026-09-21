@@ -2,7 +2,9 @@
 
 **Objet** : décider si la branche de travail peut être **fusionnée dans `main`** (donc déployée en
 production).
-**Audit initial** : 18 septembre 2026. **Version finale** : 21 septembre 2026.
+**Audit initial** : 18 septembre 2026. **Version finale** : 21 septembre 2026 — **mise à jour**
+après le correctif d'exécution de `test_reglement_metier_missions` (commit `d2d1e57`) et le
+correctif d'étiquetage de l'outil de campagne (commit `092bf12`).
 **Auditeur** : agent technique, sur demande du responsable (Lead Backend & Data Systems).
 **Public** : personne **non développeuse** — chaque terme technique est expliqué, chaque chiffre
 est reproductible par une commande citée en §3.
@@ -42,7 +44,10 @@ construction).
 
 | Élément | Valeur |
 |---|---|
-| **Commit analysé (tête de branche)** | `f56edf7` — `fix(conducteurs, v1.54): fiche auto « AUTO-xxxxxxxx » rétablie et surcharge D5 de nouveau respectée` |
+| **Commit analysé (tête de branche)** | `092bf12` — `fix(qc): une suite instable n'est plus annoncée comme un « CRASH »` |
+| Commit précédent | `d2d1e57` — `test_reglement_metier_missions` **exécutable depuis n'importe quel répertoire** |
+| Commit précédent | `e419849` — rapport GO/NO-GO déposé dans `docs/audits/` |
+| Commit précédent | `f56edf7` — **étape 2** : anti-doublon des chauffeurs |
 | Contenu de ce commit | `backend/app/engine.py` (+36/−4) · `backend/test_conducteurs_dedoublonnage_v138.py` (+20/−2) |
 | Commit précédent | `0523251` — contrôle qualité de l'étape 1 (outil de campagne, `test_chaines_v113` déterministe, journal de configuration) |
 | Commit précédent | `691559a` — étape 1 : fenêtre de rattrapage des boîtiers muets **rétablie à 3 h** |
@@ -112,14 +117,28 @@ grep -rn "MZONEX_API_FENETRE_MAX_S" backend/app backend/.env.exemple
     --json /tmp/campagne_finale.json
 ```
 
-### 3.4 Une suite, isolément (bases temporaires uniquement)
+### 3.4 `test_reglement_metier_missions` — commande exacte (corrigée le 21/09)
+
+```bash
+# Depuis la RACINE du dépôt — aucune variable, aucune configuration manuelle :
+python backend/test_reglement_metier_missions.py
+
+# Équivalents (intégration continue) :
+python -m unittest backend.test_reglement_metier_missions -v
+python -m unittest discover -s backend -p "test_reglement_metier_missions.py"
+```
+La base de test est créée automatiquement dans le dossier temporaire du système ; une
+`DATABASE_URL` fournie doit désigner une **base de test** (la base applicative réelle est
+**refusée**, code de retour 2).
+
+### 3.5 Une suite, isolément (bases temporaires uniquement)
 
 ```bash
 DATABASE_URL="sqlite:////tmp/<nom_de_la_suite>.db" \
   /tmp/lssvenv/bin/python backend/<nom_de_la_suite>.py
 ```
 
-### 3.5 Preuve de déterminisme de `test_chaines_v113` (5 exécutions)
+### 3.6 Preuve de déterminisme de `test_chaines_v113` (5 exécutions)
 
 ```bash
 for i in 1 2 3; do  # 3 exécutions consécutives
@@ -130,7 +149,7 @@ APP_TZ="Asia/Tokyo" DATABASE_URL="sqlite:////tmp/det_tz2.db" python backend/test
 #   → RÉSULTAT : 40 OK / 1 KO  dans les 5 cas
 ```
 
-### 3.6 Écran (frontend)
+### 3.7 Écran (frontend)
 
 ```bash
 cd frontend && npm ci && npx tsc --noEmit && npm test   # 0 erreur de type · 12/12 tests
@@ -172,7 +191,8 @@ sont plus comptées comme des crashs : les sorties standard et d'erreur sont ana
 | `main` (état initial) | 34 | 32 | 1 | 0 | 0 | 1 |
 | Avant l'étape 1 (`5a00211`) | 55 | 42 | 7 | 3 | 2 | 1 |
 | Après l'étape 1 + contrôle qualité | 56 | 46 | 4 | 3 | 2 | 1 |
-| **Après l'étape 2 (commit analysé)** | **56** | **49** | **3** | **1** | **2** | **1** |
+| Après l'étape 2 | 56 | 49 | 3 | 1 | 2 | 1 |
+| **Après les correctifs d'exécution (`d2d1e57`, `092bf12`)** | **56** | **49** | **3** | **0** | **2** | **1** + **1 instable** |
 
 > Le nombre de suites **augmente avec la branche** : les correctifs apportent leurs propres tests
 > de preuve (`test_fenetre_3h_v154`, `test_repli_api_v154`, `test_suppression_zero_v154`,
@@ -353,15 +373,18 @@ donc **hors** du périmètre des correctifs de la session ; **1 seul** reste un 
 
 ## 6. LES TESTS CRASHÉS
 
-**1 suite** s'arrête brutalement, donc **ne prouve rien** :
+**AUCUN crash** sur la dernière campagne : **0 suite** s'arrête brutalement. Les **trois** crashs
+constatés pendant cet audit sont tous corrigés :
 
-| Suite | Message | Cause | Origine | Statut |
-|---|---|---|---|---|
-| `test_reglement_metier_missions` | `ModuleNotFoundError: No module named 'backend'` (exception à l'import) | Le harnais du test utilise un chemin d'import incorrect | **Test** (pas le produit) | À corriger : erreur d'invocation, **aucun** défaut produit démontré |
+| Suite | Avant | Après | Correctif |
+|---|---|---|---|
+| `test_referentiel_v121` | 💥 plantait | ✅ **20/0** | Matricule `AUTO-…` rétabli (étape 2) |
+| `test_conducteurs_dedoublonnage_v138` | 💥 plantait | ✅ **26/0** | Idem + recherche de test non ambiguë |
+| `test_reglement_metier_missions` | 💥 plantait | ✅ **4 tests / OK** | Amorçage : racine du dépôt déduite du fichier, plus de dépendance au répertoire courant, base de test temporaire automatique (commit `d2d1e57`) |
 
-**Deux anciens crashs sont corrigés** par le commit analysé : `test_referentiel_v121` et
-`test_conducteurs_dedoublonnage_v138` plantaient (`AttributeError` sur un matricule absent) et
-rendent maintenant respectivement **20/0** et **26/0**.
+> **Honnêteté du chiffre.** La suite **INSTABLE** `test_verrous_sqlite_v150` n'est **pas** comptée
+> comme un crash : elle alterne entre « RÉUSSI » et « ÉCHOUÉ » (voir §7) — elle n'a **jamais**
+> planté.
 
 ---
 
@@ -374,9 +397,14 @@ rendent maintenant respectivement **20/0** et **26/0**.
 | `test_e2e_reel_v113` | ⏭️ non exécuté | Saut explicite : **pas de base bac à sable** — la suite s'abstient d'elle-même | **Environnement** | Attendu : aucun accès à une base réelle n'est autorisé |
 | `test_mzonex_ping` | ⏭️ non exécuté | Hôte des portails **injoignable** (aucun accès réseau) — exit 0 | **Environnement** | Contrôle de **connectivité**, pas une suite fonctionnelle |
 | `test_runner_complet` | ❓ non concluant | Code de retour 1, **aucun bilan lisible** | **Test** (invocation) | Le lanceur cherche un chemin `backend/backend/…` **inexistant** → à corriger |
+| `test_verrous_sqlite_v150` | 🔁 **instable** | Alterne « RÉUSSI » (18/0) et « ÉCHOUÉ » (17/1) | **Test** (minutage) | Préexistant (18/09) — ne compte ni comme réussite ni comme plantage |
 
-**Aucune instabilité** n'a été détectée : `test_verrous_sqlite_v150`, **historiquement instable**,
-est stable (18/0) sur les passes du 21/09 — à reconfirmer avant de déclarer l'instabilité éteinte.
+**Une instabilité est CONFIRMÉE** : `test_verrous_sqlite_v150` (voir §6) alterne entre **18/0** et
+**17/1** selon les exécutions (1 échec sur ~8 exécutions isolées). Son contrôle porte sur la
+**concurrence** (« un écrivain concurrent finit TOUJOURS par être servi en moins de 5 s ») : il est
+**sensible au minutage** de la machine. Instabilité **préexistante** (constatée le 18/09) et
+**imputable au test**, pas au produit. Depuis le commit `092bf12`, une suite instable a sa **propre
+rubrique** et n'est comptée **ni comme réussite, ni comme plantage**.
 
 ---
 
@@ -422,7 +450,8 @@ est stable (18/0) sur les passes du 21/09 — à reconfirmer avant de déclarer 
 |---|---|---|
 | **1 défaut produit non corrigé** | `D4-2` — une ligne « en cours » n'est pas refermée à sa vraie fin (`v130`, 1 contrôle) | 🟠 À traiter |
 | **2 échecs préexistants non instruits** | `v113` (1 contrôle) et `v145` (1 contrôle) échouent **aussi sur `main`** | 🟠 À traiter |
-| **1 suite qui plante** | `reglement_metier_missions` (erreur de chemin d'import) : elle ne prouve rien | 🟠 À corriger |
+| ~~1 suite qui plante~~ | ✅ **Corrigée** (`reglement_metier_missions`, commit `d2d1e57`) : **0 crash** sur la dernière campagne | ✅ Levée |
+| **1 suite instable** | `test_verrous_sqlite_v150` alterne RÉUSSI / ÉCHOUÉ (minutage, préexistant) | 🟠 À instruire |
 | **3 suites sans verdict** | Environnement (2) et invocation (1) — **rien n'est prouvé** sur leur périmètre | 🟠 À rendre exécutables |
 | **Limites de l'audit** | Aucune donnée de production, aucun accès réseau, aucune recette opérateur (§8) | ℹ️ À connaître |
 
@@ -460,6 +489,9 @@ réelle ou modifier `main` **avant** que ces étapes soient faites et prouvées.
 | 3 | `691559a` | **Étape 1** : profondeur de rattrapage **3 h** rétablie, tranche 15 min, garde-fou de configuration |
 | 4 | `0523251` | **Contrôle qualité de l'étape 1** : outil de campagne à 5 catégories, `test_chaines_v113` **déterministe**, configuration journalisée au démarrage |
 | 5 | `f56edf7` | **Étape 2** : matricule `AUTO-xxxxxxxx` rétabli, liste D5 de nouveau surchargeable, recherche de test non ambiguë |
+| 6 | `e419849` | Rapport GO/NO-GO déposé dans `docs/audits/` |
+| 7 | `d2d1e57` | `test_reglement_metier_missions` **exécutable depuis n'importe quel répertoire** (racine déduite du fichier, base de test temporaire, garde-fou anti-base applicative) |
+| 8 | `092bf12` | Outil de campagne : une suite **instable** a sa propre rubrique (plus de faux « crash ») |
 
 ## ANNEXE B — Spécification et amendement
 
