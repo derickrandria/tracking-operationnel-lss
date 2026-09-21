@@ -366,7 +366,7 @@ cd /home/user/tracking-operationnel-lss
 /tmp/lssvenv/bin/python backend/campagne_tests_v154.py --json \
     docs/audits/campagne_v154_resultats.json
 #   → 54 réussies / 3 échouées / 0 plantée / 2 non exécutées / 0 non concluante
-#     (v150 : instable — voir §9.6, **levé au §10.1** ; campagne finale après arbitrages : **56 / 1 / 0 / 2** — voir §10.7)
+#     (v150 : instable — voir §9.6, **levé au §10.1** ; campagne finale après arbitrages : **57 / 0 / 0 / 2** — voir §10.7)
 ```
 
 - Environnement : sandbox sans accès réseau, Python 3.11, SQLite (WAL), bases de
@@ -493,7 +493,7 @@ point. Ce chapitre **remplace l'état du §6** et **lève l'instabilité décrit
 |---|---|---|---|
 | 1 | `test_verrous_sqlite_v150` totalement déterministe, ≥ 10 exécutions vertes | ✅ **FAIT** | §10.1 — 13 exécutions, 19 contrôles, 0 KO |
 | 2 | D4-2 analysé **sans aucune modification** de code ni d'assertion | ✅ **FAIT** — arbitrage rendu : correction de la **fixture** | §10.2 |
-| 3 | v113 : ancienne assertion montrée + proposition d'assertion | ⏳ **DIFF SOUMIS POUR REVUE** — non appliqué | §10.3 |
+| 3 | v113 : ancienne assertion montrée + proposition d'assertion | ✅ **FAIT** — P1a→P1l appliqués (51 OK / 0 KO) | §10.3 |
 | 4 | v145 : fixture temporelle indépendante de la date réelle | ✅ **FAIT** | §10.4 |
 | 4bis | *Découvert en 3ᵉ passe* : `test_validite_v15`, même défaut de fixture | ✅ **FAIT** — appliqué le 21/09 | §10.5 |
 | 5 | Recette de préproduction, lecture seule, logs vérifiables | ✅ **OUTIL + PROCÉDURE LIVRÉS** — exécution réelle à faire | §10.6 |
@@ -576,7 +576,7 @@ rendu **ACTIF** juste avant le scénario D4, avec un commentaire du pourquoi ; l
 **Preuve** : 3 exécutions → **28 OK / 0 KO** chacune (avant : 27 OK / 1 KO). Dans la
 campagne rejouée, la suite passe de ÉCHOUÉ à **RÉUSSI**.
 
-### 10.3 Point 3 — `test_chaines_v113` : ancienne assertion, proposition (diff soumis)
+### 10.3 Point 3 — `test_chaines_v113` : assertion périmée remplacée (P1a→P1l) ✅
 
 **Ancienne assertion** (`backend/test_chaines_v113.py` l.261-262) : `len(restants_b) == 4`
 — elle compte les lignes restantes en base après rejeu.
@@ -586,24 +586,31 @@ campagne rejouée, la suite passe de ÉCHOUÉ à **RÉUSSI**.
 base, marqué `REJETE`, avec son motif et une trace d'audit. Le compte réel est donc
 **5** (4 fragments officiels + le jumeau conservé), et non 4.
 
-**Proposition (testée en copie, non appliquée)** — remplacer le comptage nu par six
-contrôles qui décrivent la règle réellement en vigueur :
+**Remplacement appliqué** (commit `06e3571`, `backend/test_chaines_v113.py` uniquement —
+**aucun code métier, `SPEC_RULES_v3.md` inchangée**) : le comptage nu est remplacé par
+**onze contrôles** qui décrivent la règle en vigueur. Sur votre demande du 21/09, la
+projection d'affichage est désormais vérifiée explicitement, point par point.
 
-| Ref | Contrôle |
-|---|---|
-| P1a | le jumeau périmé est **conservé en base**, statut `REJETE`, motif `DOUBLON_JUMEAU` |
-| P1b | les **4 fragments officiels** sont conservés |
-| P1c | **une seule** ligne non écartée, à 06:05:34 |
-| P1d | le masquage est **audité** (`AuditLog`, motif) |
-| P1e | TCJ = **4 fragments seulement** (le jumeau écarté est exclu des compteurs) |
-| P1f | TTJ = 06:05:34 → 09:48:14 |
+| Ref | Contrôle | Vérifie |
+|---|---|---|
+| P1a | jumeau **conservé en base**, statut `REJETE`, motif `DOUBLON_JUMEAU` | présence en base |
+| P1b | les **4 fragments officiels** sont conservés | conservation |
+| P1c | **un seul** enregistrement non écarté à 06:05:34 | absence de doublon |
+| P1d | écartement **audité** (`AuditLog` — `trajet.jumeau_fusionne`) | présence dans l'audit |
+| P1e | TCJ = **4 fragments seulement** | absent des compteurs |
+| P1f | TTJ = 06:05:34 → 09:48:14 | absent des compteurs |
+| P1g | jumeau **absent de la projection Suivi active** (1 seule séquence, aucune ligne ouverte) | onglet Suivi |
+| P1i | jumeau **absent de l'Historique actif** (snapshot canonique + fusion) | onglet Historique |
+| P1j | jumeau **absent de l'export Excel** (1 ligne, 06:05 → 09:48, aucun motif de rejet) | export Excel |
+| P1k | jumeau **absent de l'export PDF** (idem) | export PDF |
+| P1l | les 4 trajets officiels restent **visibles** (4 segments en 1 ligne, règle de séquence) | visibilité |
 
-Résultat de la version proposée en copie : **46 OK / 0 KO** (version actuelle : 41/1).
-Un import `AuditLog` doit être ajouté (l.77). **Aucune assertion n'est affaiblie** : la
-présence du jumeau est désormais *prouvée* au lieu d'être supposée absente.
-
-**Diff exact soumis à revue** : `docs/audits/PROPOSITION_v113_p1a_p1f.diff` — **non
-appliqué**. Vérifié deux fois en copie : **46 OK / 0 KO**.
+**Aucune attente métier n'est modifiée, aucune assertion n'est affaiblie** : la présence du
+jumeau en base *et* son absence dans chaque projection sont maintenant **prouvées**, au lieu
+d'être supposées. Preuve d'exécution : **51 OK / 0 KO**, trois exécutions (avant : 41/1).
+Le fichier de proposition `docs/audits/PROPOSITION_v113_p1a_p1f.diff` est conservé comme
+trace de la revue (il porte les six contrôles P1a→P1f) ; les cinq contrôles de projection
+(P1g→P1l) ont été ajoutés avant le commit, conformément à la consigne.
 
 ### 10.4 Point 4 — `test_positions_portails_v145` : fixture temporelle ✅
 
@@ -691,7 +698,7 @@ journal** ici. Critères d'acceptation : mode d'emploi, §6.
 |---|---|---|
 | 1 | Les tests N2 sont ajoutés | ✅ **FAIT** — 64 contrôles |
 | 2 | Les échecs sont **expliqués** | ✅ **FAIT** — v113, v145, v130 (§4) + v15 (§10.5) |
-| 3 | Les échecs sont **corrigés** | ⚠️ **PARTIEL** — v145, v15 et v130 corrigés et verts ✅ ; **v113 : diff soumis pour revue** (seule suite encore en échec) |
+| 3 | Les échecs sont **corrigés** | ✅ **FAIT** — v145, v15, v130 et v113 corrigés : **aucune suite en échec** (v113 : 51 OK / 0 KO) |
 | 4 | Les suites non exécutées sont **traitées** | ⚠️ **PARTIEL** — outil + procédure livrés (§10.6) ; verdicts de préproduction **non obtenus** à ce jour |
 | 5 | Le test non concluant est résolu | ✅ **FAIT** — runner 8/8 |
 | 6 | Aucun crash, aucune instabilité non expliquée | ✅ **0 crash**, **0 suite instable** ; v150 déterministe 13/13 (§10.1) ; v15 corrigée (§10.5) |
@@ -700,15 +707,32 @@ journal** ici. Critères d'acceptation : mode d'emploi, §6.
 
 **Ce qui bloque encore, exactement** :
 
-- (a) **une** correction de test encore non appliquée — **v113** : diff soumis pour
-  revue (`docs/audits/PROPOSITION_v113_p1a_p1f.diff`), validé en copie (46 OK / 0 KO) ;
-- (b) les **deux verdicts de préproduction** non obtenus (aucun accès réseau ici) ;
-- (c) la campagne n'est pas verte : **56 réussies / 1 échouée / 0 plantée /
-  2 non exécutées** — l'unique échec est v113 (test périmé, correction validée en copie).
+- (a) **il ne reste plus aucune correction de test en attente** : les quatre suites
+  concernées (v113, v145, v15, v130) sont corrigées et vertes ;
+- (b) **seul verrou restant** : les **deux verdicts de préproduction** non obtenus — aucun
+  accès réseau dans cet environnement (`test_mzonex_ping`, `test_e2e_reel_v113`). La recette
+  est prête (§10.6) et doit être exécutée sur le poste de préproduction, réseau réel actif ;
+- (c) campagne : **57 réussies / 0 échouée / 0 plantée / 2 non exécutées**. Les deux suites
+  non exécutées sont exactement celles que la recette de préproduction couvre.
 
 **Ce qui est levé** : l'instabilité de `test_verrous_sqlite_v150` (13/13, §10.1), les
 défauts de fixture de `test_positions_portails_v145` (§10.4) et de `test_validite_v15`
-(§10.5), et l'écart D4-2 de `test_reparation_v130` (§10.2).
+(§10.5), l'écart D4-2 de `test_reparation_v130` (§10.2) et l'assertion périmée de
+`test_chaines_v113` (§10.3).
+
+**Commits de cette passe** (branche `arena/01a0aa2b-tracking-operationnel-lss`) :
+
+| Commit | Objet |
+|---|---|
+| `d3aa2cf` | point 1 — instrument de verrou en lock-step (v150) |
+| `2bbd3c6` | point 4 — fixture temporelle v145 |
+| `8003457` | point 5 — pilote de recette de préproduction + mode d'emploi |
+| `a21b665` | point 6 — rapport §10 + campagne |
+| `b6d096e` · `94fa7aa` | recette — libellé du verdict, en-tête du diff de proposition |
+| `f112038` | arbitrages — D4-2 (fixture) et v15 (fenêtres disjointes) |
+| `e009a3d` | rapport — arbitrages, diff v113 soumis, campagne 56 / 1 / 0 / 2 |
+| **`06e3571`** | **point 3 — v113 : P1a→P1l (11 contrôles, 51 OK / 0 KO)** |
 
 Rappels : aucune fusion, aucun déploiement ; `main` inchangée ; `SPEC_RULES_v3.md`
-inchangée ; aucune donnée de production touchée.
+inchangée ; aucune donnée de production touchée ; aucune réparation lancée sur une base
+réelle.

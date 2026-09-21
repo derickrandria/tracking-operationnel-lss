@@ -1,7 +1,10 @@
-PROPOSITION — point 3 (v113) — NON APPLIQUÉE au 21/09/2026
+PROPOSITION — point 3 (v113) — revue du 21/09/2026 — **APPLIQUÉE** (commit 06e3571)
 Remplace l'assertion périmée « len(restants_b) == 4 » (purge physique v1.31) par
 six contrôles P1a→P1f décrivant la règle P1 en vigueur (conservation + masquage).
-Vérifiée en copie : 46 OK / 0 KO (2 exécutions). Aucune attente métier modifiée.
+Vérifiée en copie : 46 OK / 0 KO. Aucune attente métier modifiée.
+AVANT COMMIT, la consigne du 21/09 a ajouté cinq contrôles de projection
+(P1g Suivi actif, P1i Historique actif, P1j export Excel, P1k export PDF,
+P1l visibilité des 4 trajets officiels) — version appliquée : 51 OK / 0 KO.
 ──────────────────────────────────────────────────────────────────────────────
 diff --git a/backend/test_chaines_v113.py b/backend/test_chaines_v113.py
 index a46176d..7d326ff 100644
