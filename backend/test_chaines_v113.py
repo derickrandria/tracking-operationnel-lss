@@ -69,17 +69,21 @@ def _horloge_figee():
 import app.config as _config  # noqa: E402  — importé EN PREMIER, exprès
 _config.now_local = _horloge_figee
 
+import io  # noqa: E402
+
 from sqlalchemy import delete, select  # noqa: E402
 
 from app.config import now_local  # noqa: E402  (= _horloge_figee)
 from app.database import SessionLocal
 from app import engine
-from app.models import (StatutSourceTrajet, StatutValidationTrajet,
+from app.models import (AuditLog, StatutSourceTrajet, StatutValidationTrajet,
                         SuiviJournalier, Trajet, Vehicule)
 from app.reconciliation import reconcilier_trajets_valides
 from app.seed import seed_si_vide
 from app.main import migrer_schema
-from app.serializers import s_suivi
+from app.serializers import fusionner_snapshot, s_suivi, snapshot_canonique
+from app.exporters import export_suivi_excel, export_suivi_pdf
+from app.routers.operations import _suivis_filtres
 
 R = {"ok": 0, "ko": 0}
 
@@ -258,8 +262,104 @@ try:
             SuiviJournalier.date_jour == jour)).all()]
     # la BASE conserve les 4 fragments publiés (§0undecies E1 : affichage
     # seulement, rien n'est perdu en stockage)
-    check("4 enregistrements publiés en base (E1 v1.31 n'agit qu'à l'affichage)",
-          len(restants_b) == 4, f"{[(t.heure_debut, t.heure_fin) for t in restants_b]}")
+    # v1.54 (P1) : la réconciliation ne SUPPRIME plus rien. Le jumeau périmé est
+    # CONSERVÉ en base, écarté de l'affichage, marqué REJETE avec son motif et audité.
+    # L'ancienne assertion (len(restants_b) == 4) encodait la purge PHYSIQUE de l'ère
+    # v1.31 : elle comptait les survivants, pas la règle.
+    ecartes_b = [t for t in restants_b
+                 if t.statut_validation == StatutValidationTrajet.REJETE]
+    officiels_b = [t for t in restants_b
+                   if t.statut_validation != StatutValidationTrajet.REJETE]
+    check("P1a : jumeau périmé CONSERVÉ en base (REJETE, motif DOUBLON_JUMEAU)",
+          len(ecartes_b) == 1 and ecartes_b[0].motif_rejet == "DOUBLON_JUMEAU"
+          and ecartes_b[0].heure_debut == h(6, 5, 34),
+          f"{[(t.heure_debut, t.statut_validation, t.motif_rejet) for t in ecartes_b]}")
+    check("P1b : les 4 fragments officiels sont conservés",
+          len(officiels_b) == 4 and all(
+              t.statut_source == StatutSourceTrajet.VALIDE for t in officiels_b),
+          f"{[(t.heure_debut, t.heure_fin, t.statut_source) for t in officiels_b]}")
+    check("P1c : un seul enregistrement NON écarté commence à 06:05:34 (pas de doublon)",
+          sum(1 for t in officiels_b if t.heure_debut == h(6, 5, 34)) == 1,
+          f"{[(t.heure_debut, t.statut_validation) for t in officiels_b]}")
+    check("P1d : écartement AUDITÉ (AuditLog — trajet.jumeau_fusionne)",
+          db.query(AuditLog).filter(
+              AuditLog.action == "trajet.jumeau_fusionne").count() >= 1)
+    s_b_cpt = engine.ensure_suivi(db, v5316, jour)
+    engine.recalculer_temps(db, s_b_cpt, h(10, 45))
+    db.commit()
+    tcj_fragments = sum(int((t.heure_fin - t.heure_debut).total_seconds())
+                        for t in officiels_b)
+    check("P1e : TCJ = 4 fragments officiels seulement (jumeau exclu des compteurs)",
+          s_b_cpt.tcj_s == tcj_fragments, f"{s_b_cpt.tcj_s} vs {tcj_fragments}")
+    check("P1f : TTJ = amplitude réelle 06:05:34 → 09:48:14",
+          s_b_cpt.ttj_s == int((h(9, 48, 14) - h(6, 5, 34)).total_seconds()),
+          f"{s_b_cpt.ttj_s}")
+
+    # ---- Projections d'affichage (exigence d'arbitrage du 21/09/2026) -------
+    # Le jumeau REJETE est CONSERVÉ en base (P1a) et AUDITÉ (P1d), mais il doit
+    # être ABSENT de toutes les projections actives : onglet Suivi, onglet
+    # Historique (même fabrique de snapshot + fusion), exports Excel et PDF.
+    # Les 4 trajets officiels, eux, restent présents et visibles (P1b/P1c/P1l).
+    _s_b = engine.ensure_suivi(db, v5316, jour)
+    _proj = s_suivi(_s_b)
+    _lignes_proj = _proj.get("trajets") or []
+    _ouvre = (h(6, 5, 34).isoformat(), None)          # signature du jumeau (sans fin)
+    check("P1g : jumeau ABSENT de la projection Suivi active "
+          "(1 seule séquence, aucune ligne ouverte)",
+          _proj.get("nb_trajets") == 1 and len(_lignes_proj) == 1
+          and (_lignes_proj[0].get("heure_debut"), _lignes_proj[0].get("heure_fin"))
+          == (h(6, 5, 34).isoformat(), h(9, 48, 14).isoformat())
+          and all((t.get("heure_debut"), t.get("heure_fin")) != _ouvre
+                  for t in _lignes_proj)
+          and all(t.get("heure_fin") is not None for t in _lignes_proj),
+          f"{[(t.get('heure_debut'), t.get('heure_fin')) for t in _lignes_proj]}")
+
+    _snap_b = snapshot_canonique(_s_b)                # fabrique d'archive v1.53
+    _hist_b = fusionner_snapshot(dict(_snap_b))       # projection de l'Historique
+    _lignes_hist = _hist_b.get("trajets") or []
+    check("P1i : jumeau ABSENT de l'Historique actif "
+          "(snapshot canonique + fusion : 1 seule séquence)",
+          _hist_b.get("nb_trajets") == 1 and len(_lignes_hist) == 1
+          and (_lignes_hist[0].get("heure_debut"), _lignes_hist[0].get("heure_fin"))
+          == (h(6, 5, 34).isoformat(), h(9, 48, 14).isoformat())
+          and all(t.get("heure_fin") is not None for t in _lignes_hist)
+          and len(_snap_b.get("trajets") or []) == 4,  # les 4 officiels archivés
+          f"{[(t.get('heure_debut'), t.get('heure_fin')) for t in _lignes_hist]}")
+
+    # Source EXACTE des exports de l'onglet Suivi (routers/operations.py)
+    _lignes_exp = _suivis_filtres(db, jour, None, None)
+    _xls = export_suivi_excel(jour.strftime("%d/%m/%Y"), _lignes_exp, True)
+    from openpyxl import load_workbook             # noqa: PLC0415 — dépendance d'export
+    _wb = load_workbook(io.BytesIO(_xls))
+    _rows_v = [r for _ws in _wb.worksheets for r in _ws.iter_rows(values_only=True)
+               if r and r[0] == v5316.plaque]
+    _cells_v = [str(c) for r in _rows_v for c in r if c is not None]
+    check("P1j : jumeau ABSENT de l'export Excel "
+          "(1 ligne, 06:05 → 09:48, aucun motif de rejet)",
+          len(_rows_v) == 1 and _cells_v.count("06:05") == 1
+          and _cells_v.count("09:48") == 1
+          and not any(("REJET" in c.upper() or "DOUBLON" in c.upper()
+                       or "EN COURS" in c.upper()) for c in _cells_v),
+          f"{len(_rows_v)} ligne(s) — {_cells_v[:6]}")
+
+    _pdf = export_suivi_pdf(jour.strftime("%d/%m/%Y"), _lignes_exp, True)
+    from pypdf import PdfReader                    # noqa: PLC0415 — dépendance d'export
+    _txt_pdf = "\n".join((pg.extract_text() or "")
+                         for pg in PdfReader(io.BytesIO(_pdf)).pages)
+    check("P1k : jumeau ABSENT de l'export PDF "
+          "(06:05 → 09:48 une seule fois, aucun motif de rejet)",
+          v5316.plaque in _txt_pdf and _txt_pdf.count("06:05") == 1
+          and _txt_pdf.count("09:48") == 1
+          and "REJET" not in _txt_pdf.upper() and "DOUBLON" not in _txt_pdf.upper(),
+          f"{_txt_pdf.count('06:05')} x 06:05 / {_txt_pdf.count('09:48')} x 09:48")
+
+    check("P1l : les 4 trajets officiels restent VISIBLES "
+          "(règle de séquence : 4 segments en 1 seule ligne)",
+          _proj.get("nb_trajets_valides_reels") == 4
+          and _proj.get("nb_trajets") == 1
+          and _lignes_proj[0].get("segments") == 4,
+          f"{_proj.get('nb_trajets_valides_reels')} réels / "
+          f"{_lignes_proj[0].get('segments')} segments")
     g = grille(v5316)
     l = ligne(g, 0)
     # Réalignement v1.31 : les ruptures inter-fragments (7:45, 2:29, 5:15)
