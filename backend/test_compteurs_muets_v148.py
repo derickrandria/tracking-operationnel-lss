@@ -171,10 +171,18 @@ try:
     check("trace fraîche → maintenant (présomption légitime)",
           fin_bornee_ouverte(debut, debut + timedelta(minutes=10), debut, 1800)
           == debut + timedelta(minutes=10))
+except BaseException as _exc:   # AUCUNE exception n'est masquée : ni import,
+    # ni exécution, ni assertion. Un test interrompu n'est PAS un test vert.
+    print(f"\n=== ABANDON : {type(_exc).__name__}: {_exc} ===",
+          file=sys.stderr)
+    print("=== AUCUN verdict pour cette suite : contrôles non exécutés ===",
+          file=sys.stderr)
+    raise                        # traceback + code de sortie NON NUL
 finally:
     db.close()
     fichier = db_url.split("///")[-1]
     if fichier and os.path.exists(fichier):
         os.remove(fichier)
-    print(f"\n=== RÉSULTAT v1.48 : {R['ok']} OK / {R['ko']} KO ===")
-    sys.exit(1 if R["ko"] else 0)
+
+print(f"\n=== RÉSULTAT v1.48 : {R['ok']} OK / {R['ko']} KO ===")
+sys.exit(1 if R["ko"] else 0)

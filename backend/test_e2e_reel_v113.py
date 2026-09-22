@@ -11,7 +11,13 @@ from datetime import datetime
 
 src = "data/lss.db"
 if not os.path.exists(src):
-    print("pas de base bac à sable — test sauté"); sys.exit(0)
+    # Un test qui n'a PAS tourné n'est pas un test vert : statut NON-EXÉCUTABLE
+    # explicite et code de retour NON NUL (le mot « sauté » est conservé : la
+    # campagne classe la suite en « NON EXÉCUTÉ », jamais en réussite).
+    print("=== NON EXÉCUTABLE : base locale absente (data/lss.db) — "
+          "test sauté ===")
+    print("    Aucun contrôle n'a tourné : ce n'est pas un vert.")
+    sys.exit(3)
 shutil.copy(src, "/tmp/e2e_v113.db")
 
 from sqlalchemy import delete, select
@@ -190,9 +196,17 @@ try:
                   f"{ts[1] if len(ts) > 1 else None}")
             check("pas de ligne 07:20 (0,071 km isolée, manœuvre)",
                   all(t["heure_debut"] != h(7, 20, 52).isoformat() for t in ts))
+except BaseException as _exc:   # AUCUNE exception n'est masquée : ni import,
+    # ni exécution, ni assertion. Un test interrompu n'est PAS un test vert.
+    print(f"\n=== ABANDON : {type(_exc).__name__}: {_exc} ===",
+          file=sys.stderr)
+    print("=== AUCUN verdict pour cette suite : contrôles non exécutés ===",
+          file=sys.stderr)
+    raise                        # traceback + code de sortie NON NUL
 finally:
     db.close()
     if os.path.exists("/tmp/e2e_v113.db"):
         os.remove("/tmp/e2e_v113.db")
-    print(f"\n=== RÉSULTAT E2E RÉEL : {R['ok']} OK / {R['ko']} KO ===")
-    sys.exit(1 if R["ko"] else 0)
+
+print(f"\n=== RÉSULTAT E2E RÉEL : {R['ok']} OK / {R['ko']} KO ===")
+sys.exit(1 if R["ko"] else 0)

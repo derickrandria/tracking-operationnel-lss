@@ -1,0 +1,11 @@
+# ── Dépendances des SUITES DE TEST (backend/test_*.py) ──────────────────────
+# À installer EN PLUS de requirements.txt :
+#     python -m pip install -r requirements.txt -r requirements-test.txt
+#
+# pypdf — lecture des PDF produits par les exports. Utilisée par :
+#   · test_chaines_v113.py          (contrôle P1k : jumeau absent du PDF)
+#   · test_calcul_affichage_v153.py (contrôles des PDF Suivi / Historique)
+#   · test_recettes_exports_v154.py (recette des exports)
+# Sans elle, ces contrôles sont IMPOSSIBLES : les suites concernées s'arrêtent
+# en NON EXÉCUTABLE (code de retour 4) — jamais en « 0 KO », jamais en vert.
+pypdf>=4.0

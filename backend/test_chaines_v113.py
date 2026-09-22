@@ -52,6 +52,26 @@ os.environ.setdefault("SIM_ENABLE", "0")
 import sys
 from datetime import datetime, timedelta
 
+
+# ── DÉPENDANCES DE TEST (contrôles d'export P1j / P1k) ──────────────────────
+# Avant : ces imports étaient faits AU MILIEU du scénario ; leur échec était
+# alors absorbé par le `finally` qui terminait par `sys.exit(0)` : la suite
+# affichait « 21 OK / 0 KO » et rendait un code de retour 0 alors que 30
+# contrôles n'avaient JAMAIS tourné (faux vert constaté le 22/09, pypdf absent).
+# Désormais l'import précède tout contrôle et son échec est un NON-EXÉCUTABLE
+# explicite : aucun bilan, code de retour NON NUL.
+try:
+    from openpyxl import load_workbook          # export Excel (contrôle P1j)
+    from pypdf import PdfReader                 # export PDF   (contrôle P1k)
+except ImportError as _exc:                     # ModuleNotFoundError inclus
+    print(f"\n=== NON EXÉCUTABLE : dépendance de test absente "
+          f"« {getattr(_exc, 'name', _exc)} » ===")
+    print("    Cette suite contrôle les exports Excel ET PDF : sans cette")
+    print("    dépendance, des contrôles seraient SAUTÉS — un test incomplet")
+    print("    n'est jamais un test vert.")
+    print("    Installer : python -m pip install -r requirements-test.txt")
+    sys.exit(4)                                 # jamais 0
+
 # ── HORLOGE FIGÉE (v1.54, 21/09/2026) — DÉTERMINISME DU TEST ────────────────
 # Le scénario est ancré à des heures fixes (05:56 → 10:45). Sans horloge figée,
 # le verdict dépend de l'heure et de la date d'exécution. On fige l'instant
@@ -149,8 +169,13 @@ def ligne(g, i=0):
     return ts[i] if i < len(ts) else None
 
 
+# ── SECTIONS RÉELLEMENT EXÉCUTÉES : une section sautée doit être VISIBLE ────
+SECTIONS_ATTENDUES = ("A", "B", "C", "D", "E")
+sections_vues: list = []
+
 try:
     # ================================================================
+    sections_vues.append("A")
     print("\n[A] 4526TCC — chaîne EN COURS (jumeau vivant + doublon officiel)")
     # données écrites par les anciennes versions ce matin-là
     s = engine.ensure_suivi(db, v4526, jour)
@@ -233,6 +258,7 @@ try:
           s_a.ttj_s == amplitude_a, f"{s_a.ttj_s} vs {amplitude_a}")
 
     # ================================================================
+    sections_vues.append("B")
     print("\n[B] 5316TBU — chaîne terminée (jumeau périmé purgé)")
     jumeau_b = ajoute(v5316, h(6, 5, 34), None, None,
                       source=StatutSourceTrajet.PROVISOIRE,
@@ -329,7 +355,6 @@ try:
     # Source EXACTE des exports de l'onglet Suivi (routers/operations.py)
     _lignes_exp = _suivis_filtres(db, jour, None, None)
     _xls = export_suivi_excel(jour.strftime("%d/%m/%Y"), _lignes_exp, True)
-    from openpyxl import load_workbook             # noqa: PLC0415 — dépendance d'export
     _wb = load_workbook(io.BytesIO(_xls))
     _rows_v = [r for _ws in _wb.worksheets for r in _ws.iter_rows(values_only=True)
                if r and r[0] == v5316.plaque]
@@ -343,7 +368,6 @@ try:
           f"{len(_rows_v)} ligne(s) — {_cells_v[:6]}")
 
     _pdf = export_suivi_pdf(jour.strftime("%d/%m/%Y"), _lignes_exp, True)
-    from pypdf import PdfReader                    # noqa: PLC0415 — dépendance d'export
     _txt_pdf = "\n".join((pg.extract_text() or "")
                          for pg in PdfReader(io.BytesIO(_pdf)).pages)
     check("P1k : jumeau ABSENT de l'export PDF "
@@ -429,6 +453,7 @@ try:
           f"{l2 and l2['statut_source']}")
 
     # ================================================================
+    sections_vues.append("C")
     print("\n[C] 9856TCD — manœuvres IGNORÉES (Référence v2 §5.1/§7)")
     ajoute(v9856, h(6, 4, 53), h(6, 13, 54), 0.0,
            source=StatutSourceTrajet.PROVISOIRE, valid=StatutValidationTrajet.REJETE)
@@ -508,6 +533,7 @@ try:
           f"{s_c.total_pause_s} vs {pauses_nettes}")
 
     # ================================================================
+    sections_vues.append("D")
     print("\n[D] 0916TBV — manœuvre en tête + 3 trajets, pauses < 20 min")
     ajoute(v0916, h(5, 39, 36), h(5, 49, 11), 0.0,
            source=StatutSourceTrajet.PROVISOIRE, valid=StatutValidationTrajet.REJETE)
@@ -565,6 +591,7 @@ try:
               for t in g["trajets"]])
 
     # ================================================================
+    sections_vues.append("E")
     print("\n[E] Contrat grille strict — re-vérification globale des 4 lignes")
     for veh, nom in ((v4526, "4526"), (v5316, "5316"), (v9856, "9856"),
                      (v0916, "0916")):
@@ -586,10 +613,23 @@ try:
               f"ou masquées, en cours uniquement en dernier)", ok,
               f"{[(t['heure_debut'], t['heure_fin'], t['statut_source']) for t in ts]}")
 
+
+    # ── CONTRÔLE DE COMPLÉTUDE : aucune section silencieusement sautée ──────
+    _manquantes = [x for x in SECTIONS_ATTENDUES if x not in sections_vues]
+    if _manquantes:
+        raise RuntimeError(f"section(s) non exécutée(s) : {_manquantes} — "
+                           "le scénario est incomplet, il n'y a pas de verdict")
+except BaseException as _exc:   # AUCUNE exception n'est masquée : ni import,
+    # ni exécution, ni assertion. Un test interrompu n'est PAS un test vert.
+    print(f"\n=== ABANDON : {type(_exc).__name__}: {_exc} ===", file=sys.stderr)
+    print("=== AUCUN verdict pour cette suite : contrôles non exécutés ===",
+          file=sys.stderr)
+    raise                        # traceback + code de sortie NON NUL
 finally:
     db.close()
     fichier = db_url.split("///")[-1]
     if fichier and os.path.exists(fichier):
         os.remove(fichier)
-    print(f"\n=== RÉSULTAT : {R['ok']} OK / {R['ko']} KO ===")
-    sys.exit(1 if R["ko"] else 0)
+
+print(f"\n=== RÉSULTAT : {R['ok']} OK / {R['ko']} KO ===")
+sys.exit(1 if R["ko"] else 0)
