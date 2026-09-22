@@ -2,8 +2,10 @@
 
 Ce que ce test prouve, et rien d'autre :
 
-  1. la base utilisée est un fichier /tmp créé et supprimé par le test — jamais
-     la base du serveur local, jamais une base de production (garde-fou en tête) ;
+  1. la base utilisée est un fichier TEMPORAIRE du SYSTÈME (Windows comme Linux),
+     créé et supprimé par le test — jamais la base du serveur local, jamais une
+     base de production, jamais un chemin venu de l'environnement (garde-fou en
+     tête, portable : `tempfile.gettempdir()`) ;
   2. le moteur d'audit est un moteur DISTINCT du moteur applicatif ;
   3. écrire 20 traces ne modifie AUCUNE table métier (signatures avant/après) ;
   4. seules des lignes `action LIKE 'collecte.%'` s'ajoutent à `audit_log` ;
@@ -27,14 +29,66 @@ import hashlib
 import os
 import sqlite3
 import sys
+import tempfile
 import time
+from pathlib import Path
 
-# ── GARDE-FOU : la base de ce test est un fichier temporaire, rien d'autre. ───
-CHEMIN = "/tmp/test_audit_traces_m1.db"
-if not CHEMIN.startswith("/tmp/"):
-    print("REFUS : ce test n'écrit que dans /tmp", file=sys.stderr)
+# ── GARDE-FOU PORTABLE (Windows et Linux) ────────────────────────────────────
+# La base de ce test est un fichier TEMPORAIRE DU SYSTÈME, rien d'autre. Le chemin
+# n'est JAMAIS pris dans l'environnement ni dans un `.env` : il est construit à
+# partir de `tempfile.gettempdir()`, puis VÉRIFIÉ — il doit rester SOUS ce
+# répertoire, hors du dépôt, et ne pas porter le nom d'une base d'exploitation.
+RACINE_DEPOT = Path(__file__).resolve().parent           # …/backend
+TMP_SYSTEME = Path(os.path.realpath(tempfile.gettempdir()))
+CHEMIN_RESOLU = Path(os.path.realpath(TMP_SYSTEME / "test_audit_traces_m1.db"))
+NOMS_INTERDITS = {"lss.db", "lss_preprod.db", "lss_prod.db", "lss_production.db"}
+
+
+def _sous_tmp(chemin: Path) -> bool:
+    """Vrai si `chemin` est le répertoire temporaire ou se trouve SOUS lui."""
+    return chemin == TMP_SYSTEME or TMP_SYSTEME in chemin.parents
+
+
+def _refus(motif: str) -> None:
+    print(f"REFUS : {motif}", file=sys.stderr)
+    print(f"        répertoire temporaire système autorisé : {TMP_SYSTEME}",
+          file=sys.stderr)
+    print(f"        chemin refusé : {CHEMIN_RESOLU}", file=sys.stderr)
+    print("        Ce test n'écrit QUE dans le répertoire temporaire du système :"
+          " ni le dépôt, ni une base d'exploitation, ni le serveur local,"
+          " ni un chemin fourni par l'environnement/`.env`.", file=sys.stderr)
     sys.exit(3)
-os.environ["DATABASE_URL"] = f"sqlite:///{CHEMIN}"
+
+
+_env_base = (os.environ.get("DATABASE_URL") or "").strip()
+_env_chemin = None
+if _env_base.startswith("sqlite") and "///" in _env_base:
+    _brut = _env_base.split("///", 1)[-1]
+    if _brut:
+        _env_chemin = Path(os.path.realpath(_brut))
+
+SITUATION = {
+    "sous_tmp": _sous_tmp(CHEMIN_RESOLU),
+    "hors_depot": RACINE_DEPOT not in CHEMIN_RESOLU.parents,
+    "hors_nom_exploitation": CHEMIN_RESOLU.name.lower() not in NOMS_INTERDITS,
+    "env_compatible": _env_chemin is None or _sous_tmp(_env_chemin),
+}
+
+if not SITUATION["sous_tmp"]:
+    _refus(f"le chemin de la base n'est pas SOUS le répertoire temporaire système "
+           f"« {TMP_SYSTEME} »")
+if not SITUATION["hors_depot"]:
+    _refus("le chemin de la base est DANS le dépôt : jamais la base du produit")
+if not SITUATION["hors_nom_exploitation"]:
+    _refus("le nom du fichier correspond à une base d'exploitation")
+if not SITUATION["env_compatible"]:
+    _refus("DATABASE_URL désigne un chemin HORS du répertoire temporaire système "
+           "(chemin fourni par l'environnement/`.env`) : ce test ne l'utilise pas")
+
+CHEMIN = str(CHEMIN_RESOLU)          # concaténation des suffixes -wal / -shm
+print(f"  base de test : {CHEMIN_RESOLU}")
+print(f"  répertoire temporaire système utilisé : {TMP_SYSTEME}")
+os.environ["DATABASE_URL"] = f"sqlite:///{CHEMIN_RESOLU.as_posix()}"
 os.environ.setdefault("SIM_ENABLE", "0")
 
 for _suffixe in ("", "-wal", "-shm"):          # table rase AVANT tout import
@@ -101,9 +155,11 @@ def lignes_audit():
 
 
 print("\n[A] Base de test : fichier TEMPORAIRE, jamais celle du serveur local")
-check("la base est un fichier /tmp (aucun serveur, aucune production)",
-      CHEMIN.startswith("/tmp/") and os.path.abspath(CHEMIN).startswith("/tmp/"),
-      f"→ {CHEMIN}")
+check("la base est un fichier TEMPORAIRE du système (aucun serveur, aucune "
+      "production, aucun chemin d'environnement)",
+      SITUATION["sous_tmp"] and SITUATION["hors_depot"]
+      and SITUATION["hors_nom_exploitation"] and SITUATION["env_compatible"],
+      f"→ {CHEMIN_RESOLU} (répertoire temporaire : {TMP_SYSTEME})")
 
 seed_si_vide()          # crée le schéma (create_all) et les données de démo
 migrer_schema()         # migrations additives, comme au démarrage du produit
