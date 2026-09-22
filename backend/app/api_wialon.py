@@ -40,8 +40,8 @@ from datetime import datetime, timedelta, timezone
 import time
 import httpx
 
-from .concurrence import (BudgetDepasse, compter, mesurer, restant_budget,
-                          verifier_etape)
+from .concurrence import (BudgetDepasse, compter, mesurer_depuis,
+                          restant_budget, verifier_etape)
 from .config import TZ, plaque_depuis_libelle_portail
 
 log = logging.getLogger("lss.api_wialon")
@@ -369,6 +369,9 @@ class ApiWialon:
         url = (f"{API_URL}?svc={svc}&params="
                f"{urllib.parse.quote(json.dumps(params))}"
                + (f"&sid={self._sid}" if self._sid else ""))
+        # M1 — l'attente HTTP de Wialon n'était PAS mesurée : la phase
+        # `attente_http` restait à 0 s pour CamtrackPro (latence invisible).
+        _t_http = time.monotonic()
         try:
             # R3 — même règle que MZoneX : le timeout suit le temps restant.
             _restant = restant_budget()
@@ -382,6 +385,10 @@ class ApiWialon:
             raise TimeoutError(f"svc={svc} timeout après {_TIMEOUT}s : {e}") from e
         except Exception as e:
             raise ErreurApiWialon(f"svc={svc} injoignable : {type(e).__name__} {e}") from e
+        finally:
+            # M1 — mesuré MÊME en cas de timeout ou d'échec transport. Aucun
+            # point d'arrêt n'est ajouté ici : la logique d'appel est inchangée.
+            mesurer_depuis("attente_http", _t_http)
         if isinstance(data, dict) and data.get("error"):
             code_err = int(data["error"])
             if code_err == 1 and reessai:      # session expirée
@@ -513,6 +520,9 @@ class ApiWialon:
                 log.info("CamtrackPro API : véhicule à l'arrêt « %s » (immobile) — dernière position connue retenue", nom)
                 continue
 
+            # M1 — mesure de CETTE unité : ouverte ici (donc jamais pour une
+            # unité écartée plus haut) et clôturée par le `finally` ci-dessous.
+            _t_unite = time.monotonic()
             try:
                 log.info("CamtrackPro API: Exécution rapport trajets pour « %s » (uid=%s)...", nom, uid)
                 r = self._appel("report/exec_report", {
@@ -537,25 +547,46 @@ class ApiWialon:
                 lignes: list = []
                 pas = 1000
                 depuis = 0
+                # M1 — `pagination_s` mesure le traitement LOCAL de la page :
+                # l'attente HTTP de `get_result_rows` est déjà comptée dans
+                # `attente_http_s` (une mesure, un seul endroit, aucune double).
+                _t_page = None
                 while depuis < n_lig:
                     lot = self._appel("report/get_result_rows", {
                         "tableIndex": 0, "indexFrom": depuis,
                         "indexTo": min(n_lig, depuis + pas)})
-                    if not isinstance(lot, list) or not lot:
-                        break
-                    lignes.extend(lot)
-                    depuis += len(lot)
+                    _t_page = time.monotonic()          # M1 — après le HTTP
+                    try:
+                        compter("nb_pages")             # M1 — 1 par page
+                        if not isinstance(lot, list) or not lot:
+                            break
+                        lignes.extend(lot)
+                        depuis += len(lot)
+                    finally:
+                        # M1 — la page est mesurée même si son traitement lève.
+                        mesurer_depuis("pagination", _t_page)
                 if not lignes:
                     continue
-                bruts = [it for it in (
-                    item_depuis_ligne_rapport(nom, lig.get("c") or [], col_map=col_map)
-                    for lig in lignes) if it]
+                # M1 — PARSING : phase jamais alimentée jusqu'ici.
+                _t_parsing = time.monotonic()
+                try:
+                    bruts = [it for it in (
+                        item_depuis_ligne_rapport(nom, lig.get("c") or [],
+                                                  col_map=col_map)
+                        for lig in lignes) if it]
+                finally:
+                    mesurer_depuis("parsing", _t_parsing)
                 items.extend(bruts)
+                compter("nb_lignes_lues", len(lignes))     # M1 — volume lu
                 if bruts:
                     log.info("CamtrackPro API (rapport trajets) « %s » : "
                              "%d trajet(s)", nom, len(bruts))
             except (TimeoutError, ErreurApiWialon) as exc:
                 log.warning("CamtrackPro API : rapport « %s » en erreur ou timeout (%s)", nom, exc)
+            finally:
+                # M1 — l'unité est mesurée MÊME si son rapport a échoué, et la
+                # DERNIÈRE unité est clôturée (avant M1, son temps était perdu).
+                mesurer_depuis("vehicule", _t_unite)
         log.info("CamtrackPro API (rapport trajets) : %d trajet(s) officiel(s)",
                  len(items))
         return items
@@ -574,13 +605,11 @@ class ApiWialon:
         unites_list = self.unites()
         log.info("CamtrackPro API : %d unités détectées pour messages_du_jour (%s, timestamps UTC: %d -> %d)",
                  len(unites_list), jour, debut_epoch, fin_epoch)
-        t_unite = None
         for u in unites_list:
             # v1.54 — MÉTRIQUES PAR VÉHICULE + POINT D'ARRÊT CONTRÔLÉ : le coût
-            # de l'unité PRÉCÉDENTE est publié, et la passe s'arrête AVANT
-            # l'unité suivante si son budget est atteint.
-            mesurer("vehicule", t_unite)
-            t_unite = time.monotonic()
+            # d'une unité est publié (clôture par le `finally` de CETTE unité,
+            # M1) et la passe s'arrête AVANT l'unité suivante si son budget est
+            # atteint.
             verifier_etape("vehicule")   # R16 — AVANT l'unité (véhicule)
             compter("nb_vehicules")
             nom, uid = u.get("nm", ""), u.get("id")
@@ -588,6 +617,7 @@ class ApiWialon:
             if not plaque or uid is None:
                 continue
 
+            t_unite = time.monotonic()   # M1 — ouverture de CETTE unité
             try:
                 log.info("CamtrackPro API: Requête messages/load_interval pour %s (id=%s) [%d -> %d]...",
                          plaque, uid, debut_epoch, fin_epoch)
@@ -670,5 +700,11 @@ class ApiWialon:
                 # R16 — point d'arrêt APRÈS l'unité (véhicule) : la suivante
                 # n'est ouverte que si l'échéance n'est pas franchie.
                 verifier_etape("vehicule")
+            finally:
+                # M1 — clôture de CETTE unité : mesurée même si l'extraction a
+                # échoué (timeout) ou si l'échéance a interrompu la boucle juste
+                # après (`verifier_etape` ci-dessus). Chaque unité est donc
+                # mesurée une fois — ni oubliée, ni comptée deux fois.
+                mesurer_depuis("vehicule", t_unite)
 
         return resultats

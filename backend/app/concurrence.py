@@ -39,6 +39,7 @@ nombre de pages, de véhicules et de lignes.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -48,6 +49,99 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 log = logging.getLogger("lss.concurrence")
+
+# ════════════════════════════════════════════════════════════════════════════
+# M1 (22/09/2026) — TRACES DE COLLECTE : LISTE BLANCHE + TEXTE ASSAINI
+# ════════════════════════════════════════════════════════════════════════════
+# PORTÉE STRICTE : ces helpers servent aux NOUVELLES traces `collecte.*` de M1.
+# Ils ne touchent NI `scrapers._audit_collecte`, NI un audit existant, NI un
+# audit historique (aucune réécriture) : M1 n'écrit que ses propres traces.
+# AUCUN commutateur d'exécution : ce sont des constantes de module.
+
+# LISTE BLANCHE : seules ces clés peuvent être publiées. Toute clé absente est
+# DÉTRUITE avant la mise en file — un brut de portail, un en-tête HTTP, une URL
+# complète ou un `details` libre ne peuvent donc PAS atteindre la base.
+CHAMPS_TRACE_PUBLIABLES = frozenset({
+    # conteneur / identité
+    "source", "source_reelle", "passe", "couvre_sources", "compteurs_partages",
+    "metriques_attribuables_a", "lancee", "source_demarree",
+    "non_demarree_raison", "jours", "jour", "heure",
+    # temps
+    "debut_le", "fin_le", "demarrage_le", "total_s", "budget_s",
+    "duree_lecture_s", "duree_ecriture_s", "passes", "somme_total_s",
+    "max_total_s",
+    # issue / cause
+    "issue", "phase", "etape_bloquante", "raison_annulation", "issues",
+    # phases mesurées (clés fixes)
+    "auth_s", "attente_http_s", "pagination_s", "vehicule_s", "parsing_s",
+    "ecran_s", "ecriture_s", "attente_sqlite_s",
+    # volumes
+    "nb_pages", "nb_lignes_lues", "nb_ecran_vehicules",
+    # résultat CONFIRMÉ de réconciliation (par source)
+    "recus", "ecrits", "ignores", "confirme_apres_commit",
+    # état des traces (énumération fermée)
+    "origine_lecture", "traces_perdues", "file_max", "purge_active",
+    "retention_cycles_jours", "retention_syntheses_jours",
+})
+
+# Clés qui ne doivent JAMAIS sortir. Elles ne sont PAS dans la liste blanche ;
+# cette liste sert AUSSI au masquage des textes (messages d'erreur).
+CLES_INTERDITES = frozenset({
+    "sid", "session", "sessionid", "token", "access_token", "refresh_token",
+    "password", "passwd", "pwd", "secret", "client_secret", "apikey",
+    "api_key", "authorization", "cookie", "set-cookie", "user", "login",
+    "psw", "jwt", "signature", "sign", "access_hash", "imei", "hwid", "gsm",
+})
+
+_RE_URL_QUERY = re.compile(r"\?[^\s\"']*")
+_RE_SECRET = re.compile(
+    r"(?i)\b(sid|session|sessionid|token|access_token|refresh_token|password|"
+    r"passwd|pwd|secret|client_secret|apikey|api_key|authorization|cookie|"
+    r"user|login|psw|jwt|signature|sign|access_hash|imei|hwid|gsm)"
+    r"\b\s*([=:])\s*[^\s,;&\"']*")
+
+
+def texte_trace_sur(valeur, max_len: int = 120):
+    """Texte PUBLIABLE : URL réduite à sa partie avant « ? », tout `clé=valeur`
+    sensible masqué, espaces normalisés, longueur bornée.
+
+    M1 uniquement (nouvelles traces `collecte.*`). Ne lève JAMAIS : en cas de
+    doute la valeur est REFUSÉE (None) plutôt que publiée en clair.
+    """
+    if valeur is None:
+        return None
+    try:
+        texte = valeur if isinstance(valeur, str) else str(valeur)
+        texte = _RE_URL_QUERY.sub("?<masqué>", texte)
+        texte = _RE_SECRET.sub(
+            lambda m: f"{m.group(1)}{m.group(2)}<masqué>", texte)
+        return " ".join(texte.split())[:max_len]
+    except Exception:
+        return None
+
+
+def champs_publiables(details):
+    """LISTE BLANCHE : ne laisse passer que `CHAMPS_TRACE_PUBLIABLES`.
+
+    · clé hors liste ou interdite → SUPPRIMÉE (jamais publiée « au cas où ») ;
+    · texte → `texte_trace_sur` (URL complète et secrets neutralisés) ;
+    · booléen / nombre / None → conservé tel quel ;
+    · liste (jours, couvre_sources) → bornée à 32 éléments, textes assainis ;
+    · dict / objet → REFUSÉ (aucun `details` libre ne peut entrer en base).
+    """
+    sortie = {}
+    for cle, valeur in (details or {}).items():
+        if cle not in CHAMPS_TRACE_PUBLIABLES or cle.lower() in CLES_INTERDITES:
+            continue
+        if isinstance(valeur, str):
+            sortie[cle] = texte_trace_sur(valeur)
+        elif valeur is None:
+            sortie[cle] = None
+        elif isinstance(valeur, (bool, int, float)):
+            sortie[cle] = valeur
+        elif isinstance(valeur, (list, tuple)):
+            sortie[cle] = [texte_trace_sur(v) for v in list(valeur)[:32]]
+    return sortie
 
 
 def _horodatage() -> str:
@@ -358,6 +452,9 @@ class Metriques:
     pagination_s: float = 0.0
     vehicule_s: float = 0.0
     parsing_s: float = 0.0
+    # M1 — LECTURE ÉCRAN (Playwright) : cette phase n'existait dans AUCUNE
+    # métrique ; un repli écran de plusieurs minutes était invisible.
+    ecran_s: float = 0.0
     ecriture_s: float = 0.0
     attente_verrou_s: float = 0.0
     attente_sqlite_s: float = 0.0
@@ -365,6 +462,9 @@ class Metriques:
     nb_vehicules: int | None = 0
     nb_lignes: int = 0
     nb_lignes_lues: int = 0
+    # M1 — véhicules effectivement RELEVÉS À L'ÉCRAN (Playwright) : volume lu du
+    # chemin de repli, distinct de `nb_vehicules` (temps réel N1).
+    nb_ecran_vehicules: int = 0
     nb_lignes_ecrites: int = 0
     nb_points_ecrits: int | None = 0
     nb_commits: int = 0
@@ -377,6 +477,11 @@ class Metriques:
     budget_s: float = 0.0
     debut_le: str | None = None
     fin_le: str | None = None
+    # M1 — trace de LANCEMENT / NON-DÉMARRAGE d'une source. Aucune décision ne
+    # lit ces champs : ils ne servent qu'aux traces `collecte.*`.
+    demarrage_le: str | None = None
+    source_demarree: bool = False
+    non_demarree_raison: str | None = None
     # R19 — champs qu'une source NE PEUT PAS mesurer : publiés `null`, jamais
     # « 0 » (un 0 se lirait comme une mesure : « rien n'a été écrit »).
     _non_applicables: tuple = ()
@@ -412,6 +517,19 @@ class Metriques:
         if nom and nom not in self._non_applicables:
             setattr(self, nom, int(getattr(self, nom)) + int(n))
 
+    # ------------------------------------------------------------ M1 (traces)
+    def marquer_demarrage(self, quand: str) -> None:
+        """La source a été LANCÉE (idempotent). Aucune décision ne lit ce champ.
+        """
+        self.source_demarree = True
+        self.demarrage_le = self.demarrage_le or quand
+
+    def marquer_non_demarree(self, raison: str) -> None:
+        """La source N'A PAS DÉMARRÉ, avec sa raison réelle. Ne remplace JAMAIS
+        un démarrage réellement constaté."""
+        if not self.source_demarree:
+            self.non_demarree_raison = raison
+
     def depouiller(self) -> dict:
         return {c: getattr(self, c) for c in (
             "source", "total_s", "auth_s", "attente_http_s", "pagination_s",
@@ -420,7 +538,11 @@ class Metriques:
             "nb_lignes_lues", "nb_lignes_ecrites", "nb_points_ecrits",
             "nb_commits", "commits_apres_echeance", "etape_bloquante", "phase",
             "issue", "annulee", "raison_annulation", "budget_s",
-            "debut_le", "fin_le", "non_applicables")}
+            "debut_le", "fin_le", "non_applicables",
+            # M1 — AJOUTS ADDITIFS : aucune clé existante renommée ni retirée
+            # (les assertions existantes sont inclusives : vérifié).
+            "ecran_s", "nb_ecran_vehicules", "demarrage_le", "source_demarree",
+            "non_demarree_raison")}
 
     def phases_s(self) -> dict:
         """Durées par phase (pour l'interface : « où est passé le temps »)."""
@@ -428,7 +550,9 @@ class Metriques:
                 "pagination": self.pagination_s, "vehicule": self.vehicule_s,
                 "parsing": self.parsing_s, "ecriture": self.ecriture_s,
                 "attente_verrou": self.attente_verrou_s,
-                "attente_sqlite": self.attente_sqlite_s}
+                "attente_sqlite": self.attente_sqlite_s,
+                # M1 — phase « écran » : aucune clé existante modifiée.
+                "ecran": self.ecran_s}
 
     def etape_dominante(self) -> str:
         """Étape qui a le plus consommé de temps — sert à nommer la cause d'un
@@ -460,6 +584,10 @@ class PasseCourante:
         self.annulee = False
         self.annulee_raison: str | None = None
         self.etape_courante = "inconnue"
+        # M1 — sources RÉELLEMENT lancées dans cette passe (traçabilité : sert à
+        # déclarer honnêtement `compteurs_partages`). Aucune décision ne lit
+        # cette liste ; elle appartient à CETTE passe, donc à CE fil.
+        self.sources_lancees: list[str] = []
         # R19 — compteurs qu'une source ne peut pas mesurer (publiés `null`).
         if source.startswith("N2_"):
             self.metriques.marquer_non_applicable("nb_vehicules",
@@ -553,6 +681,25 @@ def mesurer(champ: str, depuis_mono: float | None) -> None:
     passe = passe_courante()
     if passe is not None:
         passe.metriques.ajouter(champ, time.monotonic() - depuis_mono)
+
+
+def mesurer_depuis(champ: str, depuis_mono: float | None) -> float:
+    """M1 — clôt la mesure ouverte depuis `depuis_mono` et rend un NOUVEAU départ.
+
+    Pourquoi : avec `mesurer(champ, t)` où `t` valait `None`, AUCUNE mesure ne
+    s'ouvrait (le tour était perdu), et la DERNIÈRE unité d'une boucle n'était
+    jamais clôturée. Ici :
+      · jamais d'appel interne avec `None` (garde explicite, testé) ;
+      · clôture possible dans un `finally` (mesure même en exception) ;
+      · la valeur rendue ouvre l'unité SUIVANTE : chaque intervalle est mesuré
+        une seule fois (aucun double comptage).
+    Ne lève jamais et n'ajoute rien hors passe (`passe_courante()` est None).
+    """
+    if depuis_mono is not None:
+        passe = passe_courante()
+        if passe is not None:
+            passe.metriques.ajouter(champ, time.monotonic() - depuis_mono)
+    return time.monotonic()
 
 
 def passe_courante() -> PasseCourante | None:

@@ -63,11 +63,14 @@ unités à 60 s (N1 CamtrackPro enfin possible, borne §5 levée par A4), rappor
 """
 import logging
 import os
+import queue
 import threading
 import time
+from contextvars import ContextVar   # M1 — bilan par appel, aucun état partagé
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import create_engine, event, func, select
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from .concurrence import (BudgetDepasse, PasseCourante, Possession,
@@ -78,7 +81,10 @@ from .concurrence import (BudgetDepasse, PasseCourante, Possession,
                           forcer_famille, metriques_publiees, ouvrir_cycle,
                           passe_courante, passe_de, passes_en_cours,
                           progression, publier_metriques, restant_budget,
-                          retirer_passe, verifier_etape, verrou_de)
+                          retirer_passe, verifier_etape, verrou_de,
+                          # M1 — traces de collecte : liste blanche, texte
+                          # assaini, mesure « depuis » (jamais None).
+                          champs_publiables, mesurer_depuis, texte_trace_sur)
 from .config import (TZ, normaliser_ident, now_local,
                      plaque_depuis_libelle_portail)
 from .database import SessionLocal
@@ -98,6 +104,363 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 log = logging.getLogger("lss.scraper")
 
 _COLLECTE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="lss-collector")
+
+# ════════════════════════════════════════════════════════════════════════════
+# M1 (22/09/2026) — TRACES DE COLLECTE : HORS DU FIL DE COLLECTE
+# ════════════════════════════════════════════════════════════════════════════
+# Une trace ne doit JAMAIS faire attendre la collecte. Or écrire une ligne
+# d'audit, c'est prendre le verrou d'écriture SQLite (busy_timeout 30 s). Donc :
+# mise en file O(1) sur le fil de collecte, écriture par UN fil dédié, file
+# BORNÉE, pertes COMPTÉES, exceptions JAMAIS propagées.
+# AUCUN commutateur d'exécution : les réglages ci-dessous sont des CONSTANTES.
+COLLECTE_TRACES_FILE_MAX = 256
+# RÉTENTION DÉCLARÉE, NON APPLIQUÉE : aucune purge dans ce commit (une purge est
+# une SUPPRESSION : hors périmètre M1). Aucune migration, aucune table.
+COLLECTE_TRACES_RETENTION_JOURS = 30
+# Bilan de la source EN COURS (origine RÉELLE de lecture, volume lu à l'écran).
+# Transmis au collecteur par CONTEXTE et non par un argument nommé : chaque
+# appel a le sien, aucun fil ne voit celui d'un autre, et les appelants
+# existants (doublures de test comprises) gardent leur signature.
+_BILAN_SOURCE: ContextVar[dict | None] = ContextVar("lss_bilan_source",
+                                                    default=None)
+COLLECTE_SYNTHESE_RETENTION_JOURS = 90
+_TRACES_FILE: "queue.Queue" = queue.Queue(maxsize=COLLECTE_TRACES_FILE_MAX)
+_TRACES_LOCK = threading.Lock()
+_TRACES_WORKER: dict = {"demarre": False}
+_TRACES_PERTES = 0
+
+# ── MOTEUR D'AUDIT DÉDIÉ (M1) ──────────────────────────────────────────────
+# L'écrivain de traces a SON moteur : ses commits ne se confondent jamais avec
+# ceux de la collecte (le contrôle de sérialisation par lots compte les commits
+# du moteur applicatif) et il ne consomme aucune connexion de son pool. Le
+# verrou d'écriture SQLite, lui, reste sérialisé (busy_timeout du moteur).
+_ENGINE_TRACES = None
+_SESSIONMAKER_TRACES = None
+_ENGINE_TRACES_LOCK = threading.Lock()
+
+
+def _session_traces():
+    """Session d'audit sur SON moteur — créé à la PREMIÈRE écriture (jamais à
+    l'import : aucune connexion n'est ouverte si rien n'est écrit). Les
+    réglages de connexion SQLite sont ceux du produit (WAL persistant,
+    `busy_timeout` 30 s, `synchronous=NORMAL`)."""
+    global _ENGINE_TRACES, _SESSIONMAKER_TRACES
+    with _ENGINE_TRACES_LOCK:
+        if _ENGINE_TRACES is None:
+            from .config import DATABASE_URL
+            from .database import EST_SQLITE, connect_args
+            _ENGINE_TRACES = create_engine(DATABASE_URL,
+                                           connect_args=connect_args,
+                                           pool_size=1, max_overflow=0,
+                                           pool_pre_ping=True)
+            if EST_SQLITE:
+                @event.listens_for(_ENGINE_TRACES, "connect")
+                def _pragmas_audit(dbapi_connection, connection_record):
+                    curseur = dbapi_connection.cursor()
+                    curseur.execute("PRAGMA busy_timeout=30000")
+                    curseur.execute("PRAGMA synchronous=NORMAL")
+                    curseur.close()
+            _SESSIONMAKER_TRACES = sessionmaker(bind=_ENGINE_TRACES,
+                                                autoflush=False,
+                                                expire_on_commit=False)
+    return _SESSIONMAKER_TRACES()
+
+
+def _ecrire_trace(action: str, details: dict) -> None:
+    """Écriture EFFECTIVE — appelée par le fil dédié, jamais par la collecte.
+
+    Les détails sont DÉJÀ passés par la liste blanche (`champs_publiables`).
+    UNE insertion sur le moteur d'audit DÉDIÉ : jamais d'UPDATE d'un audit
+    existant, jamais de lecture, jamais de connexion prise à la collecte.
+    """
+    from .models import AuditLog
+    db = _session_traces()
+    try:
+        db.add(AuditLog(username="collecte-trace", action=action,
+                        entite="source", entite_id=details.get("source"),
+                        details=details))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _worker_traces() -> None:
+    """Consomme la file HORS du chemin de collecte. Ne s'arrête JAMAIS sur une
+    erreur d'écriture : une panne d'audit n'est pas une panne de collecte."""
+    while True:
+        action, details = _TRACES_FILE.get()
+        try:
+            _ecrire_trace(action, details)
+        except Exception as exc:
+            log.warning("Trace de collecte non écrite (%s) — sans effet sur la "
+                        "collecte", texte_trace_sur(exc, 120))
+        finally:
+            _TRACES_FILE.task_done()
+
+
+def demarrer_worker_traces() -> bool:
+    """Démarre l'écrivain de traces UNE SEULE FOIS (1 fil démon, idempotent)."""
+    with _TRACES_LOCK:
+        if _TRACES_WORKER["demarre"]:
+            return False
+        _TRACES_WORKER["demarre"] = True
+    threading.Thread(target=_worker_traces, name="lss-traces",
+                     daemon=True).start()
+    return True
+
+
+def _tracer(action: str, details: dict) -> None:
+    """Trace NON BLOQUANTE. Ne lève JAMAIS.
+
+    · file bornée + `put_nowait` : aucune attente, jamais ;
+    · file pleine → trace PERDUE et COMPTÉE (`traces_perdues`), pas subie ;
+    · liste blanche appliquée ICI (calcul pur, sans I/O) pour qu'aucun brut de
+      portail ne puisse même entrer en file.
+    """
+    global _TRACES_PERTES
+    try:
+        publie = champs_publiables(details)
+        if not _TRACES_WORKER["demarre"]:
+            demarrer_worker_traces()
+        _TRACES_FILE.put_nowait((action, publie))
+    except queue.Full:
+        with _TRACES_LOCK:
+            _TRACES_PERTES += 1
+            perdues = _TRACES_PERTES
+        if perdues == 1 or perdues % 100 == 0:
+            log.warning("Traces de collecte : file pleine — %d trace(s) "
+                        "perdue(s) (aucun effet sur la collecte)", perdues)
+    except Exception:
+        pass            # jamais d'exception de trace dans la collecte
+
+
+def traces_perdues() -> int:
+    with _TRACES_LOCK:
+        return int(_TRACES_PERTES)
+
+
+def traces_info() -> dict:
+    """M1 — état des traces, publié par `etat_collecte_memoire()`, donc par
+    `/api/sante` sous `etat_collecteur.collecte_traces` (aucune modification de
+    `main.py` : `etat_collecteur` publie déjà l'état entier). Rétention
+    DÉCLARÉE : aucune purge n'est exécutée par ce commit."""
+    return {"file_max": _TRACES_FILE.maxsize,
+            "en_file": _TRACES_FILE.qsize(),
+            "perdues": traces_perdues(),
+            "retention_cycles_jours": COLLECTE_TRACES_RETENTION_JOURS,
+            "retention_syntheses_jours": COLLECTE_SYNTHESE_RETENTION_JOURS,
+            "purge_active": False}
+
+
+def vider_traces(silence_s: float = 5.0) -> int:
+    """Attend la vidange de la file — TESTS et arrêt propre SEULEMENT (jamais
+    appelée par la collecte). Bornée par `silence_s`."""
+    limite = time.monotonic() + float(silence_s)
+    while not _TRACES_FILE.empty() and time.monotonic() < limite:
+        time.sleep(0.02)
+    return _TRACES_FILE.qsize()
+
+
+# ---------------------------------------------------------------- émetteurs M1
+def _tracer_lancement(source: str, passe: PasseCourante, *, jours=None) -> None:
+    """« CETTE SOURCE A ÉTÉ LANCÉE » — appelée AVANT le premier appel réseau.
+    Ne lève jamais : une trace ne commande jamais la collecte."""
+    try:
+        instant = now_local().isoformat()
+        passe.metriques.marquer_demarrage(instant)
+        if source not in passe.sources_lancees:
+            passe.sources_lancees.append(source)
+        log.info("Collecte %s : DÉMARRAGE (passe %s, budget %.0fs, jours=%s)",
+                 source, passe.source, passe.budget_s,
+                 [str(j) for j in (jours or [])] or "-")
+        _tracer("collecte.source_lancee", {
+            "source": source, "source_reelle": source, "passe": passe.source,
+            "lancee": True, "source_demarree": True, "debut_le": instant,
+            "budget_s": passe.budget_s,
+            "jours": [str(j) for j in (jours or [])]})
+    except Exception:
+        log.warning("Trace de lancement non émise (%s) — sans effet sur la "
+                    "collecte", source, exc_info=False)
+
+
+def _tracer_non_demarree(source: str, raison: str, *, phase=None, motif=None,
+                         jours=None, passe_nom=None) -> None:
+    """« CETTE SOURCE N'A PAS DÉMARRÉ », avec la raison RÉELLE.
+
+    Cas mesuré le 22/09 : CamtrackPro jamais atteint, et rien ne le disait. La
+    raison appartient à une énumération fermée ; `phase` et `motif` proviennent
+    de l'échéance RÉELLE quand il y en a une — jamais inventés. Ne lève jamais.
+    """
+    try:
+        passe = passe_courante()
+        if passe is not None:
+            passe.metriques.marquer_non_demarree(raison)
+        log.warning("Collecte %s : source NON DÉMARRÉE (raison « %s », phase "
+                    "« %s »)", source, raison, phase or "inconnue")
+        _tracer("collecte.source_non_demarree", {
+            "source": source, "source_reelle": source,
+            "passe": passe_nom or (passe.source if passe is not None else None),
+            "lancee": False, "source_demarree": False,
+            "non_demarree_raison": raison, "phase": phase,
+            "raison_annulation": motif,
+            "jours": [str(j) for j in (jours or [])]})
+    except Exception:
+        log.warning("Trace de non-démarrage non émise (%s) — sans effet", source,
+                    exc_info=False)
+
+
+def _tracer_source_resultat(nom: str, *, passe_nom: str, jours, stats=None,
+                            origine=None, duree_lecture_s=None,
+                            duree_ecriture_s=None, issue: str = "TERMINE",
+                            erreur=None, sources_passe=None,
+                            confirme: bool = False) -> None:
+    """« VOICI CE QUE CETTE SOURCE A PRODUIT » — RÈGLE D'HONNÊTETÉ :
+
+      · les compteurs publiés viennent EXCLUSIVEMENT du retour NORMAL de
+        `reconcilier_trajets_valides` (donc APRÈS ses commits internes) et sont
+        marqués `confirme_apres_commit: true` ;
+      · sur exception (rollback, échéance), AUCUN compteur n'est publié ;
+      · AUCUN motif de rejet n'est publié par M1 (reporté au commit 5, où il
+        viendra d'un résultat confirmé après commit) ;
+      · `couvre_sources` décrit la PASSE (contexte) ; `metriques_attribuables_a`
+        ne désigne QUE cette source : les temps de phase de la passe vivent dans
+        `collecte.passe_synthese`, jamais ici.
+    Ne lève jamais : une trace ne commande jamais la collecte.
+    """
+    try:
+        details = {
+            "source": nom, "source_reelle": nom, "passe": passe_nom,
+            "couvre_sources": list(sources_passe or [nom]),
+            "compteurs_partages": False,
+            "metriques_attribuables_a": [nom],
+            "origine_lecture": origine,
+            "jours": [str(j) for j in (jours or [])],
+            "issue": issue, "raison_annulation": erreur,
+            "duree_lecture_s": duree_lecture_s,
+            "duree_ecriture_s": duree_ecriture_s}
+        if confirme and stats:
+            details.update({
+                "recus": int(stats.get("recus") or 0),
+                "ecrits": (int(stats.get("crees") or 0)
+                           + int(stats.get("remplaces") or 0)
+                           + int(stats.get("maj") or 0)),
+                "ignores": int(stats.get("ignores") or 0),
+                "confirme_apres_commit": True})
+        _tracer("collecte.source_resultat", details)
+    except Exception:
+        log.warning("Trace de résultat non émise (%s) — sans effet", nom,
+                    exc_info=False)
+
+
+def _tracer_passe_synthese(passe: PasseCourante, d: dict) -> None:
+    """« OÙ EST PASSÉ LE TEMPS DE CETTE PASSE » — UNE ligne par passe.
+
+    Si la passe couvre PLUSIEURS sources, ses métriques sont DÉCLARÉES
+    PARTAGÉES : aucune lecture ne peut les attribuer à une source seule (aucune
+    répartition estimée, aucun total inventé). Ne lève jamais.
+    """
+    try:
+        couvre = list(passe.sources_lancees or
+                      ([passe.source] if passe.source else []))
+        partage = len(couvre) > 1
+        _tracer("collecte.passe_synthese", {
+            "source": passe.source, "passe": passe.source,
+            "source_reelle": None if partage else (couvre[0] if couvre
+                                                   else None),
+            "couvre_sources": couvre, "compteurs_partages": partage,
+            "metriques_attribuables_a": None if partage else couvre,
+            "issue": d.get("issue"), "phase": d.get("phase"),
+            "etape_bloquante": d.get("etape_bloquante"),
+            "raison_annulation": d.get("raison_annulation"),
+            "source_demarree": bool(d.get("source_demarree")),
+            "non_demarree_raison": d.get("non_demarree_raison"),
+            "debut_le": d.get("debut_le"), "fin_le": d.get("fin_le"),
+            "demarrage_le": d.get("demarrage_le"),
+            "total_s": d.get("total_s"), "budget_s": d.get("budget_s"),
+            "attente_http_s": d.get("attente_http_s"),
+            "pagination_s": d.get("pagination_s"),
+            "vehicule_s": d.get("vehicule_s"),
+            "parsing_s": d.get("parsing_s"), "ecran_s": d.get("ecran_s"),
+            "ecriture_s": d.get("ecriture_s"),
+            "attente_sqlite_s": d.get("attente_sqlite_s"),
+            "nb_pages": d.get("nb_pages"),
+            "nb_lignes_lues": d.get("nb_lignes_lues"),
+            "nb_ecran_vehicules": d.get("nb_ecran_vehicules"),
+            "nb_commits": d.get("nb_commits"),
+            "commits_apres_echeance": d.get("commits_apres_echeance"),
+            "traces_perdues": traces_perdues()})
+    except Exception:
+        log.warning("Trace de synthèse de passe non émise (%s) — sans effet",
+                    getattr(passe, "source", "?"), exc_info=False)
+
+
+# ---- synthèse périodique : 1 écriture par période CLOSE, jamais par passe ----
+_SYNTHESE_ETAT: dict = {}
+_SYNTHESE_MUTEX = threading.Lock()
+_CHAMPS_CUMUL = ("nb_pages", "nb_lignes_lues", "nb_ecran_vehicules",
+                 "nb_commits", "commits_apres_echeance")
+
+
+def _resume_issues(compte: dict) -> str:
+    """Résumé PUBLIABLE d'un compteur d'issues : une CHAÎNE bornée.
+
+    La liste blanche REFUSE toute valeur `dict` (aucun `details` libre ne
+    peut entrer dans le journal) : publier `dict(issues)` revenait donc à
+    ne rien publier du tout. Les clés sont des issues produites par le code.
+    """
+    try:
+        return texte_trace_sur(", ".join(
+            f"{nom}={int(nb)}" for nom, nb in sorted((compte or {}).items())
+        ), 120) or ""
+    except Exception:
+        return ""
+
+
+def _synthese_periodique(source: str, d: dict) -> None:
+    """Accumule la passe dans la période en cours et ÉMET la période CLOSE.
+
+    Aucune lecture de la base, aucun upsert, aucune migration : la bascule se
+    fait en mémoire, une seule insertion par période (≈ 24/h et par source,
+    plus une journalière). L'heure EN COURS reste visible en direct dans
+    `/api/sante` via `metriques_par_source`.
+    """
+    instant = now_local()
+    heure = instant.strftime("%Y-%m-%dT%H")
+    jour = instant.strftime("%Y-%m-%d")
+    with _SYNTHESE_MUTEX:
+        etat = _SYNTHESE_ETAT.setdefault(source, {
+            "heure": heure, "jour": jour, "cumul": {}, "issues": {},
+            "passes": 0, "somme_total_s": 0.0, "max_total_s": 0.0})
+        if heure != etat["heure"]:
+            _tracer("collecte.synthese_heure", {
+                "source": source, "heure": etat["heure"], "jour": etat["jour"],
+                "passes": etat["passes"],
+                "somme_total_s": round(etat["somme_total_s"], 3),
+                "max_total_s": etat["max_total_s"],
+                "issues": _resume_issues(etat["issues"]),
+                **{c: etat["cumul"].get(c) for c in _CHAMPS_CUMUL},
+                "traces_perdues": traces_perdues()})
+            etat.update({"heure": heure, "cumul": {}, "issues": {}, "passes": 0,
+                         "somme_total_s": 0.0, "max_total_s": 0.0})
+        if jour != etat["jour"]:
+            _tracer("collecte.synthese_jour", {
+                "source": source, "jour": etat["jour"],
+                "passes": etat["passes"],
+                "somme_total_s": round(etat["somme_total_s"], 3),
+                "max_total_s": etat["max_total_s"],
+                "issues": _resume_issues(etat["issues"]),
+                "traces_perdues": traces_perdues()})
+            etat["jour"] = jour
+        for champ in _CHAMPS_CUMUL:
+            etat["cumul"][champ] = (int(etat["cumul"].get(champ, 0))
+                                    + int(d.get(champ) or 0))
+        issue = str(d.get("issue") or "?")
+        etat["issues"][issue] = int(etat["issues"].get(issue, 0)) + 1
+        etat["passes"] += 1
+        etat["somme_total_s"] += float(d.get("total_s") or 0.0)
+        etat["max_total_s"] = max(etat["max_total_s"],
+                                  float(d.get("total_s") or 0.0))
+
 
 # ==============================================================================
 # SÉPARATION STRICTE DES VERROUS : NIVEAU 1 (GPS LIVE) vs NIVEAU 2 (TRAITEMENT)
@@ -458,6 +821,9 @@ def etat_collecte_memoire() -> dict:
         "metriques_par_source": etat_metriques_par_source(),
         "cycles_par_source": cycles_par_source(),
         "progression_relecture": progression(),
+        # M1 — état des traces : file bornée, pertes comptées, rétention
+        # DÉCLARÉE, purge INACTIVE (aucune suppression dans ce commit).
+        "collecte_traces": traces_info(),
     }
 
 
@@ -554,6 +920,22 @@ def _finaliser_passe(passe: PasseCourante, issue: str,
                     "(budget %.1fs)", passe.source, issue,
                     depouillees.get("etape_bloquante"),
                     depouillees.get("total_s") or 0.0, passe.budget_s)
+    # M1 — TRACES (mises en file : jamais le fil de collecte).
+    #   · 1 synthèse de PASSE par cycle, SAUF N1 nominal (cadence ~10 s : la
+    #     synthèse horaire suffit) ; donc : toutes les passes N2, et tout cycle
+    #     non nominal (BUDGET_DEPASSE, ECHEC, annulation, commit après échéance) ;
+    #   · 1 ligne de PÉRIODE CLOSE (heure/jour) par source.
+    # Ces traces ne lisent ni ne modifient aucune décision de collecte :
+    # l'unique effet d'un choix ici est le NOMBRE de lignes écrites.
+    try:
+        _nominal = (issue == "TERMINE"
+                    and int(depouillees.get("commits_apres_echeance") or 0) == 0)
+        if not _nominal or str(passe.source).startswith("N2_"):
+            _tracer_passe_synthese(passe, depouillees)
+        _synthese_periodique(passe.source, depouillees)
+    except Exception:
+        log.warning("Traces de collecte non émises pour %s (sans effet)",
+                    passe.source, exc_info=False)
     return depouillees
 
 
@@ -580,6 +962,10 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
                     "depuis %.1fs (jeton %s) — aucune écriture de ma part",
                     source, source, etat.get("proprietaire"),
                     etat.get("duree_s") or 0.0, etat.get("jeton"))
+        # M1 — une source qui N'A PAS DÉMARRÉ le DIT, avec la raison RÉELLE
+        # (le refus de verrou est déjà enregistré : rien n'est inventé).
+        _tracer_non_demarree(source, "verrou_occupe", phase="attente_verrou",
+                             passe_nom=source)
         return 0
 
     passe = PasseCourante(source=source, budget_s=timeout_s,
@@ -587,6 +973,10 @@ def _collecte_protegee(source: str, action, timeout_s: float = 30.0) -> int:
     passe.metriques.attente_verrou_s = round(attente_verrou_s, 3)
     enregistrer_passe(source, passe)
     _etat_collecte_debut(source)
+    # M1 — TRACE DE LANCEMENT, avant le premier appel réseau. La ligne suivante
+    # du produit reste `erreurs_avant = _sources_en_erreur()` : l'ordre et la
+    # logique de collecte sont INCHANGÉS.
+    _tracer_lancement(source, passe)
     try:
         fut = _COLLECTE_EXECUTOR.submit(_executer_avec_passe, action, passe)
         try:
@@ -2097,6 +2487,7 @@ class MZoneXTrajetsCollector:
         from .models import Vehicule
 
         self.recensement: list = []      # §0quinquies D4 — lu par la sync
+        self.nb_vehicules_lus = 0        # M1 — compteur LOCAL (aucune décision)
         cible_onglet = _env("MZONEX_ONGLET_TRAJETS", "trajets")
         groupe = _env("MZONEX_GROUPE", "LSS (LPSA)")
         fragment_groupe = _env("MZONEX_COMBO_GROUPE", "favourite")
@@ -2136,6 +2527,9 @@ class MZoneXTrajetsCollector:
                             except Exception:
                                 log.exception("MZoneX Trajets « %s » : échec", plaque)
                                 lignes = []
+                            if lignes:                       # M1 — mesure locale
+                                self.nb_vehicules_lus += 1
+                                compter("nb_ecran_vehicules")
                             bruts = _trajets_valides_depuis_lignes(
                                 lignes, "MZONEX", "MZONEX")
                             # sécurité anti-relecture : ne retenir que CE véhicule
@@ -2247,6 +2641,7 @@ class CamtrackProTrajetsCollector:
         from playwright.sync_api import sync_playwright  # noqa: import différé
 
         self.recensement: list = []      # §0quinquies D4 — lu par la sync
+        self.nb_vehicules_lus = 0        # M1 — compteur LOCAL (aucune décision)
         fragments = self._fragments_vehicules()
         if not fragments:
             log.warning("CamtrackPro Trajets : aucun véhicule « CAMTRACKPRO » "
@@ -2295,6 +2690,9 @@ class CamtrackProTrajetsCollector:
                             except Exception:
                                 log.exception("CTPRO rapport « %s » : échec", frag)
                                 lignes, choisi = [], frag
+                            if lignes:                       # M1 — mesure locale
+                                self.nb_vehicules_lus += 1
+                                compter("nb_ecran_vehicules")
                             # la cellule véhicule est vide dans le détail →
                             # l'objet choisi (normalisé « 4296TCC ») fait foi
                             plaque = ident_vehicule(choisi) or choisi or frag
@@ -2414,8 +2812,16 @@ class MZoneXTrajetsApiCollector:
         items: list[dict] = []
         for jour in sorted(set(jours)):
             bruts = self.api.trajets_jour_local(jour)
-            items.extend(it for it in (trajet_depuis_api(t, map_vehicules=map_vehs) for t in bruts)
-                         if it)
+            # M1 — PARSING mesuré (phase jamais alimentée jusqu'ici) et VOLUME
+            # lu. Les appels API et leur ordre sont strictement inchangés.
+            _t_parsing = time.monotonic()
+            try:
+                items.extend(
+                    it for it in (trajet_depuis_api(t, map_vehicules=map_vehs)
+                                  for t in bruts) if it)
+            finally:
+                mesurer_depuis("parsing", _t_parsing)
+            compter("nb_lignes_lues", len(bruts))
             log.info("MZoneX API (Trajets) : %d ligne(s) API du %s",
                      len(bruts), jour.isoformat())
         log.info("MZoneX API (Trajets) : %d jour(s) relu(s) → %d trajet(s) "
@@ -2663,8 +3069,13 @@ def _collecter_n2_mzonex(jours: list | None = None, *,
     4. le repli n'est utilisé que s'il est complet ;
     5. sinon : listes vides (le cycle n'écrit rien — aucune archive partielle) ;
     6. chaque ligne porte son origine de lecture.
+
+    M1 — le bilan de la source en cours (origine RÉELLE de lecture, volume
+    lu à l'écran) est celui du CONTEXTE D'APPEL (`_BILAN_SOURCE`) : aucun
+    argument nouveau, donc aucune signature d'appelant cassée.
     """
     etat = {"echec": None, "origine": None, "complet": None, "detail": {}}
+    bilan = _BILAN_SOURCE.get()   # M1 — le bilan de CET appel, jamais d'un autre
     repli_autorise = os.getenv("MZONEX_REPLI_ECRAN", "1") == "1"
     if _mzonex_api_active():
         try:
@@ -2674,6 +3085,8 @@ def _collecter_n2_mzonex(jours: list | None = None, *,
             complet, detail = _completude_lecture(valides, rec, attendues)
             if valides and complet:
                 etat.update(origine=ORIGINE_API, complet=True, detail=detail)
+                if bilan is not None:      # M1 — origine RÉELLE de lecture
+                    bilan["origine"] = ORIGINE_API
                 DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
                 return _identifier_source(valides, ORIGINE_API), rec
             etat["echec"] = ("api_incomplete" if valides else "api_sans_ligne")
@@ -2699,8 +3112,18 @@ def _collecter_n2_mzonex(jours: list | None = None, *,
         DERNIER_ETAT_N2.clear(); DERNIER_ETAT_N2.update(etat)
         return [], []
     c = MZoneXTrajetsCollector()
-    valides = list(c.collecter_valides() or [])
+    # M1 — TEMPS DE LECTURE ÉCRAN (Playwright) mesuré MÊME EN CAS D'EXCEPTION :
+    # c'est le poste de temps qui n'apparaissait dans aucune métrique.
+    _t_ecran = time.monotonic()
+    try:
+        valides = list(c.collecter_valides() or [])
+    finally:
+        mesurer_depuis("ecran", _t_ecran)
     rec = list(getattr(c, "recensement", []) or [])
+    if bilan is not None:                      # M1 — origine RÉELLE (écran)
+        bilan["origine"] = ORIGINE_ECRAN
+        bilan["nb_ecran_vehicules"] = int(
+            getattr(c, "nb_vehicules_lus", 0) or 0)
     complet, detail = _completude_lecture(valides, rec, attendues)   # P2-3
     etat.update(origine=ORIGINE_ECRAN, complet=bool(complet), detail=detail)
     if not complet:                                                 # P2-5
@@ -2792,7 +3215,14 @@ def _collecter_camtrackpro_n1() -> int:
 
 
 def _collecter_n2_camtrackpro(jours: list | None = None) -> tuple:
-    """§0sexies A2/A4 : Niveau 2 CamtrackPro — API d'abord, repli écran si demandé."""
+    """§0sexies A2/A4 : Niveau 2 CamtrackPro — API d'abord, repli écran si demandé.
+
+    M1 — le bilan de CET appel (origine RÉELLE de lecture : API Wialon ou
+    écran) vient du CONTEXTE (`_BILAN_SOURCE`) ; l'information existe déjà
+    ligne à ligne (`origine_lecture`, §0sexies P2-6) et n'est pas recalculée.
+    Aucun argument ajouté : les signatures d'appel restent celles d'avant.
+    """
+    bilan = _BILAN_SOURCE.get()   # M1 — le bilan de CET appel
     if jeton_configure():
         try:
             c = CamtrackProTrajetsApiCollector()
@@ -2800,6 +3230,8 @@ def _collecter_n2_camtrackpro(jours: list | None = None) -> tuple:
                 valides = c.collecter_valides(jours)
             except TypeError:
                 valides = c.collecter_valides()
+            if bilan is not None:              # M1 — origine RÉELLE (API)
+                bilan["origine"] = ORIGINE_API
             return valides, list(c.recensement or [])
         except Exception:
             log.exception("CamtrackPro API (rapport trajets) en échec")
@@ -2807,7 +3239,17 @@ def _collecter_n2_camtrackpro(jours: list | None = None) -> tuple:
                 return [], []
     if os.getenv("CAMTRACKPRO_REPLI_ECRAN", "1") == "1":
         c = CamtrackProTrajetsCollector()
-        return c.collecter_valides(), list(getattr(c, "recensement", []) or [])
+        # M1 — TEMPS DE LECTURE ÉCRAN mesuré MÊME EN CAS D'EXCEPTION.
+        _t_ecran = time.monotonic()
+        try:
+            valides = c.collecter_valides()
+        finally:
+            mesurer_depuis("ecran", _t_ecran)
+        if bilan is not None:                  # M1 — origine RÉELLE (écran)
+            bilan["origine"] = ORIGINE_ECRAN
+            bilan["nb_ecran_vehicules"] = int(
+                getattr(c, "nb_vehicules_lus", 0) or 0)
+        return valides, list(getattr(c, "recensement", []) or [])
     return [], []
 
 
@@ -2901,6 +3343,16 @@ def synchroniser_trajets_valides(source: str | None = None) -> dict:
         log.warning("Synchronisation Niveau 2 (%s) arrêtée proprement : %s "
                     "(phase « %s », motif « %s »)", source_nom, exc, exc.etape,
                     exc.raison_annulation)
+        # M1 — l'échéance n'autorise pas le silence : toute source ATTENDUE et
+        # non lancée est publiée, avec la PHASE et le MOTIF RÉELS de l'échéance
+        # (repris de l'exception : rien n'est inventé).
+        _attendues = (SOURCES_NIVEAU2_MIXTE if source_nom == "MIXTE"
+                      else [source_nom])
+        for _nom in [n for n in _attendues if n not in passe.sources_lancees]:
+            _tracer_non_demarree(f"N2_{_nom}", "echeance_atteinte_ailleurs",
+                                 phase=exc.etape,
+                                 motif=exc.raison_annulation,
+                                 passe_nom=passe.source)
         return {"budget_depasse": True, "etape": exc.etape,
                 "raison_annulation": exc.raison_annulation}
     except Exception as exc:
@@ -2928,13 +3380,33 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
     # portail est rattrapé SEUL (upsert idempotent, jamais de suppression).
     jours = _jours_a_relire(now_local())
     recensements: dict = {}              # §0quinquies D4 — listes portails
+    # M1 — contexte de trace de CETTE passe : variables LOCALES à cet appel de
+    # fonction, donc à CE fil. Aucun état partagé, aucun attribut d'instance
+    # (la seule liste modifiée est `passe.sources_lancees`, qui appartient à
+    # cette passe et n'est lue que par les traces).
+    _p = passe_courante()
+    _passe_nom = _p.source if _p is not None else f"N2_{source}"
+    _lancees: list[str] = []
     for nom in sources:
         classe = VALIDATEURS_TRAJETS.get(nom)
         if classe is None:
             log.info("Pas de validateur Niveau 2 pour %s — sync ignorée", nom)
             continue
+        _bilan_source: dict = {}          # M1 — NEUF à chaque source
+        # M1 — bilan publié par CONTEXTE : aucun argument ajouté aux
+        # collecteurs, les signatures d'appel restent inchangées.
+        _jeton_bilan = _BILAN_SOURCE.set(_bilan_source)
         try:
+            # M1 — PREMIÈRE instruction du bloc : la durée de lecture
+            # existe donc sur TOUS les chemins d'exception (aucune supposition).
+            _t_lecture = time.monotonic()
             verifier_etape("attente_http")   # R16 — AVANT l'appel réseau
+            # M1 — la source est LANCÉE : elle le dit AVANT tout appel réseau.
+            # Si `verifier_etape` vient de lever, on n'arrive PAS ici : une
+            # source interrompue avant son appel n'est jamais dite « lancée ».
+            if _p is not None:
+                _tracer_lancement(nom, _p, jours=jours)
+                _lancees.append(nom)
             if nom == "MZONEX":
                 # §0sexies A2 + P2 — API MZoneX en principal, écran en secours
                 # SYSTÉMATIQUE, utilisé seulement s'il est COMPLET.
@@ -2951,6 +3423,7 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
                 bruts = collecteur.collecter_valides()
                 recensements[nom] = list(getattr(collecteur, "recensement", [])
                                          or [])
+            _duree_lecture = round(time.monotonic() - _t_lecture, 3)     # M1
             # R16 — APRÈS l'appel réseau : si l'échéance a été franchie pendant
             # la lecture, on n'enchaîne PAS sur la réconciliation.
             verifier_etape("attente_http")
@@ -2963,7 +3436,17 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
             # devient visible dans /api/sante (attente_sqlite), jamais muet.
             _etat_collecte_erreur(f"N2_{nom}", exc)
             log.exception("Échec collecte Niveau 2 (%s)", nom)
+            # M1 — échec de LECTURE de CETTE source : AUCUN compteur publié
+            # (rien n'a été réconcilié, donc rien ne serait attribuable).
+            _tracer_source_resultat(
+                nom, passe_nom=_passe_nom, jours=jours, stats=None,
+                origine=_bilan_source.get("origine"),
+                duree_lecture_s=round(time.monotonic() - _t_lecture, 3),
+                issue="ECHEC", erreur=texte_trace_sur(exc, 180),
+                sources_passe=sources, confirme=False)
             continue
+        finally:
+            _BILAN_SOURCE.reset(_jeton_bilan)   # M1 — contexte rendu, aucune fuite
         db = SessionLocal()
         try:
             # v1.54 — l'attente éventuelle du verrou d'écriture de SQLite est
@@ -2976,10 +3459,23 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
                     _p.metriques.ajouter("attente_sqlite_s",
                                          _attente_n2 - SQLITE_COMMIT_BASE_S)
             verifier_etape("ecriture")     # R16 — AVANT l'unité d'écriture
+            # M1 — durée LOCALE de l'écriture (mesure seule) ; `chrono` reste la
+            # mesure publiée dans `ecriture_s`, inchangé.
+            _t_ecriture = time.monotonic()
             with chrono("ecriture"):
                 stats = reconcilier_trajets_valides(
                     db, items, username=f"collecteur-{nom.lower()}")
+            _duree_ecriture = round(time.monotonic() - _t_ecriture, 3)      # M1
             verifier_etape("ecriture")     # R16 — APRÈS l'unité d'écriture
+            # M1 — RÉSULTAT CONFIRMÉ : ces compteurs ne sont lus qu'APRÈS le
+            # retour NORMAL de `reconcilier_trajets_valides`, donc après ses
+            # commits internes. AUCUN motif de rejet n'est publié par M1.
+            _tracer_source_resultat(
+                nom, passe_nom=_passe_nom, jours=jours, stats=stats,
+                origine=_bilan_source.get("origine"),
+                duree_lecture_s=_duree_lecture,
+                duree_ecriture_s=_duree_ecriture, issue="TERMINE",
+                sources_passe=sources, confirme=True)
         except BudgetDepasse:
             raise                          # échéance : la PASSE s'arrête ici
         except Exception as exc:
@@ -2990,12 +3486,32 @@ def _synchroniser_trajets_valides(source: str | None = None) -> dict:
             _etat_collecte_erreur(f"N2_{nom}", exc)
             log.exception("Échec réconciliation Niveau 2 (%s) — source suivante",
                           nom)
+            # M1 — le tour est ROULÉ BACK (ou interrompu) : AUCUN compteur n'est
+            # publié, donc aucun rejet ne peut être compté comme validé. C'est
+            # exactement ce que verrouille le test T-M1-13.
+            _tracer_source_resultat(
+                nom, passe_nom=_passe_nom, jours=jours, stats=None,
+                origine=_bilan_source.get("origine"),
+                duree_lecture_s=_duree_lecture, issue="ECHEC",
+                erreur=texte_trace_sur(exc, 180),
+                sources_passe=sources, confirme=False)
             continue
         finally:
             db.close()
         for cle in totaux:
             totaux[cle] += int(stats.get(cle, 0) or 0)
         log.info("Sync Niveau 2 (%s) : %s", nom, stats)
+    # M1 — SOURCES ATTENDUES JAMAIS LANCÉES (fin NORMALE de la boucle) : la
+    # source ne prétend rien produire, elle DIT qu'elle n'a pas démarré, avec la
+    # raison RÉELLE (« aucun validateur » si la table n'en déclare pas, sinon
+    # « non atteinte »). Aucune valeur inventée, aucun compteur publié.
+    if _p is not None:
+        for _nom in [n for n in sources if n not in _lancees]:
+            _tracer_non_demarree(
+                f"N2_{_nom}",
+                "aucun_validateur" if _nom not in VALIDATEURS_TRAJETS
+                else "non_atteinte",
+                jours=jours, passe_nom=_passe_nom)
     if source == "MIXTE":
         log.info("Sync Niveau 2 (MIXTE) — total : %s", totaux)
     # §0quinquies decies I1/I5 (25/08/2026) — collecte Ym@ne adossée au cycle
@@ -3479,6 +3995,10 @@ def boucle_collecte():
     # tour de boucle (une boucle retenue dans une passe n'empêche plus
     # l'annulation coopérative).
     demarrer_surveillance()
+    # M1 — l'ÉCRIVAIN DE TRACES a le sien (1 fil démon) : aucune trace ne prend
+    # le verrou d'écriture sur le fil de collecte. Idempotent (`_tracer` le
+    # démarre de toute façon au premier usage).
+    demarrer_worker_traces()
 
     while True:
         # §0bis — SURVEILLANCE COOPÉRATIVE des verrous (v1.54).
